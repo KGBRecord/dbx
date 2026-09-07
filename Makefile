@@ -3,7 +3,7 @@
 PNPM ?= pnpm
 TAURI_DEV_PORT ?= 1420
 
-.PHONY: help install docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion
+.PHONY: help install docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion docker-up docker-build docker-down docker-logs
 
 export DB
 export DB_VERSION
@@ -51,6 +51,12 @@ help:
 	@printf '  %-23s %s\n' 'make db-reset DB=mysql@8.4 CONFIRM=1' 'Delete containers and data'
 	@printf '  %-23s %s\n' 'make db-check' 'Validate every recipe and Compose file'
 	@printf '  %-23s %s\n' 'make db-completion' 'Show Bash/Zsh completion setup'
+	@printf '%s\n' ''
+	@printf '%s\n' 'Docker:'
+	@printf '  %-23s %s\n' 'make docker-up' 'Build from source and start the container (docker compose up -d --build)'
+	@printf '  %-23s %s\n' 'make docker-build' 'Build the image from source only'
+	@printf '  %-23s %s\n' 'make docker-down' 'Stop the container'
+	@printf '  %-23s %s\n' 'make docker-logs' 'Follow container logs'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Setup:'
 	@printf '  %-23s %s\n' 'make install' 'Install root project dependencies'
@@ -135,3 +141,15 @@ db-check:
 
 db-completion:
 	@$(PNPM) db:env -- completion
+
+docker-up:
+	docker compose up -d --build
+
+docker-build:
+	docker compose build
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f

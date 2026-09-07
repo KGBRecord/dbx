@@ -66,6 +66,9 @@ Thumbs.db
 # Temp
 tmp/
 
+# Local runtime data (docker-compose bind mount)
+dbx-data/
+
 # AI background-run dev artifacts (never commit)
 .dlp-quarantine/
 outputs/

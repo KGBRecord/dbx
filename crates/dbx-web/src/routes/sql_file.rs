@@ -22,7 +22,7 @@ use crate::state::WebState;
 
 const PENDING_SQL_FILE_PROGRESS_CHANNEL_TTL: Duration = Duration::from_secs(30);
 const SQL_FILE_UPLOAD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-pub const SQL_FILE_UPLOAD_MAX_BYTES: usize = 200 * 1024 * 1024;
+pub const SQL_FILE_UPLOAD_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
