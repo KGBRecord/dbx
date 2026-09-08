@@ -1,6 +1,7 @@
 import type { EditorSettings } from "@/stores/settingsStore";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { normalizeQueryResultMaxRows } from "@/lib/dataGrid/queryResultRowLimit";
+import { normalizeExternalSqlEditorMaxMb } from "@/lib/sql/sqlFileOpen";
 import { normalizeCompletionTriggerMode } from "@/lib/sql/sqlCompletionTriggerPolicy";
 import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 
@@ -57,6 +58,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "tableOpenPageSize",
   "queryResultMaxRowsEnabled",
   "queryResultMaxRows",
+  "externalSqlEditorMaxMb",
   "infiniteScroll",
   "regexMaxMatchCount",
   "autoCalculateTotalRows",
@@ -129,6 +131,7 @@ export function normalizeQueryResultMaxRowsDraft(value: unknown): number {
 function normalizedDraftValue(key: EditorSettingsDraftKey, value: unknown): unknown {
   if (key === "pageSize" || key === "tableOpenPageSize") return normalizeTableOpenPageSizeDraft(value);
   if (key === "queryResultMaxRows") return normalizeQueryResultMaxRowsDraft(value);
+  if (key === "externalSqlEditorMaxMb") return normalizeExternalSqlEditorMaxMb(value);
   if (key === "completionTriggerMode") return normalizeCompletionTriggerMode(value);
   if (key === "redisKeyTemplates") return normalizeRedisKeyTemplates(value);
   return value;
