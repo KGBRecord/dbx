@@ -1783,6 +1783,10 @@ async fn execute_sql_file_statement(
         })
     };
 
+    let timeout_secs = {
+        let configs = state.configs.read().await;
+        configs.get(&request.connection_id).map(|config| config.effective_query_timeout_secs())
+    };
     let result = execute_sql_statement_with_options(
         state,
         &request.connection_id,
@@ -1790,7 +1794,7 @@ async fn execute_sql_file_statement(
         sql,
         None,
         Some(child_token),
-        QueryExecutionOptions { execution_id: Some(execution_id), ..Default::default() },
+        QueryExecutionOptions { execution_id: Some(execution_id), timeout_secs, ..Default::default() },
     )
     .await;
 
