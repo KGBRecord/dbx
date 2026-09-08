@@ -3,7 +3,7 @@
 PNPM ?= pnpm
 TAURI_DEV_PORT ?= 1420
 
-.PHONY: help install docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion docker-up docker-build docker-down docker-logs
+.PHONY: help install docs-install check-tauri-dev-port dev dev-fast dev-web dev-backend build package clean docs docs-build check test cargo-check-fast cargo-test-fast db db-list db-verify db-down db-reset db-check db-completion docker-up docker-build docker-down docker-logs docker-ram docker-up-8gb
 
 export DB
 export DB_VERSION
@@ -57,6 +57,8 @@ help:
 	@printf '  %-23s %s\n' 'make docker-build' 'Build the image from source only'
 	@printf '  %-23s %s\n' 'make docker-down' 'Stop the container'
 	@printf '  %-23s %s\n' 'make docker-logs' 'Follow container logs'
+	@printf '  %-23s %s\n' 'make docker-ram' 'Set OrbStack VM memory to 8GB (default)'
+	@printf '  %-23s %s\n' 'make docker-up-8gb' 'Set 8GB RAM, build with 1 job, and start'
 	@printf '%s\n' ''
 	@printf '%s\n' 'Setup:'
 	@printf '  %-23s %s\n' 'make install' 'Install root project dependencies'
@@ -153,3 +155,11 @@ docker-down:
 
 docker-logs:
 	docker compose logs -f
+
+docker-ram:
+	orbctl config set memory_mib 8192
+	@echo "OrbStack memory set to 8GB. Run 'orbctl stop && orb start' to apply."
+
+docker-up-8gb:
+	docker compose build --build-arg CARGO_BUILD_JOBS=1
+	docker compose up -d
