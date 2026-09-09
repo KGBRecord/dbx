@@ -56,6 +56,19 @@ Running `cargo test -p dbx-core --lib table_export` **crashes with a stack overf
 - `cargo test -p dbx-core --lib export_split_zip` -> **4 passed, 0 failed**.
 - `cargo test -p dbx-core --lib table_export` -> NOT fully verified due to the stack-overflow blocker above; tests up through `export_batch_size_respects_row_limit_remaining_rows` passed before the crash in an unrelated test.
 
+## Update after frontend/web wiring
+
+The following parts are now implemented after this note was first written:
+
+- `DatabaseExportDialog.vue` has a Split SQL Output checkbox and per-part MB input. When selected, the native save dialog writes `.zip`; the backend request receives `splitMaxMb`. All-database export emits one ZIP archive per selected database.
+- `SqlInsertModeDialog.vue` includes the same split option only when a caller passes `allowSplit: true`.
+- Data-grid full table SQL export and Object Browser SQL export pass `splitMaxMb`, use `.zip` save dialogs, and send the option to `TableExportRequest`.
+- Web database/table routes use `.zip` temp paths, filenames, and `application/zip` responses when the request has `split_max_mb`.
+- TypeScript request types and all nine locale strings are updated.
+- Validated: `pnpm typecheck`, relevant frontend unit tests, `cargo check --workspace --lib --tests`, `cargo fmt --check`, and dbx-core split/database export tests.
+
+Remaining: full table-export test suite still needs pre-existing stack-overflow isolation confirmation; complete broader CI validation before PR.
+
 ## NOT started yet (remaining work, in order)
 
 1. **Fix/skip the table_export stack-overflow test isolation issue**, then confirm all table_export tests (excluding that one if pre-existing) pass.

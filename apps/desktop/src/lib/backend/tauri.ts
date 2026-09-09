@@ -4891,6 +4891,7 @@ export interface DatabaseExportRequest {
   outputCompression?: "none" | "gzip";
   snapshotSessionId?: string;
   batchSize: number;
+  splitMaxMb?: number;
 }
 
 export interface DatabaseBackupSnapshot {
@@ -4941,6 +4942,7 @@ export interface TableExportRequest {
   dateTimeFormat?: string;
   numericColumnRightAlign?: boolean;
   autoFilter?: boolean;
+  splitMaxMb?: number;
 }
 
 export interface TableCsvExportOptions {
