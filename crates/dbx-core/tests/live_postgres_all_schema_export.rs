@@ -114,6 +114,7 @@ async fn live_postgres_all_schema_export_restores_one_sql_file() {
             output_compression: Default::default(),
             snapshot_session_id: None,
             batch_size: 1000,
+            split_max_mb: None,
         },
         move |event| progress_sink.lock().expect("progress mutex poisoned").push(event),
     )

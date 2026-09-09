@@ -82,6 +82,7 @@ async fn live_mysql_database_export_restores_dependent_views() {
         output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
     let test_result = async {
         export_database_sql_core(&state, &export_request, |_| {}).await?;
@@ -217,6 +218,7 @@ async fn run_live_mysql_database_export_handles_many_tables_including_empty_tabl
                 output_compression: Default::default(),
                 snapshot_session_id: None,
                 batch_size: 1000,
+                split_max_mb: None,
             };
 
             export_database_sql_core(&state, &request, |_| {}).await?;
@@ -311,6 +313,7 @@ async fn live_mysql_database_export_creates_missing_destination_directory() {
         output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     let result = export_database_sql_core(&state, &export_request, |_| {}).await;
@@ -377,6 +380,7 @@ async fn live_mysql_database_export_refuses_to_recreate_a_destination_that_disap
         output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     export_database_sql_core(&state, &export_request, |_| {}).await.expect("first export should succeed");
@@ -464,6 +468,7 @@ async fn live_mysql_database_export_refuses_a_destination_that_vanished_before_i
         output_compression: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     // The mount disappears before the scheduler ever runs this schedule for

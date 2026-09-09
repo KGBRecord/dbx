@@ -83,6 +83,12 @@ pub struct TableExportRequest {
     pub column_comments: Option<Vec<Option<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_filter: Option<bool>,
+    /// SQL format only: when set, the export is packaged as a `.zip` archive
+    /// containing multiple `part-N.sql` entries (plus a `manifest.json`)
+    /// capped at this many megabytes each, instead of one unbounded `.sql`
+    /// file. Ignored for every other format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_max_mb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -976,6 +982,52 @@ async fn stream_native_table_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Output writer for the single-table SQL export. `Plain` is the historical
+/// unbounded `.sql` file; `SplitZip` packages the SQL into multiple
+/// `part-N.sql` entries inside a `.zip` when `TableExportRequest::split_max_mb`
+/// is set.
+enum TableExportSqlWriter {
+    Plain(BufWriter<std::fs::File>),
+    SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
+}
+
+impl Write for TableExportSqlWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(buffer),
+            Self::SplitZip(writer) => writer.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::SplitZip(writer) => writer.flush(),
+        }
+    }
+}
+
+impl TableExportSqlWriter {
+    fn finish(self, source_file_name: &str) -> Result<(), String> {
+        match self {
+            Self::Plain(mut writer) => writer.flush().map_err(|error| format!("Failed to flush export file: {error}")),
+            Self::SplitZip(writer) => writer.finish(source_file_name),
+        }
+    }
+}
+
+fn create_table_export_sql_writer(request: &TableExportRequest) -> Result<TableExportSqlWriter, String> {
+    if let Some(max_mb) = request.split_max_mb {
+        let zip_path = std::path::Path::new(&request.file_path);
+        let stem = zip_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(&request.table_name);
+        let writer = crate::export_split_zip::SplitZipExportWriter::create(zip_path, max_mb, stem, "sql")?;
+        return Ok(TableExportSqlWriter::SplitZip(Box::new(writer)));
+    }
+    Ok(TableExportSqlWriter::Plain(BufWriter::new(
+        std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
+    )))
+}
+
 async fn try_export_native_table_stream(
     state: &AppState,
     pool_key: &str,
@@ -1254,13 +1306,11 @@ async fn try_export_native_table_stream(
             result
         }
         "sql" => {
-            let mut file = BufWriter::new(
-                std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
-            );
+            let mut file = create_table_export_sql_writer(request)?;
             let mut pending_rows: Vec<Vec<Value>> = Vec::new();
             let mut wrote_statements = false;
             let mut flush_pending =
-                |file: &mut BufWriter<std::fs::File>, pending_rows: &mut Vec<Vec<Value>>| -> Result<(), String> {
+                |file: &mut TableExportSqlWriter, pending_rows: &mut Vec<Vec<Value>>| -> Result<(), String> {
                     if pending_rows.is_empty() {
                         return Ok(());
                     }
@@ -1321,7 +1371,7 @@ async fn try_export_native_table_stream(
                 if wrote_statements {
                     file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
                 }
-                file.flush().map_err(|e| format!("Failed to flush export file: {e}"))?;
+                file.finish(&format!("{}.sql", request.table_name))?;
             }
             result
         }
@@ -2304,6 +2354,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
 
         ExternalDriverExportFixture { state, request, calls, output, dir }
@@ -2466,6 +2517,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
 
         export_table_data_core(&state, &request, |_| {}).await.unwrap();
@@ -2631,6 +2683,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let columns = vec!["Time".to_string(), "root.test.device2.temperature".to_string()];
@@ -2689,6 +2742,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let columns = vec!["tImE".to_string(), "temperature".to_string()];
@@ -2725,6 +2779,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let error = table_export_query_columns(&request, &context, &["TIME".to_string()]).unwrap_err();
@@ -2756,6 +2811,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Iotdb, None, request.schema.as_deref());
         let columns = vec![
@@ -2795,6 +2851,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["Time".to_string(), "value".to_string()];
 
@@ -2846,6 +2903,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Oracle, None, request.schema.as_deref());
 
@@ -2891,6 +2949,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["id".to_string(), "payload".to_string()];
         let primary_keys = vec!["id".to_string()];
@@ -2964,6 +3023,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["id".to_string(), "DisplayName".to_string()];
         let primary_keys = vec!["id".to_string()];
@@ -3019,6 +3079,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let columns = vec!["id".to_string(), "geom".to_string(), "name".to_string()];
         let column_types = vec![Some("int".to_string()), Some("geometry".to_string()), Some("varchar".to_string())];
@@ -3076,6 +3137,7 @@ mod tests {
             numeric_column_right_align: false,
             column_comments: None,
             auto_filter: None,
+            split_max_mb: None,
         };
         let context = table_export_sql_context(DatabaseType::Oracle, None, request.schema.as_deref());
         let sql = table_cursor_sql(&request, &context, &columns, &[], &primary_keys);
