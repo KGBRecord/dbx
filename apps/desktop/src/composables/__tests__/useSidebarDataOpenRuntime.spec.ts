@@ -118,7 +118,10 @@ vi.mock("@/lib/backend/debugLog", () => ({ appendDebugLog: vi.fn(), isDebugLoggi
 // dataTabOpenPolicy 使用真实实现，覆盖设置开关对应的复用范围
 vi.mock("@/lib/sidebar/treeNodeContext", () => ({ hasTreeNodeDatabaseContext: () => true }));
 vi.mock("@/lib/table/tableSelectSql", () => ({ buildTableSelectSql: mocks.buildTableSelectSql }));
-vi.mock("@/lib/table/tableEditing", () => ({ usesSyntheticRowIdKey: () => false }));
+vi.mock("@/lib/table/tableEditing", () => ({
+  usesSyntheticRowIdKey: () => false,
+  shouldIncludeSyntheticRowId: () => false,
+}));
 vi.mock("@/lib/table/tableOpenPageLimit", () => ({ tableOpenPageLimit: () => 100 }));
 vi.mock("@/lib/tabs/dataTabActivation", () => ({ canActivateExistingDataTableTab: () => false }));
 

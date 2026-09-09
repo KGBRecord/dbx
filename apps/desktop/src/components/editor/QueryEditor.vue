@@ -22,6 +22,7 @@ import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 import { expandToSqlStatementWindow } from "@/lib/sql/insertValueHints";
 import { insertValueHintColumnNames } from "@/lib/sql/insertValueHintColumns";
 import { canFormatSqlForDatabaseType, formatSqlForDisplay, formatSqlForEditing, compressSqlText, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
+import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { detectAndFormatStructured } from "@/lib/sql/autoFormat";
 import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 import { blankLineDeletionChanges, replaceSelectedEditorText } from "@/lib/editor/queryEditorTextEdits";
@@ -95,7 +96,7 @@ import {
 import { buildHoverTableSql, ddlForHoverPreview, hoverTableMatchesScope, normalizeAlignedSqlWhitespace, quoteIdentifier, quoteQualifiedName, reformatHoverDdl, scopeHoverTables, type HoverTableScope } from "@/lib/editor/hoverTableSql";
 import { constrainSqlHoverLayout } from "@/lib/editor/sqlHoverLayout";
 import { createHoverSearch, type HoverSearchController } from "@/lib/editor/sqlHoverSearch";
-import { lineColumnToOffset, sqlErrorDecorationRange as resolveSqlErrorDecorationRange } from "@/lib/sql/sqlDiagnostics";
+import { lineColumnToOffset, sqlErrorDecorationRange as resolveSqlErrorDecorationRange, sqlErrorSqlMatchesEditor } from "@/lib/sql/sqlDiagnostics";
 import { analyzeMysqlRoutineSyntax, supportsMysqlRoutineSyntaxDiagnostics } from "@/lib/sql/mysqlRoutineSyntaxDiagnostics";
 import { buildOracleSyntaxDiagnostics } from "@/lib/sql/oracleSyntaxDiagnostics";
 import {
@@ -243,6 +244,7 @@ const emit = defineEmits<{
   closeColumnPanel: [];
   viewportChange: [viewport: { scrollTop: number; scrollLeft: number }];
   selectionStateChange: [selection: { anchor: number; head: number }];
+  editorStateFlushed: [];
   sendSelectionToAi: [sql: string];
 }>();
 
@@ -2995,7 +2997,9 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
           // (the same one the sidebar/object-source viewers use). Tables keep
           // the aligned column layout from reformatHoverDdl.
           const isViewObject = objectMetadataRequest.objectType === "VIEW" || objectMetadataRequest.objectType === "MATERIALIZED_VIEW";
-          sqlContent = isViewObject ? await formatSqlForDisplay(rawDdl, props.formatDialect ?? sqlFormatDialectForDbType(props.databaseType), settingsStore.editorSettings.sqlFormatter) : reformatHoverDdl(rawDdl, quoteQualifiedName(hoverQualifiedName));
+          const formatDialect = props.formatDialect ?? sqlFormatDialectForDbType(props.databaseType);
+          const formatted = isViewObject ? await formatSqlForDisplay(rawDdl, formatDialect, settingsStore.editorSettings.sqlFormatter) : reformatHoverDdl(rawDdl, quoteQualifiedName(hoverQualifiedName));
+          sqlContent = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, formatDialect);
         }
       } catch (error) {
         console.warn(`[DBX] Failed to load table DDL for ${hoverDatabase}.${hoverSchema}.${table.name}:`, error);
@@ -3074,7 +3078,7 @@ async function resolveSqlHoverTooltip(currentView: EditorViewType, pos: number) 
 
 function sqlErrorDecorationRange(currentState: import("@codemirror/state").EditorState) {
   if (!props.executionError) return [];
-  if (!props.executionErrorSql || props.executionErrorSql !== currentState.doc.toString()) return [];
+  if (!props.executionErrorSql || !sqlErrorSqlMatchesEditor(currentState.doc.toString(), props.executionErrorSql)) return [];
   const range = resolveSqlErrorDecorationRange(currentState.doc.toString(), props.executionError);
   if (!range) return [];
   return [
@@ -6701,6 +6705,14 @@ function activateTabDocument(prevTabId: string | undefined, tabId: string | unde
   const cached = tabId === undefined ? undefined : tabStateCache.get(tabId);
   if (!cached) {
     swapEditorDocument(doc);
+    // First activation in this editor instance (or a cache-evicted tab, e.g.
+    // beyond MAX_CACHED_TAB_STATES): restore the tab's saved cursor and scroll
+    // position exactly like the cached-state branch, otherwise the swapped-in
+    // document keeps whatever scroll offset the dispatch left behind (#8374).
+    // A brand-new tab has no saved state, so reset it instead of falling back
+    // to the previous tab's latest position (#8378).
+    restoreEditorSelection(props.initialSelection ?? { anchor: 0, head: 0 });
+    restoreEditorViewport(props.initialViewport ?? { scrollTop: 0, scrollLeft: 0 });
     return;
   }
   // setState swaps doc, selection, undo history and all fields at once, but it
@@ -6974,6 +6986,7 @@ function pauseQueryEditorBackgroundWork() {
   cancelBatchColumnSelectionRefresh();
   flushEditorViewport();
   flushEditorSelection();
+  emit("editorStateFlushed");
   clearTableNavigationHover();
   clearPendingCompletionEnter();
   clearPendingCompletionTab();
@@ -7055,10 +7068,10 @@ function flushEditorSelection() {
   if (latestSelection) emitEditorSelection(latestSelection);
 }
 
-function restoreEditorSelection() {
-  const selection = normalizedEditorSelection(props.initialSelection ?? latestSelection, props.modelValue.length);
-  if (!view.value || !selection) return;
-  view.value.dispatch({ selection });
+function restoreEditorSelection(selection = props.initialSelection ?? latestSelection) {
+  const normalizedSelection = normalizedEditorSelection(selection, props.modelValue.length);
+  if (!view.value || !normalizedSelection) return;
+  view.value.dispatch({ selection: normalizedSelection });
 }
 
 function restoreEditorFocus() {
@@ -7097,8 +7110,7 @@ function flushEditorViewport() {
   if (latestViewport) emitEditorViewport(latestViewport);
 }
 
-function restoreEditorViewport() {
-  const viewport = props.initialViewport ?? latestViewport;
+function restoreEditorViewport(viewport = props.initialViewport ?? latestViewport) {
   if (!view.value || !viewport) return;
   const restoreScroll = () => {
     if (!view.value) return;

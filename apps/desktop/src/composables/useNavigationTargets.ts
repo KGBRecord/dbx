@@ -5,7 +5,7 @@ import { canApplyDataTabMetadata, canReuseActiveMongoTab, type DataTabReuseMode 
 import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
-import { editableRowIdentifierColumns, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { editableRowIdentifierColumns, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
 import { beginDataTabNavigation, endDataTabNavigation, isCurrentDataTabNavigation } from "@/lib/tabs/dataTabNavigationGeneration";
@@ -272,7 +272,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       // 异步窗口内 tab 可能已被复用为其他目标：旧请求的元数据不得落地、
       // 不得解除新目标的 pending
       if (!isCurrentTarget() || !isCurrentGeneration()) return;
-      const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, targetTableType);
+      const useRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, targetTableType);
       queryStore.setTableMeta(tabId, {
         schema: tableSchema,
         catalog: target.catalog,
