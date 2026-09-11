@@ -2517,11 +2517,8 @@ mod tests {
             database: String::new(),
             file_path: path.to_string_lossy().to_string(),
             continue_on_error: true,
-<<<<<<< HEAD
             selected_tables: None,
-=======
             part_cooldown_ms: 0,
->>>>>>> cf039630a (feat(sql-file): cool down between imported package parts)
         };
         let mut progress = Vec::new();
 
