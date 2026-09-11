@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -2686,6 +2686,21 @@ fn postgres_create_schema_sql(schema: &str) -> String {
     format!("CREATE SCHEMA IF NOT EXISTS {};", quote_identifier(schema, &DatabaseType::Postgres))
 }
 
+// Copy one line at a time so a `SplitZipExportWriter` can only rotate between
+// complete SQL statements; `std::io::copy` would feed it arbitrary 8KB chunks.
+fn combine_schema_sql_export<W: Write>(source: &mut dyn BufRead, destination: &mut W) -> std::io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = source.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        destination.write_all(&line)?;
+    }
+    Ok(())
+}
+
 async fn export_postgres_all_schemas_sql_core(
     state: &Arc<crate::connection::AppState>,
     request: &DatabaseExportRequest,
@@ -2781,16 +2796,8 @@ async fn export_postgres_all_schemas_sql_core(
             let mut source = std::io::BufReader::new(
                 std::fs::File::open(path).map_err(|e| format!("Failed to read temporary schema export: {e}"))?,
             );
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                let bytes_read = std::io::BufRead::read_until(&mut source, b'\n', &mut line)
-                    .map_err(|e| format!("Failed to read temporary schema export: {e}"))?;
-                if bytes_read == 0 {
-                    break;
-                }
-                file.write_all(&line).map_err(|e| format!("Failed to combine schema export: {e}"))?;
-            }
+            combine_schema_sql_export(&mut source, &mut file)
+                .map_err(|e| format!("Failed to combine schema export: {e}"))?;
             writeln!(file).map_err(|e| format!("Failed to write file: {e}"))?;
         }
         file.finish(&export_source_file_name(&request.file_path))?;
@@ -3818,7 +3825,7 @@ fn build_database_export_object_source_sql(
 #[cfg(test)]
 mod tests {
     use super::{
-        await_export_operation, await_export_stream_operation, clear_export_cancelled,
+        await_export_operation, await_export_stream_operation, clear_export_cancelled, combine_schema_sql_export,
         concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency,
         emit_database_export_cancelled, postgres_create_schema_sql, postgres_export_schema_names, set_export_cancelled,
         snapshot_batch_cancelled, ExportStatus, EXPORT_CANCELLED_ERROR,
@@ -5595,6 +5602,70 @@ mod tests {
         }
         // Reassembling every part in order must reproduce all 20 rows.
         let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined.matches("INSERT INTO").count(), 20);
+    }
+
+    #[test]
+    fn all_schemas_combine_keeps_split_part_boundaries_statement_safe() {
+        // Mirror of the per-schema temporary files that
+        // `export_postgres_all_schemas_sql_core` combines: whole SQL
+        // statements, one per line, each newline-terminated.
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("schema-0.sql");
+        let long_value = "x".repeat(200_000);
+        let mut schema_sql = String::new();
+        for row_index in 0..20 {
+            schema_sql.push_str(&format!("INSERT INTO orders VALUES ({row_index}, '{long_value}');\n"));
+        }
+        std::fs::write(&schema_path, &schema_sql).unwrap();
+
+        let zip_path = directory.path().join("combined.zip");
+        let mut writer = crate::export_split_zip::SplitZipExportWriter::create(
+            &zip_path,
+            crate::export_split_zip::MIN_SPLIT_PART_MAX_MB,
+            "combined",
+            "sql",
+        )
+        .unwrap();
+        let mut source = std::io::BufReader::new(std::fs::File::open(&schema_path).unwrap());
+        combine_schema_sql_export(&mut source, &mut writer).unwrap();
+        writer.finish("combined.sql").unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sql_parts = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if !entry.name().ends_with(".sql") {
+                continue;
+            }
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            sql_parts.push((entry.name().to_string(), contents));
+        }
+        sql_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert!(
+            sql_parts.len() > 1,
+            "expected the combined export to be split into multiple parts, got {}",
+            sql_parts.len()
+        );
+        for (name, contents) in &sql_parts {
+            assert!(!contents.is_empty(), "{name} must not be empty");
+            // Every non-blank line must be a complete statement -- proof that
+            // the copy never cut inside one.
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    line.trim_start().starts_with("INSERT INTO") && line.trim_end().ends_with(';'),
+                    "{name} has a malformed line from a mid-statement cut"
+                );
+            }
+        }
+        // Reassembling the parts in order must reproduce the temporary file
+        // byte for byte: the line-by-line copy adds, drops, and alters
+        // nothing, including the trailing newline.
+        let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined, schema_sql);
         assert_eq!(combined.matches("INSERT INTO").count(), 20);
     }
 
