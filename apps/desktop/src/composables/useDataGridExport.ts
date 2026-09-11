@@ -1410,11 +1410,12 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
         },
         true,
       );
-      const sqlExportOptions = await showSqlInsertModeDialog({ allowSplit: rowIds === undefined && context.value === "table-data" });
-      if (sqlExportOptions === null) {
+      const selectedSqlExportOptions = (await showSqlInsertModeDialog({ allowSplit: rowIds === undefined && context.value === "table-data" })) as SqlExportOptions | SqlInsertMode | null;
+      if (selectedSqlExportOptions === null) {
         logExportStage("cancelled", { stage: "insert-mode-dialog" });
         return;
       }
+      const sqlExportOptions = typeof selectedSqlExportOptions === "string" ? { insertMode: selectedSqlExportOptions } : selectedSqlExportOptions;
       const insertMode = sqlExportOptions.insertMode;
       logExportStage("mode-selected", { insertMode, splitMaxMb: sqlExportOptions.splitMaxMb });
       try {
@@ -1492,9 +1493,9 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
 
   async function exportCurrentPageSql() {
     await runExclusiveExport(async () => {
-      const sqlExportOptions = await showSqlInsertModeDialog();
-      if (sqlExportOptions === null) return;
-      const insertMode = sqlExportOptions.insertMode;
+      const selectedSqlExportOptions = (await showSqlInsertModeDialog()) as SqlExportOptions | SqlInsertMode | null;
+      if (selectedSqlExportOptions === null) return;
+      const insertMode = typeof selectedSqlExportOptions === "string" ? selectedSqlExportOptions : selectedSqlExportOptions.insertMode;
       try {
         const result = await resultToExport(undefined, undefined, false, false);
         const exportData = sqlInsertExportData(result);

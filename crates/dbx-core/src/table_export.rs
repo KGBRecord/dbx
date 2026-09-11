@@ -1028,6 +1028,7 @@ fn create_table_export_sql_writer(request: &TableExportRequest) -> Result<TableE
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_export_native_table_stream(
     state: &AppState,
     pool_key: &str,
