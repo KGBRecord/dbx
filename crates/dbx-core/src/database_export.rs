@@ -2781,7 +2781,16 @@ async fn export_postgres_all_schemas_sql_core(
             let mut source = std::io::BufReader::new(
                 std::fs::File::open(path).map_err(|e| format!("Failed to read temporary schema export: {e}"))?,
             );
-            std::io::copy(&mut source, &mut file).map_err(|e| format!("Failed to combine schema export: {e}"))?;
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let bytes_read = std::io::BufRead::read_until(&mut source, b'\n', &mut line)
+                    .map_err(|e| format!("Failed to read temporary schema export: {e}"))?;
+                if bytes_read == 0 {
+                    break;
+                }
+                file.write_all(&line).map_err(|e| format!("Failed to combine schema export: {e}"))?;
+            }
             writeln!(file).map_err(|e| format!("Failed to write file: {e}"))?;
         }
         file.finish(&export_source_file_name(&request.file_path))?;

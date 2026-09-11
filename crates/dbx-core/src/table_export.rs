@@ -1613,8 +1613,13 @@ async fn export_table_data_core_inner(
     }
 
     // 8. Create output file
-    let file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?;
-    let mut file = BufWriter::new(file);
+    let mut file = if request.format.eq_ignore_ascii_case("sql") {
+        create_table_export_sql_writer(request)?
+    } else {
+        TableExportSqlWriter::Plain(BufWriter::new(
+            std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create file: {e}"))?,
+        ))
+    };
     let mut text_buffer = String::new();
 
     let mut rows_exported: u64 = 0;
@@ -2205,7 +2210,7 @@ async fn export_table_data_core_inner(
     }
 
     close_table_export_cursor_if_open(state, &pool_key, request, &mut cursor_session).await;
-    file.flush().map_err(|e| format!("Failed to flush export file: {e}"))?;
+    file.finish(&format!("{}.sql", request.table_name))?;
 
     // 8. Emit Done progress
     on_progress(TableExportProgress {
