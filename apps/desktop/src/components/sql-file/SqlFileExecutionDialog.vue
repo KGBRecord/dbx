@@ -548,6 +548,7 @@ async function startExecution() {
           filePath: executionPaths[0]!,
           continueOnError: continueOnError.value,
           ...(restoreSelectedTables.value ? { selectedTables: selectedTables.value.map((table) => ({ ...table })) } : {}),
+          partCooldownMs: previews.value.some((item) => item.packageFilePaths) ? 500 : 0,
         },
         executionPaths,
       );

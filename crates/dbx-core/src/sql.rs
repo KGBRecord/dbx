@@ -61,6 +61,8 @@ pub struct SqlFileRequest {
     pub continue_on_error: bool,
     #[serde(default)]
     pub selected_tables: Option<Vec<crate::sql_file_import::SqlFileTable>>,
+    #[serde(default)]
+    pub part_cooldown_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

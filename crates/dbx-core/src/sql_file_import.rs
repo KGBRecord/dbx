@@ -593,6 +593,15 @@ pub async fn execute_sql_file_paths(
             prev_failure_count = progress.failure_count;
             prev_affected_rows = progress.affected_rows;
         }
+        if file_index + 1 < file_count && request.part_cooldown_ms > 0 {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    emit_sql_file_terminal_progress(request, &token, started_at, &progress, &mut emit);
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(request.part_cooldown_ms)) => {}
+            }
+        }
     }
     emit_sql_file_terminal_progress(request, &token, started_at, &progress, &mut emit);
     Ok(())
@@ -2508,7 +2517,11 @@ mod tests {
             database: String::new(),
             file_path: path.to_string_lossy().to_string(),
             continue_on_error: true,
+<<<<<<< HEAD
             selected_tables: None,
+=======
+            part_cooldown_ms: 0,
+>>>>>>> cf039630a (feat(sql-file): cool down between imported package parts)
         };
         let mut progress = Vec::new();
 

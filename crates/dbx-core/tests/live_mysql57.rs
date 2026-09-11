@@ -1174,6 +1174,7 @@ INSERT INTO install_check (id) VALUES (1), (2);
             .into_owned(),
         continue_on_error: false,
         selected_tables: None,
+        part_cooldown_ms: 0,
     };
 
     let _ = execute_sql_statement(
@@ -1260,6 +1261,7 @@ INSERT INTO children (parent_id) VALUES (LAST_INSERT_ID());
             .into_owned(),
         continue_on_error: false,
         selected_tables: None,
+        part_cooldown_ms: 0,
     };
 
     let _ = execute_sql_statement(
@@ -1330,6 +1332,7 @@ async fn live_sql_file_import_preserves_raw_mysql_binary_literal_bytes() {
         file_path: std::env::temp_dir().join(format!("mysql-binary-dump-{suffix}.sql")).to_string_lossy().into_owned(),
         continue_on_error: false,
         selected_tables: None,
+        part_cooldown_ms: 0,
     };
 
     tokio::fs::write(&request.file_path, script).await.unwrap();
