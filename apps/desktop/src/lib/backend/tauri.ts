@@ -4602,6 +4602,8 @@ export interface SqlFilePreview {
   preview: string;
   canExecuteWithoutSelectedDatabase: boolean;
   establishesDatabaseContext?: boolean;
+  packageFilePaths?: string[];
+  packagePartCount?: number;
 }
 
 export interface SqlFileProgress {

@@ -6191,6 +6191,7 @@ export default {
     databasePlaceholder: "Database name",
     options: "Options",
     continueOnError: "Continue on error",
+    packageParts: "{count} SQL parts",
     runInBackground: "Run in background",
     cancelling: "Cancelling...",
     cancel: "Cancel",
