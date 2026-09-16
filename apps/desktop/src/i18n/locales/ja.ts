@@ -5855,6 +5855,7 @@ export default withEnglishFallback({
     databasePlaceholder: "データベース名",
     options: "オプション",
     packageParts: "{count} 個のSQLパート",
+    skipRelationalConstraints: "インポート中に関連性制約を一時的に無効化",
     continueOnError: "エラー時に続行",
     cancelling: "キャンセル中...",
     cancel: "キャンセル",

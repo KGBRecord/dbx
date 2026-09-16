@@ -85,6 +85,7 @@ const database = ref("");
 const databaseOptions = ref<string[]>([]);
 const loadingDatabases = ref(false);
 const continueOnError = ref(false);
+const skipRelationalConstraints = ref(false);
 
 const running = ref(false);
 const cancelling = ref(false);
@@ -132,6 +133,7 @@ function resetPerFileState() {
 }
 
 const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
+const isMysqlCompatibleTarget = computed(() => store.getConfig(connectionId.value)?.db_type === "mysql");
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
 
@@ -309,6 +311,7 @@ function resetState() {
   databaseOptions.value = [];
   loadingDatabases.value = false;
   continueOnError.value = false;
+  skipRelationalConstraints.value = false;
   restoreSelectedTables.value = false;
   resetExecution();
 }
@@ -549,6 +552,7 @@ async function startExecution() {
           continueOnError: continueOnError.value,
           ...(restoreSelectedTables.value ? { selectedTables: selectedTables.value.map((table) => ({ ...table })) } : {}),
           partCooldownMs: previews.value.some((item) => item.packageFilePaths) ? 500 : 0,
+          skipRelationalConstraints: skipRelationalConstraints.value,
         },
         executionPaths,
       );
@@ -793,6 +797,11 @@ watch(
             <CheckSquare v-if="continueOnError" class="w-3.5 h-3.5 text-primary shrink-0" />
             <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
             {{ t("sqlFile.continueOnError") }}
+          </button>
+          <button v-if="isMysqlCompatibleTarget" type="button" class="flex items-center gap-2 text-xs text-left" :disabled="running" @click="skipRelationalConstraints = !skipRelationalConstraints">
+            <CheckSquare v-if="skipRelationalConstraints" class="w-3.5 h-3.5 text-primary shrink-0" />
+            <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
+            {{ t("sqlFile.skipRelationalConstraints") }}
           </button>
         </div>
 

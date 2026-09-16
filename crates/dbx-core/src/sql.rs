@@ -63,6 +63,11 @@ pub struct SqlFileRequest {
     pub selected_tables: Option<Vec<crate::sql_file_import::SqlFileTable>>,
     #[serde(default)]
     pub part_cooldown_ms: u64,
+    /// Temporarily disable MySQL `FOREIGN_KEY_CHECKS` for this import and
+    /// restore them on completion, error, or cancellation. Only applies to
+    /// MySQL-compatible connections that reuse one pinned session.
+    #[serde(default)]
+    pub skip_relational_constraints: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

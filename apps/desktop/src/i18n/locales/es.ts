@@ -5818,6 +5818,7 @@ export default withEnglishFallback({
     databasePlaceholder: "Nombre de la base de datos",
     options: "Opciones",
     packageParts: "{count} partes SQL",
+    skipRelationalConstraints: "Desactivar temporalmente las restricciones relacionales durante la importación",
     continueOnError: "Continuar en caso de error",
     runInBackground: "Ejecutar en segundo plano",
     cancelling: "Cancelando...",

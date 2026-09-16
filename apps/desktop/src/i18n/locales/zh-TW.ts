@@ -5138,6 +5138,7 @@ export default withEnglishFallback({
     databasePlaceholder: "資料庫名稱",
     options: "選項",
     packageParts: "{count} 個 SQL 分片",
+    skipRelationalConstraints: "匯入期間暫時停用關聯式約束",
     continueOnError: "錯誤後繼續",
     cancelling: "正在取消……",
     cancel: "取消",

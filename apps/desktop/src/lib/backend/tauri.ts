@@ -4585,6 +4585,7 @@ export interface SqlFileRequest {
   continueOnError: boolean;
   selectedTables?: SqlFileTable[];
   partCooldownMs?: number;
+  skipRelationalConstraints?: boolean;
 }
 
 export interface SqlFileTable {

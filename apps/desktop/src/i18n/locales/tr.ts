@@ -6074,6 +6074,7 @@ export default withEnglishFallback({
     databasePlaceholder: "Veritabanı adı",
     options: "Seçenekler",
     packageParts: "{count} SQL bölümü",
+    skipRelationalConstraints: "İçe aktarma sırasında ilişkisel kısıtlamaları geçici olarak devre dışı bırak",
     continueOnError: "Hatada devam et",
     runInBackground: "Arka planda çalıştır",
     cancelling: "İptal ediliyor...",

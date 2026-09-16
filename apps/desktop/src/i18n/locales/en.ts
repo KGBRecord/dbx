@@ -6191,6 +6191,7 @@ export default {
     databasePlaceholder: "Database name",
     options: "Options",
     continueOnError: "Continue on error",
+    skipRelationalConstraints: "Temporarily disable relational constraints during import",
     packageParts: "{count} SQL parts",
     runInBackground: "Run in background",
     cancelling: "Cancelling...",
