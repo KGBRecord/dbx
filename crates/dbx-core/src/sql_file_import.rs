@@ -293,7 +293,7 @@ impl MySqlSqlFileExecutor {
                         // A fresh session restores the server default FOREIGN_KEY_CHECKS = 1;
                         // re-issue the bypass so the remaining parts match the caller's toggle.
                         if self.constraints_disabled {
-                            self.set_foreign_key_checks(state, &child_token, false).await?;
+                            self.set_foreign_key_checks(state, child_token, false).await?;
                         }
                         continue;
                     }
