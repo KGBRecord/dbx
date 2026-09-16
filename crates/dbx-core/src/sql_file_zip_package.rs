@@ -61,14 +61,18 @@ pub fn extract_sql_file_zip_package(path: &Path, destination: &Path) -> Result<S
     let file = std::fs::File::open(path).map_err(|error| format!("Failed to open SQL ZIP package: {error}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|error| format!("Invalid SQL ZIP package: {error}"))?;
     for (index, part) in package.part_names.iter().enumerate() {
-        let mut entry =
-            archive.by_name(part).map_err(|_| format!("SQL ZIP package is missing manifest part: {part}"))?;
+        let entry = archive.by_name(part).map_err(|_| format!("SQL ZIP package is missing manifest part: {part}"))?;
         let output = destination.join(format!("{:05}-{}", index + 1, part));
         let mut target =
             std::fs::File::create(&output).map_err(|error| format!("Failed to create extracted SQL part: {error}"))?;
+        // `entry.size()` is declared metadata; the zip reader does not clamp decompressed output
+        // to it, so the copy itself must be bounded to keep a lying header from writing past the
+        // inspected limit before the mismatch check runs.
+        let declared = entry.size();
+        let mut bounded = entry.take(declared + 1);
         let copied =
-            std::io::copy(&mut entry, &mut target).map_err(|error| format!("Failed to extract SQL part: {error}"))?;
-        if copied != entry.size() {
+            std::io::copy(&mut bounded, &mut target).map_err(|error| format!("Failed to extract SQL part: {error}"))?;
+        if copied != declared {
             return Err(format!("Failed to fully extract SQL part: {part}"));
         }
         target.flush().map_err(|error| format!("Failed to flush extracted SQL part: {error}"))?;
@@ -77,12 +81,17 @@ pub fn extract_sql_file_zip_package(path: &Path, destination: &Path) -> Result<S
 }
 
 fn read_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
-    let mut entry = archive.by_name(name).map_err(|_| format!("SQL ZIP package is missing {name}"))?;
+    let entry = archive.by_name(name).map_err(|_| format!("SQL ZIP package is missing {name}"))?;
     if entry.is_dir() || entry.size() > max_bytes {
         return Err(format!("SQL ZIP package {name} exceeds limits"));
     }
     let mut bytes = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut bytes).map_err(|error| format!("Failed to read SQL ZIP {name}: {error}"))?;
+    let declared = entry.size();
+    let mut bounded = entry.take(max_bytes + 1);
+    bounded.read_to_end(&mut bytes).map_err(|error| format!("Failed to read SQL ZIP {name}: {error}"))?;
+    if bytes.len() as u64 != declared {
+        return Err(format!("SQL ZIP {name} does not match its declared size"));
+    }
     Ok(bytes)
 }
 
@@ -144,5 +153,26 @@ mod tests {
         let package_path = dir.path().join("package.zip");
         write_package(&package_path, &[("safe.sql", "SELECT 1;\n")], &["../safe.sql"]);
         assert!(inspect_sql_file_zip_package(&package_path).unwrap_err().contains("Unsafe"));
+    }
+
+    #[test]
+    fn rejects_parts_whose_declared_size_understates_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_path = dir.path().join("package.zip");
+        write_package(&package_path, &[("a.sql", &"SELECT 1;\n".repeat(64))], &["a.sql"]);
+        // Shrink the central-directory uncompressed size of the first entry so the declared
+        // metadata understates the real decompressed content: the bounded copy must stop at the
+        // declared size instead of inflating whatever the stream contains onto disk.
+        let mut bytes = std::fs::read(&package_path).unwrap();
+        let eocd = bytes.windows(4).rposition(|window| window == b"PK\x05\x06").unwrap();
+        let directory_offset = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[directory_offset..directory_offset + 4], b"PK\x01\x02");
+        let declared_size_at = directory_offset + 24;
+        bytes[declared_size_at..declared_size_at + 4].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&package_path, bytes).unwrap();
+
+        let destination = dir.path().join("parts");
+        let error = extract_sql_file_zip_package(&package_path, &destination).unwrap_err();
+        assert!(error.contains("Failed to fully extract SQL part"), "{error}");
     }
 }

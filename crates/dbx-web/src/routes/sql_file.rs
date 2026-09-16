@@ -286,14 +286,19 @@ fn cleanup_sql_file_uploads_older_than(tmp_dir: &Path, max_age: Duration) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let expired = entry
-            .metadata()
-            .ok()
-            .filter(|metadata| metadata.is_file())
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age >= max_age);
-        if expired {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        // Extracted `package-*` directories count too: a preview that never reaches execution
+        // leaves them behind, and they must expire with the uploaded files.
+        let expired =
+            metadata.modified().ok().and_then(|modified| modified.elapsed().ok()).is_some_and(|age| age >= max_age);
+        if !expired {
+            continue;
+        }
+        if metadata.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
             let _ = std::fs::remove_file(path);
         }
     }

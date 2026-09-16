@@ -46,6 +46,7 @@ pub async fn preview_sql_file(file_path: String) -> Result<SqlFilePreview, Strin
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
     {
+        sweep_stale_sql_zip_packages();
         let extraction_dir = std::env::temp_dir().join(format!("dbx-sql-package-{}", uuid::Uuid::new_v4()));
         let (package, extracted_paths) = tokio::task::spawn_blocking({
             let path = path.clone();
@@ -140,6 +141,29 @@ fn cleanup_sql_zip_package_paths(file_paths: &[String]) {
     }
     for directory in directories {
         let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+/// A preview that never reaches execution leaves its extraction directory behind, so each new
+/// preview also sweeps `dbx-sql-package-*` directories that have outlived a day.
+fn sweep_stale_sql_zip_packages() {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(|name| name.starts_with("dbx-sql-package-")) {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= MAX_AGE);
+        if expired {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 

@@ -151,6 +151,7 @@ struct MySqlSqlFileExecutor {
     dialect: db::mysql::MySqlQueryDialect,
     budget: DbOperationBudget,
     conn: Option<mysql_async::Conn>,
+    constraints_disabled: bool,
 }
 
 impl MySqlSqlFileExecutor {
@@ -197,6 +198,7 @@ impl MySqlSqlFileExecutor {
             ),
             budget,
             conn: None,
+            constraints_disabled: false,
         }))
     }
 
@@ -288,6 +290,11 @@ impl MySqlSqlFileExecutor {
                         let database = self.database.trim();
                         let database = (!database.is_empty()).then_some(database);
                         self.pool_key = state.reconnect_pool_for_session(&self.connection_id, database, None).await?;
+                        // A fresh session restores the server default FOREIGN_KEY_CHECKS = 1;
+                        // re-issue the bypass so the remaining parts match the caller's toggle.
+                        if self.constraints_disabled {
+                            self.set_foreign_key_checks(state, &child_token, false).await?;
+                        }
                         continue;
                     }
                     // Cancelled, or the retry itself failed with another
@@ -469,6 +476,7 @@ pub async fn execute_sql_file_paths(
             emit(sql_file_execution_error_progress(&request.execution_id, started_at, &progress, error.clone()));
             return Err(error);
         }
+        executor.constraints_disabled = true;
     }
     let file_count = file_paths.len();
     let mut prev_statement_index = 0usize;

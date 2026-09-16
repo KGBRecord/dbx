@@ -133,7 +133,15 @@ function resetPerFileState() {
 }
 
 const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
-const isMysqlCompatibleTarget = computed(() => store.getConfig(connectionId.value)?.db_type === "mysql");
+// Mirrors the core executor gate (`supports_connection_level_database_bootstrap_target`): the
+// MySQL-family types it runs for, so the constraint toggle appears wherever the backend honors it.
+const MYSQL_BOOTSTRAP_IMPORT_TYPES = new Set(["mysql", "doris", "starrocks", "goldendb"]);
+const MYSQL_BOOTSTRAP_IMPORT_PROFILES = new Set(["mariadb", "tidb", "oceanbase", "custom_mysql", "doris", "starrocks", "selectdb", "goldendb"]);
+const isMysqlCompatibleTarget = computed(() => {
+  const config = store.getConfig(connectionId.value);
+  if (!config) return false;
+  return MYSQL_BOOTSTRAP_IMPORT_TYPES.has(config.db_type) || (!!config.driver_profile && MYSQL_BOOTSTRAP_IMPORT_PROFILES.has(config.driver_profile.toLowerCase()));
+});
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
 
