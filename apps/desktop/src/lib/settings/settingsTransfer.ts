@@ -71,7 +71,7 @@ export function serializeSettingsTransfer(settings: EditorSettings, meta: Settin
 const SETTINGS_TRANSFER_CATEGORY_ORDER: readonly SettingsTransferCategoryId[] = ["appearance", "editor", "formatter", "navigation", "data", "shortcuts", "snippets", "other"];
 
 const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readonly EditorSettingsDraftKey[]> = {
-  appearance: ["fontFamily", "fontSize", "tableFontFamily", "uiFontFamily", "uiScale", "theme", "customThemes", "activeCustomThemeId", "backgroundImage", "toolbarItems", "updateNotificationsEnabled"],
+  appearance: ["fontFamily", "fontSize", "tableFontFamily", "uiFontFamily", "uiScale", "theme", "customThemes", "activeCustomThemeId", "backgroundImage", "toolbarItems"],
   editor: [
     "executeMode",
     "defaultTransactionMode",
@@ -141,13 +141,15 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
     "compactColumnHeaderActions",
     "dataGridQuickEntry",
     "dataGridFilterEditorView",
-    "dataGridAutoHideFilterBuilder",
+    "dataGridKeepFilterEditorExpanded",
     "dataGridTextFilterPanelHeight",
+    "defaultAutoKeepResults",
     "multiStatementDefaultView",
     "dataGridAutoTransposeSingleRow",
     "dataGridCellDetailButtonVisible",
     "dataGridCrosshairHighlight",
     "flatteningMultiLineText",
+    "dataGridShowWhitespace",
     "pageSize",
     "tableOpenPageSize",
     "queryResultMaxRowsEnabled",
@@ -169,7 +171,7 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
   ],
   shortcuts: ["shortcuts", "sqlShortcuts"],
   snippets: ["snippets"],
-  other: ["updateDownloadSource"],
+  other: ["updateDownloadSource", "updateNotificationsEnabled"],
 };
 
 const KEY_TO_CATEGORY = new Map<string, SettingsTransferCategoryId>();
@@ -258,6 +260,7 @@ const PASS_THROUGH_BOOLEAN_KEYS = [
   "compactColumnHeaderActions",
   "dataGridQuickEntry",
   "flatteningMultiLineText",
+  "dataGridShowWhitespace",
   "infiniteScroll",
   "autoCalculateTotalRows",
   "autoSelectActiveSidebarNode",
@@ -467,6 +470,13 @@ export function parseSettingsTransferFile(text: string): { ok: true; value: Pars
   if (!isPlainObject(settings)) return { ok: false, error: { code: "invalid-structure" } };
   const editor = settings.editor;
   if (!isPlainObject(editor)) return { ok: false, error: { code: "empty-settings" } };
+
+  // Old exports used the inverse `dataGridAutoHideFilterBuilder` flag. Keep
+  // accepting it, but normalize it into the single current preference before
+  // applying the strict whitelist below.
+  if (!("dataGridKeepFilterEditorExpanded" in editor) && typeof editor.dataGridAutoHideFilterBuilder === "boolean") {
+    editor.dataGridKeepFilterEditorExpanded = !editor.dataGridAutoHideFilterBuilder;
+  }
 
   const presentKeys = EDITOR_SETTINGS_DRAFT_KEYS.filter((key) => key in editor);
   if (presentKeys.length === 0) return { ok: false, error: { code: "empty-settings" } };

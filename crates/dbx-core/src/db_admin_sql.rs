@@ -203,6 +203,17 @@ pub struct DuplicateTableStructureSqlOptions {
     pub table_comment: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_comments: Vec<DuplicateTableColumnComment>,
+    /// Source primary-key columns to recreate on the clone. SQL Server's
+    /// `SELECT ... INTO` copies columns but drops constraints, so the clone
+    /// needs an explicit `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_key_columns: Vec<String>,
+    /// Pre-computed primary-key constraint name for the clone. Callers derive
+    /// it from the source index names so the generated `PK_{target}` respects
+    /// SQL Server's 128-character identifier limit and avoids a name that
+    /// already exists on the source table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_key_constraint_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
 }
@@ -263,8 +274,17 @@ pub fn build_create_database_sql(options: CreateDatabaseSqlOptions) -> Result<St
 }
 
 fn build_create_database_statement(options: &CreateDatabaseSqlOptions) -> Result<String, String> {
-    if !supports_create_database_target(options.database_type) {
+    if !supports_create_database_target(options.database_type, options.driver_profile.as_deref()) {
         return Err(format!("Creating databases is not supported for {}.", database_label(options.database_type)));
+    }
+    if is_informix_family(options.database_type, options.driver_profile.as_deref()) {
+        // Informix / GBase 8s accept only a bare `CREATE DATABASE <name>`. The new database
+        // inherits the instance default locale, and the MySQL `CHARACTER SET`/`COLLATE`
+        // clauses are invalid syntax here. Database names are ordinary identifiers, so quote
+        // them with the Informix rule (unquoted for simple identifiers) rather than the
+        // default double-quote path that `DatabaseType::Gbase` would otherwise take.
+        let name = quote_table_identifier(Some(DatabaseType::Informix), &options.name);
+        return Ok(format!("CREATE DATABASE {name};"));
     }
     let name = quote_table_identifier(options.database_type, &options.name);
     let charset = clean_sql_option(options.charset.as_deref());
@@ -277,7 +297,25 @@ fn build_create_database_statement(options: &CreateDatabaseSqlOptions) -> Result
     Ok(format!("CREATE DATABASE {name} CHARACTER SET {charset}{collate_clause};"))
 }
 
-pub fn supports_create_database_target(database_type: Option<DatabaseType>) -> bool {
+/// Whether the connection belongs to the Informix family: standalone Informix, or GBase 8s
+/// (which shares `DatabaseType::Gbase` with the MySQL-based GBase 8a and is only distinguishable
+/// through the `gbase8s` driver profile). Informix-family servers accept `CREATE DATABASE` but
+/// have no `CREATE SCHEMA <name>` statement (a "schema" is the table owner), so the create
+/// targets differ from the rest of the `Gbase` family.
+fn is_informix_family(database_type: Option<DatabaseType>, driver_profile: Option<&str>) -> bool {
+    match database_type {
+        Some(DatabaseType::Informix) => true,
+        Some(DatabaseType::Gbase) => driver_profile.is_some_and(|profile| profile.eq_ignore_ascii_case("gbase8s")),
+        _ => false,
+    }
+}
+
+pub fn supports_create_database_target(database_type: Option<DatabaseType>, driver_profile: Option<&str>) -> bool {
+    // Informix / GBase 8s create namespaces with `CREATE DATABASE`, so they are valid targets
+    // even though they are absent from the explicit list below.
+    if is_informix_family(database_type, driver_profile) {
+        return true;
+    }
     matches!(
         database_type,
         Some(
@@ -330,7 +368,6 @@ pub fn supports_create_schema_target(database_type: Option<DatabaseType>) -> boo
                 | DatabaseType::Trino
                 | DatabaseType::PrestoSql
                 | DatabaseType::H2
-                | DatabaseType::Informix
                 | DatabaseType::Xugu
                 | DatabaseType::Oscar
                 | DatabaseType::Iris
@@ -775,10 +812,32 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
             Some(format!("COMMENT ON COLUMN {target}.{column_name} IS {}", quote_sql_string(&column.comment)))
         }));
     }
-    if comment_sql.is_empty() {
+
+    // `SELECT ... INTO` copies the IDENTITY property but not constraints, so the cloned table
+    // would silently lose its primary key (t8y2/dbx#8931). Recreate it from the source metadata.
+    let mut constraint_sql = Vec::new();
+    if options.database_type == Some(DatabaseType::SqlServer) && !options.primary_key_columns.is_empty() {
+        let raw_constraint_name: String = match options.primary_key_constraint_name.as_deref() {
+            Some(name) => name.to_string(),
+            None => format!("PK_{}", options.target_name),
+        };
+        let constraint_name = quote_table_identifier(options.database_type, &raw_constraint_name);
+        let key_columns = options
+            .primary_key_columns
+            .iter()
+            .map(|column| quote_table_identifier(options.database_type, column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        constraint_sql
+            .push(format!("ALTER TABLE {target} ADD CONSTRAINT {constraint_name} PRIMARY KEY ({key_columns})"));
+    }
+
+    let mut trailing_sql = constraint_sql;
+    trailing_sql.extend(comment_sql);
+    if trailing_sql.is_empty() {
         return structure_sql;
     }
-    format!("{};\n{};", structure_sql.trim_end_matches(';'), comment_sql.join(";\n"))
+    format!("{};\n{};", structure_sql.trim_end_matches(';'), trailing_sql.join(";\n"))
 }
 
 pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
@@ -1371,6 +1430,74 @@ mod tests {
         })
         .unwrap_err()
         .contains("Creating databases is not supported"));
+    }
+
+    #[test]
+    fn builds_informix_family_create_database_without_mysql_clause() {
+        // GBase 8s shares DatabaseType::Gbase with GBase 8a and is only identified by the
+        // gbase8s driver profile; it must emit a bare, unquoted CREATE DATABASE.
+        assert_eq!(
+            build_create_database_sql(CreateDatabaseSqlOptions {
+                database_type: Some(DatabaseType::Gbase),
+                driver_profile: Some("gbase8s".to_string()),
+                target: None,
+                parent: None,
+                name: "app_db".to_string(),
+                charset: Some("utf8mb4".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+            })
+            .unwrap(),
+            "CREATE DATABASE app_db;"
+        );
+        // Standalone Informix behaves the same.
+        assert_eq!(
+            build_create_database_sql(CreateDatabaseSqlOptions {
+                database_type: Some(DatabaseType::Informix),
+                driver_profile: None,
+                target: None,
+                parent: None,
+                name: "app_db".to_string(),
+                charset: None,
+                collation: None,
+            })
+            .unwrap(),
+            "CREATE DATABASE app_db;"
+        );
+    }
+
+    #[test]
+    fn gbase8a_is_not_a_create_database_target() {
+        assert!(build_create_database_sql(CreateDatabaseSqlOptions {
+            database_type: Some(DatabaseType::Gbase),
+            driver_profile: Some("gbase8a".to_string()),
+            target: None,
+            parent: None,
+            name: "app_db".to_string(),
+            charset: None,
+            collation: None,
+        })
+        .unwrap_err()
+        .contains("Creating databases is not supported"));
+    }
+
+    #[test]
+    fn rejects_create_schema_for_informix_effective_dialect() {
+        // The frontend collapses GBase 8s to the Informix dialect for schema DDL; Informix has no
+        // CREATE SCHEMA <name>, so it must be rejected rather than emitting invalid SQL.
+        assert!(build_create_schema_sql(SchemaNameSqlOptions {
+            database_type: Some(DatabaseType::Informix),
+            name: "app".to_string(),
+        })
+        .unwrap_err()
+        .contains("Creating schemas is not supported"));
+    }
+
+    #[test]
+    fn create_database_target_distinguishes_gbase_profiles() {
+        assert!(supports_create_database_target(Some(DatabaseType::Gbase), Some("gbase8s")));
+        assert!(!supports_create_database_target(Some(DatabaseType::Gbase), Some("gbase8a")));
+        assert!(!supports_create_database_target(Some(DatabaseType::Gbase), None));
+        assert!(supports_create_database_target(Some(DatabaseType::Informix), None));
     }
 
     #[test]
@@ -2120,6 +2247,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `users_copy` LIKE `users`;"
@@ -2132,6 +2261,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"public\".\"users_copy\" (LIKE \"public\".\"users\" INCLUDING ALL);"
@@ -2144,6 +2275,8 @@ mod tests {
                 target_name: "connection_test_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `dbx_demo`.`connection_test_copy` LIKE `dbx_demo`.`connection_test`;"
@@ -2156,6 +2289,8 @@ mod tests {
                 target_name: "orders_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `dbx_demo`.`orders_copy` LIKE `dbx_demo`.`orders`;"
@@ -2168,6 +2303,8 @@ mod tests {
                 target_name: "customer_orders_copy".to_string(),
                 table_comment: Some("  Customer's orders; archive  ".to_string()),
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"public\".\"customer_orders_copy\" (LIKE \"public\".\"customer_orders\" INCLUDING ALL);\nCOMMENT ON TABLE \"public\".\"customer_orders_copy\" IS '  Customer''s orders; archive  ';"
@@ -2180,6 +2317,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"public\".\"users_copy\" (LIKE \"public\".\"users\" INCLUDING ALL);"
@@ -2192,6 +2331,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "SELECT TOP 0 * INTO [dbo].[users_copy] FROM [dbo].[users];"
@@ -2204,9 +2345,53 @@ mod tests {
                 target_name: "USERS_COPY".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"HR\".USERS_COPY AS SELECT * FROM \"HR\".\"USERS\" WHERE 1=0"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: Some("dbo".to_string()),
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
+                identifier_quote: None,
+            }),
+            "SELECT TOP 0 * INTO [dbo].[users_copy] FROM [dbo].[users];"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: None,
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec!["id".to_string(), "seq no".to_string()],
+                primary_key_constraint_name: None,
+                identifier_quote: None,
+            }),
+            "SELECT TOP 0 * INTO [users_copy] FROM [users];\nALTER TABLE [users_copy] ADD CONSTRAINT [PK_users_copy] PRIMARY KEY ([id], [seq no]);"
+        );
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                schema: None,
+                source_name: "users".to_string(),
+                target_name: "users_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                primary_key_constraint_name: Some("PK_users_copy_2".to_string()),
+                identifier_quote: None,
+            }),
+            "SELECT TOP 0 * INTO [users_copy] FROM [users];\nALTER TABLE [users_copy] ADD CONSTRAINT [PK_users_copy_2] PRIMARY KEY ([id]);"
         );
         let dameng_sql = build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
             database_type: Some(DatabaseType::Dameng),
@@ -2222,6 +2407,8 @@ mod tests {
                 DuplicateTableColumnComment { name: "STATUS".to_string(), comment: "active  ".to_string() },
                 DuplicateTableColumnComment { name: "EMPTY".to_string(), comment: " \t\n".to_string() },
             ],
+            primary_key_columns: vec![],
+            primary_key_constraint_name: None,
             identifier_quote: None,
         });
         assert_eq!(
@@ -2245,6 +2432,8 @@ mod tests {
             target_name: "users_copy".to_string(),
             table_comment: Some("line1\\path\nline2".to_string()),
             column_comments: vec![],
+            primary_key_columns: vec![],
+            primary_key_constraint_name: None,
             identifier_quote: None,
         });
         assert_eq!(
@@ -2260,6 +2449,8 @@ mod tests {
                 target_name: "UsersCopy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"APP\".\"UsersCopy\" AS SELECT * FROM \"APP\".\"USERS\" WHERE 1=0"
@@ -2278,6 +2469,8 @@ mod tests {
                 target_name: "copy".to_string(),
                 table_comment: Some("owner\\'s; archive".to_string()),
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             });
             let expected_literal = if database_type == DatabaseType::Redshift {
@@ -2302,6 +2495,8 @@ mod tests {
                 target_name: "tb_a_copy".to_string(),
                 table_comment: None,
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE \"SQLUSER\".\"tb_a_copy\" AS SELECT * FROM \"SQLUSER\".\"tb_a\" WHERE 1=0"
@@ -2314,6 +2509,8 @@ mod tests {
                 target_name: "users_copy".to_string(),
                 table_comment: Some("ignored by QuestDB".to_string()),
                 column_comments: vec![],
+                primary_key_columns: vec![],
+                primary_key_constraint_name: None,
                 identifier_quote: None,
             }),
             "CREATE TABLE `users_copy` (LIKE `users`);"

@@ -126,10 +126,15 @@ export interface ConnectionConfig {
   redis_database_aliases?: Record<string, string>;
   /** Key-search templates for the Redis browser. Non-empty overrides global settings. */
   redis_key_templates?: string[];
+  redis_key_grouping?: import("@/lib/redis/redisKeyGrouping").RedisKeyGrouping;
   etcd_endpoints?: string;
   gbase_server?: string;
   informix_server?: string;
   external_config?: unknown;
+  plugin_id?: string;
+  plugin_connection_provider?: string;
+  plugin_connection_type?: string;
+  connection_secrets?: Record<string, string>;
   one_time?: boolean;
   /**
    * Whether the database password may be persisted locally. When false, the
@@ -259,19 +264,352 @@ export interface PluginDriverManifest {
   database_type?: string;
 }
 
+export type PluginFormFieldType = "text" | "password" | "number" | "boolean" | "select" | "radio" | "textarea";
+export type PluginFormFieldBinding = "config" | "secret" | "name" | "host" | "port" | "username" | "password" | "database";
+
+export type PluginFormFieldValue = string | number | boolean | undefined;
+
+export interface LocalSshKey {
+  /** Absolute path to the private key file. */
+  path: string;
+  /** SSH algorithm name (e.g. `ssh-ed25519`); empty when undetectable. */
+  algorithm: string;
+  /** SHA-256 fingerprint (`SHA256:...`); empty when the key could not be decoded. */
+  fingerprint: string;
+  /** Heuristic: the key looks passphrase-protected. */
+  hasPassphrase: boolean;
+}
+
+export interface PluginFormFieldOption {
+  label: string;
+  value: string;
+}
+
+export interface PluginFieldCondition {
+  /** Key of another plugin form field whose current value drives the condition. */
+  field: string;
+  /** The condition matches when the referenced field's value is in this list. */
+  one_of: string[];
+}
+
+export interface PluginFormField {
+  key: string;
+  label: string;
+  type: PluginFormFieldType;
+  description?: string;
+  placeholder?: string;
+  required?: boolean;
+  default?: PluginFormFieldValue;
+  options?: PluginFormFieldOption[];
+  /** Plugin method returning `{ options: [{ value, label }] }` for dynamic
+   * select rendering; falls back to the declared type when unavailable. */
+  options_action?: string;
+  binding?: PluginFormFieldBinding;
+  visible_when?: PluginFieldCondition;
+  required_when?: PluginFieldCondition;
+}
+
+export type PluginConnectionCapability = "test" | "connect" | "disconnect";
+export type PluginConnectionActionKind = "test" | "save" | "save-and-connect" | "custom";
+export type PluginConnectionActionVariant = "default" | "outline" | "secondary" | "destructive" | "ghost";
+export type PluginConnectionActionWhen = "always" | "create" | "edit";
+
+export interface PluginConnectionActionContribution {
+  id: string;
+  label: string;
+  description?: string;
+  variant?: PluginConnectionActionVariant;
+  when?: PluginConnectionActionWhen;
+  close_on_success?: boolean;
+  requires_valid_form?: boolean;
+  timeout_ms?: number;
+}
+
+export interface PluginConnectionAction {
+  id: string;
+  kind: PluginConnectionActionKind;
+  label?: string;
+  description?: string;
+  variant?: PluginConnectionActionVariant;
+  when?: PluginConnectionActionWhen;
+  close_on_success?: boolean;
+  requires_valid_form?: boolean;
+  timeout_ms?: number;
+}
+
+export interface PluginConnectionProviderContribution {
+  type: "connection-provider";
+  id: string;
+  label: string;
+  icon?: string;
+  database_type: string;
+  description?: string;
+  fields: PluginFormField[];
+  workbench?: string;
+  filesystem_provider?: string;
+  capabilities?: PluginConnectionCapability[];
+  actions?: PluginConnectionActionContribution[];
+}
+
+export interface PluginWorkbenchContribution {
+  type: "workbench";
+  id: string;
+  label: string;
+  description?: string;
+  icon?: string;
+}
+
+export interface PluginFilesystemProviderContribution {
+  type: "filesystem-provider";
+  id: string;
+  label: string;
+  schemes: string[];
+  description?: string;
+  icon?: string;
+  root_uri?: string;
+  capabilities?: Array<"read" | "write" | "delete" | "rename" | "mkdir">;
+}
+
+export type PluginFilesystemEntryKind = "file" | "directory" | "symlink" | "other";
+
+export interface PluginFilesystemEntry {
+  name: string;
+  uri: string;
+  kind: PluginFilesystemEntryKind;
+  size?: number;
+  modifiedAt?: string;
+  contentType?: string;
+}
+
+export interface PluginFilesystemListResult {
+  entries: PluginFilesystemEntry[];
+  nextCursor?: string;
+}
+
+export interface PluginFilesystemReadResult {
+  dataBase64: string;
+  contentType?: string;
+  truncated: boolean;
+  etag?: string;
+}
+
+export interface PluginFilesystemMutationResult {
+  success: boolean;
+  message?: string;
+  entry?: PluginFilesystemEntry;
+}
+
+export interface PluginContextMenuContribution {
+  type: "context-menu";
+  id: string;
+  label: string;
+  description?: string;
+  icon?: string;
+  menu: string;
+}
+
+export interface PluginResultViewContribution {
+  type: "result-view";
+  id: string;
+  label: string;
+  description?: string;
+  icon?: string;
+}
+
+export type PluginContribution = PluginConnectionProviderContribution | PluginWorkbenchContribution | PluginFilesystemProviderContribution | PluginContextMenuContribution | PluginResultViewContribution;
+
+export interface PluginEngines {
+  dbx: string;
+  host_api: string;
+}
+
+export interface PluginBackendEntrypoint {
+  protocol_versions?: number[];
+  transport?: "stdio-jsonl" | "stdio-framed";
+  executable: string;
+}
+
+export interface PluginUiEntrypoint {
+  root?: string;
+  entry: string;
+}
+
+export interface PluginEntrypoints {
+  backend?: PluginBackendEntrypoint;
+  ui?: PluginUiEntrypoint;
+}
+
+export interface PluginFormFieldLocalization {
+  label?: string;
+  description?: string;
+  placeholder?: string;
+  options?: Record<string, string>;
+}
+
+export interface PluginContributionLocalization {
+  label?: string;
+  description?: string;
+  fields?: Record<string, PluginFormFieldLocalization>;
+  actions?: Record<string, { label?: string; description?: string }>;
+}
+
+export interface PluginManifestLocalization {
+  name?: string;
+  description?: string;
+  contributions?: Record<string, PluginContributionLocalization>;
+}
+
+export interface PluginCompatibility {
+  compatible: boolean;
+  errors?: string[];
+  warnings?: string[];
+  target?: string;
+}
+
 export interface PluginManifest {
+  manifest_version?: number;
   id: string;
   name: string;
+  icon?: string;
   version?: string;
+  publisher?: string;
+  engines?: PluginEngines;
+  permissions?: string[];
+  entrypoints?: PluginEntrypoints;
   protocol_version?: number;
   description?: string;
+  source?: string;
+  homepage?: string;
   executable?: string;
   drivers: PluginDriverManifest[];
+  contributions?: PluginContribution[];
+  localizations?: Record<string, PluginManifestLocalization>;
 }
 
 export interface InstalledPlugin {
   manifest: PluginManifest;
-  path: string;
+  compatibility: PluginCompatibility;
+  path?: string;
+}
+
+export interface PluginTrustedKey {
+  keyId: string;
+  publicKey: string;
+}
+
+export type PluginRepositoryKind = "official" | "custom" | "enterprise";
+
+export interface PluginRepository {
+  id: string;
+  name: string;
+  kind: PluginRepositoryKind;
+  catalogUrl?: string;
+  enabled: boolean;
+  managed: boolean;
+}
+
+export interface PluginMarketplaceRepositoryMetadata {
+  id: string;
+  name: string;
+  homepage?: string;
+}
+
+export interface PluginMarketplaceLocalization {
+  name?: string;
+  description?: string;
+}
+
+export interface PluginMarketplaceArtifact {
+  target: string;
+  url: string;
+  sha256: string;
+  signingKeyId: string;
+  size?: number;
+}
+
+export interface PluginMarketplaceVersion {
+  version: string;
+  releasedAt?: string;
+  releaseNotes?: string;
+  artifacts: PluginMarketplaceArtifact[];
+}
+
+export interface PluginMarketplacePlugin {
+  id: string;
+  name: string;
+  description: string;
+  publisher: string;
+  verified: boolean;
+  icon?: string;
+  tags: string[];
+  permissions: string[];
+  source?: string;
+  homepage?: string;
+  license?: string;
+  latestVersion: string;
+  versions: PluginMarketplaceVersion[];
+  localizations?: Record<string, PluginMarketplaceLocalization>;
+}
+
+export interface PluginMarketplaceCatalog {
+  catalogVersion: number;
+  repository: PluginMarketplaceRepositoryMetadata;
+  generatedAt?: string;
+  plugins: PluginMarketplacePlugin[];
+}
+
+export interface PluginRepositoryCatalogResult {
+  repository: PluginRepository;
+  target: string;
+  catalog?: PluginMarketplaceCatalog;
+  error?: string;
+}
+
+export interface PluginMarketplaceInstallRequest {
+  repositoryId: string;
+  pluginId: string;
+  version?: string;
+}
+
+export interface ActivePluginSession {
+  pluginId: string;
+  processId?: number;
+  state: "starting" | "running" | "stopping" | "stopped" | "exited";
+}
+
+export interface PluginUiAssetPayload {
+  contentType: string;
+  dataBase64: string;
+  etag: string;
+}
+
+export interface PluginConnectionActionResult {
+  message?: string;
+  fieldValues?: Record<string, PluginFormFieldValue | null>;
+}
+
+export interface PluginInstallResult {
+  plugin: InstalledPlugin;
+  previousVersion?: string;
+  packageSha256: string;
+  signature: { status: "trusted"; key_id: string } | { status: "unsigned" };
+}
+
+export interface PluginRollbackResult {
+  plugin: InstalledPlugin;
+  previousVersion: string;
+}
+
+export interface PluginEvent {
+  pluginId: string;
+  method: string;
+  params: unknown;
+}
+
+export interface PluginBinaryEvent {
+  pluginId: string;
+  channel: string;
+  dataBase64: string;
 }
 
 export interface JdbcDriverInfo {
@@ -337,6 +675,8 @@ export interface DatabaseInfo {
   comment?: string | null;
   default_charset?: string | null;
   default_collation?: string | null;
+  /** Database-level compatibility mode, for example openGauss A/B/C/PG. */
+  compatibility_mode?: string | null;
 }
 
 export interface DatabaseStorageInfo {
@@ -743,6 +1083,13 @@ export interface QueryResult {
   /** Absolute offsets in the editor document at execution time. */
   sourceFrom?: number;
   sourceTo?: number;
+  /**
+   * Frontend-internal: the statement text actually sent for this result when it
+   * differs from `sourceStatement` (pagination wrapping, hidden-key rewrites…).
+   * Backend SQL error positions are relative to this text, so it is needed to
+   * map an error row/column back onto the user's original statement.
+   */
+  executedStatement?: string;
   /** Database server messages (notices, warnings) emitted while producing this result. Omitted when empty. */
   messages?: QueryMessage[];
 }
@@ -799,6 +1146,13 @@ export interface QueryResultRun {
   pinned?: boolean;
   /** Distinguishes successive result payloads that reuse the same run slot. */
   resultGridRevision?: string;
+  /**
+   * Logical-result identity for the tab-switch view snapshot cache. Distinct
+   * from `resultGridRevision` (the grid remount key): this one changes on every
+   * dataset replacement, including in-place refresh, and is preserved across
+   * disk eviction/restore. See `dataGridViewStateCache.ts`.
+   */
+  resultViewGeneration?: string;
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
@@ -936,6 +1290,8 @@ export type TreeNodeType =
   | "group-types"
   | "group-sequences"
   | "group-synonyms"
+  | "oracle-db-links"
+  | "oracle-db-link"
   | "group-jobs"
   | "group-packages"
   | "group-partitions"
@@ -1012,6 +1368,8 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  /** Database-level compatibility mode, for example openGauss A/B/C/PG. */
+  compatibilityMode?: string;
   catalog?: string;
   catalogType?: string;
   linkedServer?: string;
@@ -1116,6 +1474,8 @@ export interface TableStructureEditorViewport {
 
 export type ObjectBrowserViewMode = "list" | "grid";
 
+export type ObjectBrowserFilter = "all" | "tables" | "views" | "materializedViews" | "procedures" | "functions" | "triggers" | "events" | "sequences" | "packages" | "types";
+
 export interface ObjectBrowserViewport {
   scrollTop: number;
   viewMode: ObjectBrowserViewMode;
@@ -1140,6 +1500,18 @@ export interface QueryPageJumpProgress {
   completedRequests: number;
   totalRequests: number;
   targetPage: number;
+}
+
+export type TabOutputView = "result" | "summary" | "explain" | "chart" | "messages" | "profile";
+
+export type TabPageUiState = Record<string, unknown>;
+
+/** UI-only state that must survive an inactive tab's component being unmounted. */
+export interface TabUiState {
+  activeOutputView?: TabOutputView;
+  resultPaneOpen?: boolean;
+  /** Small JSON-compatible snapshots owned by special-page components. */
+  page?: Record<string, TabPageUiState>;
 }
 
 export interface QueryTab {
@@ -1199,9 +1571,13 @@ export interface QueryTab {
   activeResultIndex?: number;
   /** Distinguishes successive result payloads that reuse the current result slot. */
   resultGridRevision?: string;
+  /** Logical-result identity for the tab-switch view snapshot cache; see QueryResultRun. */
+  resultViewGeneration?: string;
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
+  /** Undefined inherits the default on open; false preserves an explicit per-tab opt-out. */
   resultAutoSave?: boolean;
+  uiState?: TabUiState;
   explainPlan?: import("@/lib/diagram/explainPlan").ParsedExplainPlan;
   /** MySQL's regular EXPLAIN result, kept alongside its JSON visual plan. */
   explainTableResult?: QueryResult;
@@ -1211,6 +1587,7 @@ export interface QueryTab {
   explainTableSql?: string;
   lastExplainedSql?: string;
   isExecuting: boolean;
+  redisMonitorActive?: boolean;
   isCancelling?: boolean;
   queryExecutionStartedAt?: number;
   /** Ephemeral per-statement progress for the latest multi-statement execution. */
@@ -1267,7 +1644,20 @@ export interface QueryTab {
     | "mysql-dashboard"
     | "postgres-dashboard"
     | "xugu-dashboard"
-    | "dolt-version-control";
+    | "dolt-version-control"
+    | "plugin-workbench"
+    | "plugin-filesystem";
+  pluginWorkbench?: {
+    pluginId: string;
+    contributionId: string;
+    context?: Record<string, unknown>;
+  };
+  pluginFilesystem?: {
+    pluginId: string;
+    providerId: string;
+    rootUri?: string;
+    currentUri?: string;
+  };
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
   hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
@@ -1295,6 +1685,7 @@ export interface QueryTab {
     /** 显式的"新建事件"请求：单调递增，用于让已复用 tab 也能重复进入 CREATE 编辑器 */
     eventCreateRequestId?: number;
     initialObjectFilter?: "tables" | "events";
+    filter?: ObjectBrowserFilter;
     searchQuery?: string;
     viewport?: ObjectBrowserViewport;
   };
@@ -1305,6 +1696,29 @@ export interface QueryTab {
     name: string;
     objectType: ObjectSourceKind;
     signature?: string;
+  };
+  /**
+   * 「先出 UI 再加载」的中间态：源码 tab 已经可见，但源码还在路上
+   * （ensureConnected + getObjectSource）。让 tab 栏与编辑区在等待期间就有反馈，
+   * 失败时就地显示错误 + Retry，而不是等到加载完才建 tab、失败只弹 toast。
+   *
+   * 纯运行期字段，刻意不进 openTabsPersistence 的落盘白名单：重启后恢复出的
+   * tab 只是普通空 tab，不会永久停在「加载中」。
+   */
+  sourceLoad?: {
+    startedAt: number;
+    /** 加载失败时写入；保留 request 以便就地重试 */
+    error?: string;
+    /**
+     * 重试所需的请求身份。与 `objectSource` 分开保存：objectType 在这里是
+     * **请求时**的类型，而 `objectSource.objectType` 是 routine fallback
+     * 解析后的类型（PROCEDURE↔FUNCTION、PACKAGE↔PACKAGE_BODY 会被改写）。
+     */
+    request: {
+      name: string;
+      objectType: ObjectSourceKind;
+      signature?: string;
+    };
   };
   tableComment?: string | null;
   tableMeta?: {
@@ -1534,4 +1948,5 @@ export interface CollectionInfo {
   milvusSchema?: MilvusCollectionSchema;
   kind?: MongoCollectionKind | "bucket";
   bucketName?: string;
+  aliases?: string[];
 }

@@ -59,7 +59,7 @@ describe("right sidebar panel entry points", () => {
     expect(appSource).toContain("const isAiPanelMaximized = ref(false);");
     expect(appSource).toContain(':maximized="isAiPanelMaximized"');
     expect(appSource).toContain('@toggle-maximize="toggleAiPanelMaximized"');
-    expect(appSource).toContain("isAiPanelMaximized ? 'min-w-0 flex-1' : 'min-w-[180px] max-w-full'");
+    expect(appSource).toContain("isAiPanelMaximized ? 'min-w-0 flex-1' : 'min-w-[240px] max-w-full'");
     expect(appSource).toContain('v-show="!isAiPanelMaximized && !isZenMode"');
     expect(functionSource("setRightSidebarPanelOpen", "toggleRightSidebarPanel")).toContain("isAiPanelMaximized.value = false;");
   });
@@ -72,7 +72,10 @@ describe("right sidebar panel entry points", () => {
     expect(appSource).toContain("isToggleZenModeShortcut(e, shortcuts) && supportsZenMode(activeTab.value?.mode)");
     expect(appSource).toContain('@toggle-zen-mode="toggleZenMode"');
     expect(appSource).toContain('v-show="sidebarOpen && !isZenMode"');
-    expect(appSource).toContain('v-show="!sidebarOpen && !isZenMode"');
+    expect(appSource).toContain(':show-sidebar-expand="!sidebarOpen && !isZenMode"');
+    expect(toolbarSource).toContain('<Tooltip v-if="showSidebarExpand">');
+    expect(toolbarSource).toContain("@click=\"emit('expand-sidebar')\"");
+    expect(appSource).toContain('@expand-sidebar="setSidebarOpen(true)"');
     expect(appSource).toContain('v-show="!isAiPanelMaximized || isZenMode"');
     expect(appSource).toContain('v-show="!isZenMode"');
   });

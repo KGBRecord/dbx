@@ -24,14 +24,14 @@ export interface SqlSemanticDiagnosticVisibleRange {
   to: number;
 }
 
-export function sqlSemanticDiagnosticRangesForViewport(sql: string, visibleRanges: readonly SqlSemanticDiagnosticVisibleRange[], databaseType?: DatabaseType): SqlTextRange[] {
-  const statements = databaseType === "sqlserver" ? sqlServerSemanticDiagnosticRanges(sql) : executableStatementRanges(sql, databaseType);
+export function sqlSemanticDiagnosticRangesForViewport(sql: string, visibleRanges: readonly SqlSemanticDiagnosticVisibleRange[], databaseType?: DatabaseType, cachedStatements?: readonly SqlTextRange[], parameterOptions?: { compatibilityMode?: string }): SqlTextRange[] {
+  const statements = databaseType === "sqlserver" ? sqlServerSemanticDiagnosticRanges(sql) : (cachedStatements ?? executableStatementRanges(sql, databaseType, parameterOptions));
   if (statements.length === 0 || visibleRanges.length === 0) return [];
 
   const selected: SqlTextRange[] = [];
   const seen = new Set<string>();
   for (const statement of statements) {
-    if (isOraclePlSqlStatement(statement.sql, databaseType)) continue;
+    if (isOraclePlSqlStatement(statement.sql, databaseType, parameterOptions)) continue;
     if (!visibleRanges.some((visibleRange) => rangesIntersect(statement, visibleRange))) continue;
     const key = `${statement.from}:${statement.to}`;
     if (seen.has(key)) continue;
@@ -286,7 +286,7 @@ export function buildSqlSemanticDiagnostics(analysis: SqlReferenceAnalysis, sche
     // would otherwise show a false "Unknown column" diagnostic. Reuse the
     // completion context, which already extracts aliases and knows when they
     // are visible, to keep diagnostics aligned with executable SQL semantics.
-    if (schema.sql && isVisibleProjectionAlias(schema.sql, column.span, column.name)) continue;
+    if (schema.sql && isVisibleProjectionAlias(schema.sql, column.span, column.name, schema.databaseType)) continue;
 
     const displayName = column.qualifier ? `${column.qualifier}.${column.name}` : column.name;
     diagnostics.push({
@@ -327,10 +327,10 @@ export function isSqlVirtualTableReference(table: { name: string; schema?: strin
   return databaseType === "mysql" && !table.schema && normalizeName(table.name) === "dual";
 }
 
-function isVisibleProjectionAlias(sql: string, span: SqlTextSpan, name: string): boolean {
+function isVisibleProjectionAlias(sql: string, span: SqlTextSpan, name: string, databaseType?: DatabaseType): boolean {
   const range = sqlTextSpanToOffsetRange(sql, span);
   if (!range) return false;
-  const context = getSqlCompletionContext(sql, range.to);
+  const context = getSqlCompletionContext(sql, range.to, { databaseType });
   if (!context.prioritizeSelectAliases) return false;
   return context.selectAliases.some((alias) => normalizeName(alias) === normalizeName(name));
 }

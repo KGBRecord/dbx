@@ -25,6 +25,12 @@ function rect(left: number, width: number): DOMRect {
   } as DOMRect;
 }
 
+function pointerEvent(type: string, clientX: number, pointerId = 1): MouseEvent {
+  const event = new MouseEvent(type, { bubbles: true, clientX });
+  Object.defineProperty(event, "pointerId", { value: pointerId });
+  return event;
+}
+
 describe("usePanelResize", () => {
   beforeEach(() => {
     vi.stubGlobal("localStorage", localStorageMock);
@@ -49,10 +55,10 @@ describe("usePanelResize", () => {
     vi.spyOn(panel, "getBoundingClientRect").mockReturnValue(rect(1000, 360));
 
     const { aiPanelWidth, startAiPanelResize } = usePanelResize();
-    handle.addEventListener("mousedown", startAiPanelResize);
-    handle.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 1000 }));
-    document.dispatchEvent(new MouseEvent("mousemove", { clientX: -1000 }));
-    document.dispatchEvent(new MouseEvent("mouseup"));
+    handle.addEventListener("pointerdown", startAiPanelResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 1000));
+    document.dispatchEvent(pointerEvent("pointermove", -1000));
+    document.dispatchEvent(pointerEvent("pointerup", -1000));
 
     expect(aiPanelWidth.value).toBe(1060);
     expect(localStorage.getItem("dbx-ai-panel-width")).toBe("1060");
@@ -71,13 +77,58 @@ describe("usePanelResize", () => {
     vi.spyOn(panel, "getBoundingClientRect").mockReturnValue(rect(300, 700));
 
     const { aiPanelWidth, startAiPanelResize } = usePanelResize();
-    handle.addEventListener("mousedown", startAiPanelResize);
-    handle.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 300 }));
-    document.dispatchEvent(new MouseEvent("mousemove", { clientX: 400 }));
-    document.dispatchEvent(new MouseEvent("mouseup"));
+    handle.addEventListener("pointerdown", startAiPanelResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 300));
+    document.dispatchEvent(pointerEvent("pointermove", 400));
+    document.dispatchEvent(pointerEvent("pointerup", 400));
 
     expect(aiPanelWidth.value).toBe(600);
     expect(localStorage.getItem("dbx-ai-panel-width")).toBe("600");
+  });
+
+  it("keeps resizable panels wide enough for their toolbar actions", () => {
+    const panel = document.createElement("div");
+    const handle = document.createElement("div");
+    panel.append(handle);
+    document.body.append(panel);
+
+    vi.spyOn(panel, "getBoundingClientRect").mockReturnValue(rect(0, 260));
+
+    const { sidebarWidth, startSidebarResize } = usePanelResize();
+    handle.addEventListener("pointerdown", startSidebarResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 260));
+    document.dispatchEvent(pointerEvent("pointermove", 0));
+
+    expect(panel.style.width).toBe("240px");
+    document.dispatchEvent(pointerEvent("pointerup", 0));
+
+    expect(sidebarWidth.value).toBe(240);
+    expect(localStorage.getItem("dbx-sidebar-width")).toBe("240");
+  });
+
+  it("removes the drag overlay when the window loses focus", () => {
+    const panel = document.createElement("div");
+    const handle = document.createElement("div");
+    panel.append(handle);
+    document.body.append(panel);
+
+    const { startSidebarResize } = usePanelResize();
+    handle.addEventListener("pointerdown", startSidebarResize);
+    handle.dispatchEvent(pointerEvent("pointerdown", 260));
+
+    expect(document.body.querySelector('[aria-hidden="true"]')).not.toBeNull();
+    window.dispatchEvent(new Event("blur"));
+    expect(document.body.querySelector('[aria-hidden="true"]')).toBeNull();
+  });
+
+  it("raises persisted panel widths below the toolbar-safe minimum", () => {
+    localStorage.setItem("dbx-sidebar-width", "180");
+    localStorage.setItem("dbx-ai-panel-width", "200");
+
+    const { sidebarWidth, aiPanelWidth } = usePanelResize();
+
+    expect(sidebarWidth.value).toBe(240);
+    expect(aiPanelWidth.value).toBe(240);
   });
 
   it("persists the collapsed vertical tab bar state across composable instances", () => {

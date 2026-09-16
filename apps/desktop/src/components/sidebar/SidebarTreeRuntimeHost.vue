@@ -28,6 +28,7 @@ import {
   Plug,
   Unplug,
   Pin,
+  PlugZap,
   ArrowRightLeft,
   Download,
   Eye,
@@ -61,6 +62,7 @@ import {
   Settings2,
   GitBranch,
   Sparkles,
+  Link2,
 } from "@lucide/vue";
 import type { ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
@@ -69,8 +71,10 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { useToast } from "@/composables/useToast";
+import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
+import type { InstalledPlugin } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
-import type { ColumnInfo, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import type { ElasticsearchIndexMetadataKind } from "@/lib/backend/tauri";
 import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
@@ -152,13 +156,13 @@ import {
   type TableChildObjectType,
 } from "@/lib/database/dbAdminSql";
 import { buildRenameObjectSql, buildRenameDatabaseSql, buildRenameDatabasePreflightSql, databaseRenameMaintenanceDatabase, supportsDatabaseRename, supportsObjectRename, type RenameableObjectType } from "@/lib/table/objectRenameSql";
-import { buildEditableObjectSource, buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
-import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
+import { buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
 import { buildViewDdl } from "@/lib/table/viewDdl";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
 import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
-import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionTableSqlSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { isObjectCacheInvalidationError } from "@/lib/metadata/objectCacheInvalidationError";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import {
   defaultPasteTableMode,
@@ -192,6 +196,7 @@ import { formatSidebarTableCopyText, type FormatSidebarTableNamesOptions } from 
 import { supportsScheduledDatabaseBackup } from "@/lib/backup/scheduledDatabaseBackup";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { copyToClipboard } from "@/lib/common/clipboard";
+import { buildConnectionUrlCopy, CONNECTION_URL_COPY_WITH_PASSWORD_FORMATS, connectionUrlCopyFormats, type ConnectionUrlCopyFormat } from "@/lib/connection/connectionUrlBuilder";
 import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
 import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
 import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
@@ -337,7 +342,7 @@ import {
   type DuplicateStructureSource,
 } from "./sidebarTreeDialogState";
 
-const { t } = useI18n();
+const { t, locale: appLocale } = useI18n();
 
 const connectionStore = useConnectionStore();
 
@@ -348,6 +353,15 @@ const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 
 const { toast } = useToast();
+const installedPlugins = ref<InstalledPlugin[]>([]);
+const sidebarPluginRegistry = computed(() => createFrontendPluginRegistry(installedPlugins.value, appLocale.value));
+
+void api.listPlugins().then(
+  (plugins) => {
+    installedPlugins.value = plugins.filter((plugin) => plugin.compatibility.compatible);
+  },
+  () => {},
+);
 
 const { highlight } = useSqlHighlighter();
 
@@ -389,21 +403,22 @@ watch(
   { flush: "post" },
 );
 
-const { copyStructureAs, copyStructureDocText, copyStructurePreview, exportData, exportDataXlsx, exportStructure, saveStructurePreview, selectTextareaContent } = useSidebarTreeExportRuntime({
+const { copyStructureAs, copyStructureDocText, copyStructurePreview, exportData, exportDataXlsx, exportMongoCollection, exportStructure, saveStructurePreview, selectTextareaContent } = useSidebarTreeExportRuntime({
   activeNode,
   connectionStore,
   settingsStore,
   acceptedSelectionIds: () => acceptedSelectionIds,
 });
 
-const { openAllDatabasesExport, openDataCompare, openDatabaseExport, openDatabaseSearch, openDiagram, openDocs, openFieldLineage, openScheduledBackups, openSchemaDiff, openSqlFileExecution, openStructureEditor, openTableImport, openTransfer } = useSidebarTreeToolRuntime({
-  activeNode,
-  connectionStore,
-  queryStore,
-  settingsStore,
-  tableChildObjectName: tableChildDropObjectName,
-  acceptedSelectionIds: () => acceptedSelectionIds,
-});
+const { openAllDatabasesExport, openDataCompare, openDatabaseExport, openDatabaseSearch, openDiagram, openDocs, openFieldLineage, openMongoImport, openScheduledBackups, openSchemaDiff, openSchemaDiffForRoutine, openSqlFileExecution, openStructureEditor, openTableImport, openTransfer } =
+  useSidebarTreeToolRuntime({
+    activeNode,
+    connectionStore,
+    queryStore,
+    settingsStore,
+    tableChildObjectName: tableChildDropObjectName,
+    acceptedSelectionIds: () => acceptedSelectionIds,
+  });
 
 const emit = defineEmits<{
   "rename-started": [];
@@ -888,7 +903,8 @@ async function toggle(requestId = beginNavigationRequest()) {
       return;
     }
 
-    if (node.type === "package" && node.connectionId && supportsPackageMemberExpansion(currentDatabaseType())) {
+    const packageDatabaseType = currentDatabaseType();
+    if (node.type === "package" && node.connectionId && supportsPackageMemberExpansion(packageDatabaseType, packageDatabaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(node.connectionId, node.database) : undefined)) {
       await connectionStore.loadPackageMembers(node);
       emitNodeToggled(node, wasExpanded);
       return;
@@ -921,6 +937,9 @@ async function toggle(requestId = beginNavigationRequest()) {
         await connectionStore.loadNacosNamespaces(node.connectionId, treeLoadSearchOptions);
       } else if (config?.db_type === "mqtt") {
         await connectionStore.loadMqttTopics(node.connectionId);
+      } else if (config?.db_type === "plugin") {
+        await queryStore.openPluginConnection(node.connectionId);
+        return;
       } else {
         await connectionStore.loadDatabases(node.connectionId, treeLoadSearchOptions);
       }
@@ -1005,6 +1024,8 @@ async function toggle(requestId = beginNavigationRequest()) {
       await connectionStore.loadDorisCatalogDatabases(node, treeLoadSearchOptions);
     } else if (node.type === "schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && schemaNodeHasLoadableName(effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)), node.schema)) {
       await connectionStore.loadTables(node.connectionId, node.database, node.schema, treeLoadSearchOptions);
+    } else if (node.type === "oracle-db-links") {
+      await connectionStore.loadTreeNodeChildren(node, treeLoadSearchOptions);
     } else if (node.type === "linked-server-root" && node.connectionId) {
       await connectionStore.loadSqlServerLinkedServers(node.connectionId, treeLoadSearchOptions);
     } else if (node.type === "linked-server" && node.connectionId) {
@@ -1533,6 +1554,11 @@ function openMongoTreeData(node: TreeNode) {
     return;
   }
   if (node.type !== "mongo-collection") return;
+  const existing = queryStore.tabs.find((tab) => tab.mode === "mongo" && tab.connectionId === node.connectionId && tab.database === node.database && tab.tableMeta?.tableName === node.label);
+  if (existing) {
+    queryStore.switchTab(existing.id);
+    return;
+  }
   const tab = queryStore.createTab(node.connectionId, node.database, tabTitle, "mongo");
   queryStore.updateSql(tab, node.label);
   queryStore.setTableMeta(tab, {
@@ -1618,13 +1644,16 @@ async function openObjectBrowser(eventReadOnly = false, openEventEditor: boolean
     const eventCreateRequestId = openEventEditor === "create" && node.type === "group-events" ? ++mysqlEventCreateRequestSeq : undefined;
     const objectFilter = node.type === "event" || node.type === "group-events" ? "events" : undefined;
 
+    const connection = connectionStore.getConfig(node.connectionId);
+    if (!connection) return;
+    if (connection.db_type === "plugin") {
+      await queryStore.openPluginConnection(node.connectionId);
+      return;
+    }
     if (hasTreeNodeDatabaseContext(node)) {
       queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
       return;
     }
-
-    const connection = connectionStore.getConfig(node.connectionId);
-    if (!connection) return;
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
@@ -2163,6 +2192,19 @@ function openElasticsearchIndexMetadata(kind: ElasticsearchIndexMetadataKind) {
 
 async function refresh() {
   const node = activeNode.value;
+  if (node.type === "connection" && node.connectionId) {
+    try {
+      await connectionStore.refreshConnectionTreeNode(node);
+    } catch (e: any) {
+      if (isObjectCacheInvalidationError(e)) {
+        toast(t("connection.objectCacheRefreshFailed", { message: translateBackendError(t, e) }), 5000);
+        return;
+      }
+      toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
+      openDriverStoreForInstallError(e?.message || String(e), node);
+    }
+    return;
+  }
   try {
     await connectionStore.refreshTreeNode(node);
   } catch (e: any) {
@@ -2207,6 +2249,64 @@ function copyNameMenuItem(): ContextMenuItem {
     };
   }
   return { label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value };
+}
+
+const CONNECTION_URL_COPY_LABEL_KEYS: Record<ConnectionUrlCopyFormat, string> = {
+  url: "contextMenu.copyConnectionUrl",
+  urlWithPassword: "contextMenu.copyConnectionUrlWithPassword",
+  jdbcUrl: "contextMenu.copyJdbcUrl",
+  jdbcUrlWithCredentials: "contextMenu.copyJdbcUrlWithCredentials",
+  hostPort: "contextMenu.copyHostPort",
+  dsn: "contextMenu.copyDsn",
+  dsnWithPassword: "contextMenu.copyDsnWithPassword",
+  psqlCommand: "contextMenu.copyPsqlCommand",
+};
+
+/**
+ * "Copy Connection Info" submenu for connection/database nodes: standard URL,
+ * JDBC URL, host:port, libpq DSN and psql command, trimmed to what the
+ * connection's dialect actually supports. The primary entries never embed the
+ * stored password; password-inclusive entries say so in their label and are
+ * gated behind a confirmation dialog. `databaseOverride` lets a database node
+ * copy the URL for that specific database instead of the default one.
+ */
+function connectionUrlCopyMenuItem(databaseOverride?: string): ContextMenuItem | null {
+  const node = activeNode.value;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  if (!config) return null;
+  const formats = connectionUrlCopyFormats(config);
+  if (formats.length === 0) return null;
+  return {
+    label: t("contextMenu.copyConnectionInfo"),
+    icon: Link2,
+    children: formats.map((format) => ({
+      label: t(CONNECTION_URL_COPY_LABEL_KEYS[format]),
+      action: () => copyConnectionUrlFormat(config, format, databaseOverride),
+    })),
+  };
+}
+
+const showCopyConnectionSecretConfirm = shallowRef(false);
+let pendingConnectionSecretCopy: { config: ConnectionConfig; format: ConnectionUrlCopyFormat; databaseOverride?: string } | null = null;
+
+function copyConnectionUrlFormat(config: ConnectionConfig, format: ConnectionUrlCopyFormat, databaseOverride?: string) {
+  if (CONNECTION_URL_COPY_WITH_PASSWORD_FORMATS.has(format)) {
+    pendingConnectionSecretCopy = { config, format, databaseOverride };
+    showCopyConnectionSecretConfirm.value = true;
+    return;
+  }
+  return performConnectionUrlCopy(config, format, databaseOverride);
+}
+
+async function performConnectionUrlCopy(config: ConnectionConfig, format: ConnectionUrlCopyFormat, databaseOverride?: string) {
+  const text = buildConnectionUrlCopy(config, format, { database: databaseOverride });
+  if (!text) return;
+  try {
+    await copyToClipboard(text);
+    toast(t("connection.copied"), 2000);
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 async function copyCustomTypeDdl() {
@@ -2439,63 +2539,22 @@ function openObjectSourceDialog(initialEditing: boolean, viewPackageBody = false
   const database = node.database;
   const sourceTarget = objectSourceTargetForTreeNode(sourceNode);
   if (!sourceTarget) return;
-  const openMode = settingsStore.editorSettings.routineSourceOpenMode;
-  if (openMode === "query-tab") {
-    void connectionStore
-      .ensureConnected(connectionId)
-      .then(async () => {
-        connectionStore.activeConnectionId = connectionId;
-        const schema = sourceTarget.schema || database;
-        const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
-        if (!databaseType) throw new Error("Connection type is unavailable.");
-        const objectName = sourceTarget.name;
-        const {
-          raw,
-          editableSource,
-          objectType: resolvedType,
-        } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
-          connectionId,
-          database,
-          schema,
-          name: objectName,
-          objectType: sourceTarget.objectType as any,
-          databaseType,
-          signature: sourceNode.signature,
-        });
-        const sourceIsEditable = raw.editable !== false && !["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY", "JOB"].includes(resolvedType);
-        if (sourceIsEditable) {
-          queryStore.openObjectSourceTab({
-            connectionId,
-            database,
-            title: `Source - ${node.label}`,
-            schema,
-            catalog: node.catalog,
-            sql: editableSource,
-            objectSource: {
-              schema,
-              name: objectName,
-              objectType: resolvedType,
-              signature: node.signature,
-            },
-          });
-        } else {
-          queryStore.createTab(connectionId, database, `Source - ${node.label}`, "query", schema, editableSource, node.catalog, { forceNew: true, sourceView: true });
-        }
-      })
-      .catch((e: any) => {
-        toast(e?.message || String(e), 5000);
-      });
+  const schema = sourceTarget.schema || database;
+  // issue #9035：两个分支都不再 await 连接与取源。先把容器挂出来（源码 tab /
+  // 源码弹窗），ensureConnected 与 getObjectSource 都发生在已挂载的 UI 之内，
+  // 加载中有状态、失败就地重试，而不是点击后一段时间毫无反应。
+  if (settingsStore.editorSettings.routineSourceOpenMode === "query-tab") {
+    queryStore.openObjectSourceTabPending({
+      connectionId,
+      database,
+      title: `Source - ${node.label}`,
+      schema,
+      catalog: node.catalog,
+      request: { name: sourceTarget.name, objectType: sourceTarget.objectType, signature: sourceNode.signature },
+    });
     return;
   }
-  void connectionStore
-    .ensureConnected(connectionId)
-    .then(() => {
-      connectionStore.activeConnectionId = connectionId;
-      emit("open-object-source", sourceNode, initialEditing);
-    })
-    .catch((e: any) => {
-      toast(e?.message || String(e), 5000);
-    });
+  emit("open-object-source", sourceNode, initialEditing);
 }
 
 function openProcedureExecution() {
@@ -2712,11 +2771,13 @@ function batchTruncateConfirmMessage(): string {
 
 async function dropSqlForTreeNode(node: TreeNode, options?: { cascade?: boolean }): Promise<string | null> {
   if (node.type === "table" && node.connectionId && node.database) {
+    const config = connectionStore.getConfig(node.connectionId);
     return buildDropTableSql({
       databaseType: databaseTypeForNode(node),
-      schema: node.schema,
+      schema: connectionTableSqlSchema(config, node.schema),
       tableName: node.label,
       cascade: options?.cascade && supportsDropTableCascade(databaseTypeForNode(node)),
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
     });
   }
   const objectOptions = dropObjectSqlOptionsForNode(node);
@@ -4432,6 +4493,8 @@ function createView() {
           identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
           schema: node.schema,
           tableName: viewName,
+          includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+          quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
         });
   const tabId = queryStore.createTab(node.connectionId, node.database, t("contextMenu.createView"), "query", node.schema, undefined, node.catalog);
   queryStore.updateSql(tabId, `CREATE VIEW ${viewSqlName} AS\nSELECT\n  *\nFROM table_name;\n`);
@@ -4492,7 +4555,7 @@ const canOpenSqlFileExecution = computed(() => {
 const canExportAllDatabases = computed(() => {
   if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
   const dbType = connectionStore.getConfig(activeNode.value.connectionId)?.db_type;
-  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(dbType || "");
+  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "plugin"].includes(dbType || "");
 });
 
 const canOpenScheduledBackups = computed(() => {
@@ -4645,6 +4708,19 @@ routeDangerDialog(showDeleteSavedSqlConfirm, () =>
     message: t("savedSql.deleteFileConfirm", { name: activeNode.value.label }),
     confirmLabel: t("dangerDialog.confirm"),
     confirm: confirmDeleteSavedSqlFile,
+  }),
+);
+
+routeDangerDialog(showCopyConnectionSecretConfirm, () =>
+  dangerRequest({
+    title: t("contextMenu.copyPasswordConfirmTitle"),
+    message: t("contextMenu.copyPasswordConfirmMessage"),
+    confirmLabel: t("contextMenu.copyPasswordConfirmAction"),
+    confirm: () => {
+      const pending = pendingConnectionSecretCopy;
+      pendingConnectionSecretCopy = null;
+      if (pending) return performConnectionUrlCopy(pending.config, pending.format, pending.databaseOverride);
+    },
   }),
 );
 
@@ -5342,6 +5418,8 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     }
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    const connectionUrlCopyMenu = connectionUrlCopyMenuItem();
+    if (connectionUrlCopyMenu) items.push(connectionUrlCopyMenu);
     items.push({ label: "", separator: true });
     const supportsQueryActions = supportsConnectionQueryActions(currentDatabaseType());
     const supportsAiContext = supportsAiAssistantContext(currentDatabaseType());
@@ -5560,6 +5638,8 @@ function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.unshift({ label: t("contextMenu.closeDatabaseConnection"), action: closeDatabaseConnection, icon: Unplug });
     }
     items.push(copyNameMenuItem());
+    const databaseUrlCopyMenu = connectionUrlCopyMenuItem(node.database || undefined);
+    if (databaseUrlCopyMenu) items.push(databaseUrlCopyMenu);
     items.push({ label: "", separator: true });
     if (canOpenObjectBrowser.value) {
       items.push({ label: t("contextMenu.openObjectBrowser"), action: openObjectBrowser, icon: TableProperties });
@@ -5850,6 +5930,15 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (canCloneMongoCollection.value) {
       items.push({ label: t("contextMenu.cloneCollection"), action: openCloneMongoCollectionDialog, icon: CopyPlus });
     }
+    items.push({ label: t("contextMenu.importData"), action: openMongoImport, icon: Download });
+    items.push({
+      label: t("contextMenu.exportData"),
+      icon: Upload,
+      children: [
+        { label: "CSV", action: () => void exportMongoCollection("csv") },
+        { label: "NDJSON", action: () => void exportMongoCollection("ndjson") },
+      ],
+    });
     if (canDropMongoCollection.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.dropCollection"), action: dropMongoCollection, icon: Trash2, shortcut: shortcutDelete, variant: "destructive" as const });
@@ -6112,6 +6201,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
     }
     items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (!isPackageMember) {
+      items.push({ label: t("diff.title"), action: openSchemaDiffForRoutine, icon: ArrowRightLeft });
+    }
     if (!isPackageMember && canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
       items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
     }
@@ -6356,7 +6448,38 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
   }
 
+  appendPluginConnectionMenuItems(items, node);
+
   return items;
+}
+
+/** Plugin-contributed native menu entries for saved connections. */
+function appendPluginConnectionMenuItems(items: ContextMenuItem[], node: TreeNode) {
+  if (node.type !== "connection") return;
+  const pluginItems = sidebarPluginRegistry.value.listContextMenuItems("connection");
+  if (pluginItems.length === 0) return;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  if (!config) return;
+  items.push({ label: "", separator: true });
+  for (const { plugin, contribution } of pluginItems) {
+    items.push({
+      label: contribution.label,
+      icon: PlugZap,
+      action: () => {
+        api
+          .invokePlugin(plugin.manifest.id, `contextMenu/${contribution.id}`, {
+            connection: { id: config.id, dbType: config.db_type, name: config.name, database: config.database || "" },
+          })
+          .then((result) => {
+            const message = (result as { message?: unknown } | null | undefined)?.message;
+            if (typeof message === "string" && message.trim()) toast(message, 4000);
+          })
+          .catch((error: unknown) => {
+            toast(String((error as Error)?.message || error), 5000);
+          });
+      },
+    });
+  }
 }
 
 function activateRuntimeNode(node: TreeNode) {

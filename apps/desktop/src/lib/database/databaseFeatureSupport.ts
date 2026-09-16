@@ -124,7 +124,7 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
  * SQL editor against a broker (issue #8415).
  */
 export function supportsConnectionQueryActions(dbType?: DatabaseType): boolean {
-  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "mqtt";
+  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "zookeeper" && dbType !== "plugin" && dbType !== "mq" && dbType !== "mqtt";
 }
 
 /**
@@ -228,7 +228,13 @@ export function supportsObjectBrowser(dbType?: DatabaseType): boolean {
 
 export function supportsConnectionDatabaseBrowser(dbType?: DatabaseType): boolean {
   // MongoDB reuses the object browser for collections, not the SQL database list.
-  return supportsObjectBrowser(dbType) && dbType !== "mongodb";
+  //
+  // Message brokers (`mq` — Kafka/Pulsar/RocketMQ/RabbitMQ/NATS, separated only by
+  // driver_profile) keep the objectBrowser capability for their tenant/topic tree,
+  // but they expose no database namespace: the connection-level browser tab listed
+  // nothing and rendered "no databases found" (issue #8515). Their workbench is the
+  // MQ admin tab instead. MQTT is already excluded: it has no objectBrowser at all.
+  return supportsObjectBrowser(dbType) && dbType !== "mongodb" && dbType !== "mq";
 }
 
 export function supportsObjectBrowserTreeNode(dbType: DatabaseType | undefined, nodeType: TreeNodeType): boolean {
@@ -251,7 +257,12 @@ export function usesPostgresLikeStructureCopy(dbType?: DatabaseType): boolean {
   return !!dbType && PG_LIKE_STRUCTURE_TYPES.has(dbType);
 }
 
-const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "mysql", "oracle", "jdbc"];
+const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "mysql", "oracle", "jdbc", "oceanbase-oracle"];
+
+/** Oracle-family databases that use the sticky manual-transaction UX. OceanBase
+ * Oracle mode runs the same transaction model as Oracle, so it shares the
+ * commit/rollback dirty-state behavior rather than the generic transaction path. */
+const ORACLE_STICKY_TRANSACTION_TYPES: ReadonlySet<string> = new Set(["oracle", "oceanbase-oracle"]);
 
 /**
  * Returns true if the given database type supports explicit transaction control
@@ -259,6 +270,58 @@ const TRANSACTION_SUPPORTED_TYPES: readonly string[] = ["postgres", "mysql", "or
  */
 export function supportsTransaction(dbType?: string): boolean {
   return !!dbType && TRANSACTION_SUPPORTED_TYPES.includes(dbType);
+}
+
+// Engines confirmed to reject SELECT projection aliases inside HAVING (they
+// resolve only source columns there): the PostgreSQL family (PostgreSQL,
+// Redshift, Kingbase, HighGo, UXDB, Vastbase, GaussDB, openGauss, KwDB), SQL
+// Server, DB2, the Oracle family (Oracle, OceanBase Oracle mode, Yashandb,
+// Dameng, Oscar, Xugu), Informix, Firebird, Exasol, Trino, and PrestoSQL.
+// Everything else — including Spark, Databricks, Hive-family engines, and
+// Snowflake, which all resolve SELECT aliases in HAVING — keeps the
+// permissive behavior, mirroring DBeaver's permissive-default
+// ProjectionAliasVisibilityScope with a deny list of known rejecters.
+const HAVING_ALIAS_REJECTED_DATABASE_TYPES: ReadonlySet<string> = new Set([
+  "postgres",
+  "redshift",
+  "kingbase",
+  "highgo",
+  "uxdb",
+  "vastbase",
+  "gaussdb",
+  "opengauss",
+  "kwdb",
+  "sqlserver",
+  "db2",
+  "oracle",
+  "oceanbase-oracle",
+  "yashandb",
+  "dameng",
+  "oscar",
+  "xugu",
+  "informix",
+  "firebird",
+  "exasol",
+  "trino",
+  "prestosql",
+]);
+
+/**
+ * Returns true when the engine rejects SELECT alias references from the
+ * HAVING clause, so alias completion hides there and the "Unknown column"
+ * diagnostic keeps flagging a projected alias used in HAVING. Unknown or
+ * unlisted database types stay permissive.
+ */
+export function rejectsAliasReferenceInHaving(dbType?: string): boolean {
+  return !!dbType && HAVING_ALIAS_REJECTED_DATABASE_TYPES.has(dbType);
+}
+
+/**
+ * Returns true if the database type uses Oracle's sticky manual-transaction state
+ * (commit/rollback hidden until an unproven statement dirties the session).
+ */
+export function usesOracleStickyTransactionState(dbType?: string): boolean {
+  return !!dbType && ORACLE_STICKY_TRANSACTION_TYPES.has(dbType);
 }
 
 /**

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use deadpool_postgres::{ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
 use futures::{SinkExt, StreamExt};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
@@ -59,6 +59,16 @@ pub(crate) fn gaussdb_identifier_quote_for_compatibility_mode(compatibility_mode
     }
 }
 
+pub async fn opengauss_compatibility_mode(pool: &Pool) -> Result<Option<String>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let row = postgres_query_one_cached(&client, GAUSSDB_COMPATIBILITY_SQL, &[]).await.map_err(|e| e.to_string())?;
+    Ok(row.try_get::<_, Option<String>>(0).ok().flatten().filter(|value| !value.trim().is_empty()))
+}
+
+pub async fn opengauss_is_oracle_compatible(pool: &Pool) -> Result<bool, String> {
+    Ok(opengauss_compatibility_mode(pool).await?.is_some_and(|mode| mode.trim().eq_ignore_ascii_case("A")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostgresTablePrivilegeInfo {
     pub grantor: String,
@@ -109,6 +119,7 @@ pub enum PostgresColumnDefaultState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostgresTablePartitionLocalObjects {
     pub has_primary_key: bool,
+    pub unique_constraints: BTreeSet<String>,
     pub foreign_keys: BTreeSet<String>,
     pub indexes: BTreeSet<String>,
     /// CHECK constraints with a local definition on this partition, as
@@ -121,9 +132,6 @@ pub struct PostgresTablePartitionLocalObjects {
 }
 
 fn pg_temporal_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
-    if let Ok(v) = row.try_get::<_, DateTime<Local>>(idx) {
-        return Some(serde_json::Value::String(format_pg_timestamptz(v)));
-    }
     if let Ok(v) = row.try_get::<_, NaiveDateTime>(idx) {
         return Some(serde_json::Value::String(v.to_string()));
     }
@@ -825,7 +833,7 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
     if let Ok(values) = row.try_get::<_, Vec<Option<uuid::Uuid>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
     }
-    if let Ok(values) = row.try_get::<_, Vec<Option<DateTime<Local>>>>(idx) {
+    if let Ok(values) = row.try_get::<_, Vec<Option<DateTime<Utc>>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(format_pg_timestamptz(v))));
     }
     if let Ok(values) = row.try_get::<_, Vec<Option<NaiveDateTime>>>(idx) {
@@ -869,7 +877,7 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
     None
 }
 
-fn format_pg_timestamptz(value: DateTime<Local>) -> String {
+fn format_pg_timestamptz(value: DateTime<Utc>) -> String {
     value.to_rfc3339()
 }
 
@@ -956,6 +964,17 @@ fn pg_type_requires_text_protocol(pg_type: &Type, col_type: PgColType) -> bool {
         return true;
     }
 
+    // PostgreSQL's binary timestamptz decoder converts UTC into chrono::Local,
+    // which makes the DBX host timezone win over the server session timezone.
+    // Text output is formatted by PostgreSQL in the session timezone and keeps
+    // timestamp-without-time-zone values as wall-clock text as well.
+    if matches!(
+        col_type,
+        PgColType::Temporal { fallback: PgTemporalFallback::Probe | PgTemporalFallback::GenericArray }
+    ) {
+        return true;
+    }
+
     match pg_type.kind() {
         Kind::Enum(_) => false,
         Kind::Array(element_type) => Type::from_oid(element_type.oid()).is_none(),
@@ -966,6 +985,7 @@ fn pg_type_requires_text_protocol(pg_type: &Type, col_type: PgColType) -> bool {
 
 pub(crate) fn classify_pg_type(type_name: &str) -> PgColType {
     let upper = type_name.to_uppercase();
+    let temporal_type_name = upper.strip_prefix('_').unwrap_or(&upper);
 
     if upper == "BYTEA" {
         return PgColType::Bytea;
@@ -985,11 +1005,9 @@ pub(crate) fn classify_pg_type(type_name: &str) -> PgColType {
     if upper == "DATERANGE" {
         return PgColType::DateRange;
     }
-    if upper.contains("TIMESTAMP")
-        || upper == "DATE"
-        || upper == "TIME"
-        || upper == "TIMETZ"
-        || upper.contains("INTERVAL")
+    if temporal_type_name.contains("TIMESTAMP")
+        || matches!(temporal_type_name, "DATE" | "TIME" | "TIMETZ")
+        || temporal_type_name.contains("INTERVAL")
     {
         let fallback = if upper.starts_with('_') {
             PgTemporalFallback::GenericArray
@@ -1154,12 +1172,150 @@ fn pg_text_fallback_value_with_spatial(
             .map(|geometry| (serde_json::Value::String(geometry.wkt), geometry.srid, true))
             .or_else(|| split_pg_ewkt(value, false).map(|(value, srid)| (value, srid, true)))
             .unwrap_or_else(|| (serde_json::Value::String(value.to_string()), None, true)),
+        Some(PgColType::Temporal { fallback: PgTemporalFallback::GenericArray }) => {
+            pg_temporal_array_text_to_json(value)
+                .map(|value| (value, None, false))
+                .unwrap_or_else(|| (serde_json::Value::String(normalize_pg_temporal_text(value)), None, false))
+        }
+        Some(PgColType::Temporal { .. }) => (serde_json::Value::String(normalize_pg_temporal_text(value)), None, false),
         Some(_) => (serde_json::Value::String(value.to_string()), None, false),
         None => decode_pg_text_wkb(value)
             .map(|geometry| (serde_json::Value::String(geometry.wkt), geometry.srid, true))
             .or_else(|| split_pg_ewkt(value, true).map(|(value, srid)| (value, srid, true)))
             .unwrap_or_else(|| (serde_json::Value::String(value.to_string()), None, false)),
     }
+}
+
+/// Keep PostgreSQL's session-local wall clock while returning the same ISO
+/// shape that the grid formatter and editor already understand. PostgreSQL
+/// emits a numeric hour-only offset (for example `+08`) in text mode.
+fn normalize_pg_temporal_text(value: &str) -> String {
+    let Some(offset_start) = value.rfind(['+', '-']) else {
+        return value.to_string();
+    };
+    let (date_time, offset) = value.split_at(offset_start);
+    if date_time.as_bytes().get(10) != Some(&b' ') || !matches!(offset.len(), 3 | 6) {
+        return value.to_string();
+    }
+    let offset_bytes = offset.as_bytes();
+    let valid_offset = offset_bytes.first().is_some_and(|sign| matches!(sign, b'+' | b'-'))
+        && offset_bytes[1..].iter().enumerate().all(|(index, byte)| {
+            if offset.len() == 6 && index == 2 {
+                *byte == b':'
+            } else {
+                byte.is_ascii_digit()
+            }
+        });
+    if !valid_offset {
+        return value.to_string();
+    }
+
+    let mut normalized = String::with_capacity(value.len() + (offset.len() == 3) as usize * 3);
+    normalized.push_str(&date_time[..10]);
+    normalized.push('T');
+    normalized.push_str(&date_time[11..]);
+    normalized.push_str(offset);
+    if offset.len() == 3 {
+        normalized.push_str(":00");
+    }
+    normalized
+}
+
+fn pg_temporal_array_text_to_json(value: &str) -> Option<serde_json::Value> {
+    fn skip_whitespace(input: &[u8], cursor: &mut usize) {
+        while input.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            *cursor += 1;
+        }
+    }
+
+    fn parse_quoted(input: &[u8], cursor: &mut usize) -> Option<String> {
+        if input.get(*cursor) != Some(&b'"') {
+            return None;
+        }
+        *cursor += 1;
+        let mut bytes = Vec::new();
+        while let Some(&byte) = input.get(*cursor) {
+            *cursor += 1;
+            match byte {
+                b'"' => return String::from_utf8(bytes).ok(),
+                b'\\' => {
+                    let escaped = *input.get(*cursor)?;
+                    *cursor += 1;
+                    bytes.push(escaped);
+                }
+                _ => bytes.push(byte),
+            }
+        }
+        None
+    }
+
+    fn parse_array(input: &[u8], cursor: &mut usize) -> Option<serde_json::Value> {
+        if input.get(*cursor) != Some(&b'{') {
+            return None;
+        }
+        *cursor += 1;
+        let mut values = Vec::new();
+        loop {
+            skip_whitespace(input, cursor);
+            match input.get(*cursor)? {
+                b'}' => {
+                    *cursor += 1;
+                    return Some(serde_json::Value::Array(values));
+                }
+                b'{' => values.push(parse_array(input, cursor)?),
+                b'"' => values.push(serde_json::Value::String(parse_quoted(input, cursor)?)),
+                _ => {
+                    let start = *cursor;
+                    while input.get(*cursor).is_some_and(|byte| !matches!(byte, b',' | b'}')) {
+                        *cursor += 1;
+                    }
+                    let token = std::str::from_utf8(input.get(start..*cursor)?).ok()?.trim();
+                    if token.eq_ignore_ascii_case("NULL") {
+                        values.push(serde_json::Value::Null);
+                    } else {
+                        values.push(serde_json::Value::String(token.to_string()));
+                    }
+                }
+            }
+            skip_whitespace(input, cursor);
+            if input.get(*cursor) == Some(&b',') {
+                *cursor += 1;
+            } else if input.get(*cursor) != Some(&b'}') {
+                return None;
+            }
+        }
+    }
+
+    fn normalize_array_value(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(normalize_array_value).collect())
+            }
+            serde_json::Value::String(value) => serde_json::Value::String(normalize_pg_temporal_text(&value)),
+            value => value,
+        }
+    }
+
+    let input = value.trim().as_bytes();
+    let mut cursor = 0;
+    // PostgreSQL prefixes arrays with dimension bounds when a lower bound is
+    // not one, for example `[0:1]={...}`. JSON has no lower-bound metadata,
+    // so skip the prefix and retain the array values themselves.
+    let mut has_dimension_bounds = false;
+    while input.get(cursor) == Some(&b'[') {
+        has_dimension_bounds = true;
+        let end = input.get(cursor..)?.iter().position(|byte| *byte == b']')? + cursor;
+        cursor = end + 1;
+    }
+    if has_dimension_bounds {
+        if input.get(cursor) != Some(&b'=') {
+            return None;
+        }
+        cursor += 1;
+    }
+    let parsed = parse_array(input, &mut cursor)?;
+    skip_whitespace(input, &mut cursor);
+    (cursor == input.len()).then(|| normalize_array_value(parsed))
 }
 
 fn decode_pg_text_wkb(value: &str) -> Option<super::wkb::DecodedGeometry> {
@@ -1324,6 +1480,25 @@ fn escape_tsvector_lexeme(value: &str) -> String {
 }
 
 fn pg_error_to_string(err: tokio_postgres::Error) -> String {
+    let Some(db_error) = err.as_db_error() else {
+        return err.to_string();
+    };
+    let mut message = db_error.to_string();
+    // Carry the server-reported cursor position across the `db` layer's
+    // `Result<_, String>` boundary; `query.rs` resolves it against the executed
+    // statement and strips the suffix before the message reaches any client.
+    if let Some(tokio_postgres::error::ErrorPosition::Original(cursor)) = db_error.position() {
+        message.push_str(&crate::sql_error_position::encode_marker(*cursor));
+    }
+    message
+}
+
+/// Same as [`pg_error_to_string`] but never carries a cursor position.
+///
+/// Used for infrastructure/setup statements (search_path, BEGIN/ROLLBACK, …)
+/// whose SQL is not the statement the user is editing: a marker from those would
+/// be resolved against the user's SQL and point at the wrong place.
+fn pg_error_to_string_plain(err: tokio_postgres::Error) -> String {
     err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
 }
 
@@ -2282,16 +2457,10 @@ pub async fn connect_with_max_connections(
     fallback_timeout: Duration,
     max_connections: usize,
 ) -> Result<Pool, String> {
-    #[cfg(all(windows, target_vendor = "win7"))]
-    {
-        connect_with_optional_local_timezone_with_max_connections(url, fallback_timeout, None, max_connections).await
-    }
-
-    #[cfg(not(all(windows, target_vendor = "win7")))]
-    {
-        let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
-        connect_with_local_timezone_with_max_connections(url, fallback_timeout, &timezone, max_connections).await
-    }
+    // Leave the PostgreSQL session timezone untouched. PostgreSQL owns the
+    // timezone used for timestamptz text output; deriving one from DBX's host
+    // would make the client's OS timezone override the server configuration.
+    connect_with_optional_local_timezone_with_max_connections(url, fallback_timeout, None, max_connections).await
 }
 
 /// Test-only thin wrappers (the library now connects through
@@ -2301,6 +2470,7 @@ async fn connect_with_local_timezone(url: &str, fallback_timeout: Duration, time
     connect_with_local_timezone_with_max_connections(url, fallback_timeout, timezone, 10).await
 }
 
+#[cfg(test)]
 async fn connect_with_local_timezone_with_max_connections(
     url: &str,
     fallback_timeout: Duration,
@@ -2671,7 +2841,10 @@ async fn set_automatic_postgres_timezone(client: &deadpool_postgres::Client, tim
                 }
             }
             Err(error) => {
-                return Err(format!("PostgreSQL SET timezone failed after connecting: {}", pg_error_to_string(error)));
+                return Err(format!(
+                    "PostgreSQL SET timezone failed after connecting: {}",
+                    pg_error_to_string_plain(error)
+                ));
             }
         }
     }
@@ -3149,6 +3322,13 @@ fn list_databases_sql() -> &'static str {
      ORDER BY datname"
 }
 
+fn list_opengauss_databases_sql() -> &'static str {
+    "SELECT datname, datcompatibility::text \
+     FROM pg_catalog.pg_database \
+     WHERE datallowconn = true \
+     ORDER BY datname"
+}
+
 fn database_metadata_sql() -> &'static str {
     "SELECT d.datname, \
             CASE \
@@ -3191,6 +3371,40 @@ pub async fn list_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
     let rows = postgres_query_cached(&client, list_databases_sql(), &[]).await.map_err(|e| e.to_string())?;
 
     Ok(rows.iter().map(|row| DatabaseInfo { name: pg_row_try_string(row, 0), ..Default::default() }).collect())
+}
+
+pub async fn list_opengauss_databases(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = match postgres_query_cached(&client, list_opengauss_databases_sql(), &[]).await {
+        Ok(rows) => rows,
+        Err(primary_error) => {
+            let primary_error = primary_error.to_string();
+            return postgres_query_cached(&client, list_databases_sql(), &[])
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| DatabaseInfo { name: pg_row_try_string(row, 0), ..Default::default() })
+                        .collect()
+                })
+                .map_err(|fallback_error| {
+                    format!(
+                        "openGauss database compatibility lookup failed: {primary_error}; database list fallback failed: {fallback_error}"
+                    )
+                });
+        }
+    };
+    Ok(rows
+        .iter()
+        .map(|row| DatabaseInfo {
+            name: pg_row_try_string(row, 0),
+            compatibility_mode: row
+                .try_get::<_, Option<String>>(1)
+                .ok()
+                .flatten()
+                .filter(|value| !value.trim().is_empty()),
+            ..Default::default()
+        })
+        .collect())
 }
 
 pub async fn list_database_metadata(pool: &Pool) -> Result<Vec<DatabaseInfo>, String> {
@@ -3297,6 +3511,25 @@ pub async fn completion_assistant_search(
     pool: &Pool,
     request: &CompletionAssistantRequest,
 ) -> Result<CompletionAssistantResponse, String> {
+    completion_assistant_search_inner(pool, request, false).await
+}
+
+/// openGauss variant of [`completion_assistant_search`]: top-level routines
+/// exclude package members (`propackage = true`) and private members
+/// (`proisprivate = true`), which are surfaced under their PACKAGE nodes by
+/// [`opengauss_package_members`] instead.
+pub async fn opengauss_completion_assistant_search(
+    pool: &Pool,
+    request: &CompletionAssistantRequest,
+) -> Result<CompletionAssistantResponse, String> {
+    completion_assistant_search_inner(pool, request, true).await
+}
+
+async fn completion_assistant_search_inner(
+    pool: &Pool,
+    request: &CompletionAssistantRequest,
+    exclude_package_members: bool,
+) -> Result<CompletionAssistantResponse, String> {
     let schema = request.schema.as_deref().or(request.parent_schema.as_deref());
     let routine_schema = schema.unwrap_or("public");
     let limit = request.max_results.unwrap_or(100).clamp(1, 1000);
@@ -3365,13 +3598,49 @@ pub async fn completion_assistant_search(
         }
     }
 
+    if candidates.len() < limit
+        && exclude_package_members
+        && request.parent_name.as_deref().is_none_or(|name| name.trim().is_empty())
+        && kinds.iter().any(CompletionAssistantObjectKind::is_routine_like)
+    {
+        let rows = match postgres_query_cached(
+            &client,
+            opengauss_completion_packages_sql(),
+            &[&routine_schema, &pattern, &((limit - candidates.len()) as i64)],
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        for row in rows {
+            candidates.push(CompletionAssistantCandidate {
+                name: pg_row_try_string(&row, 0),
+                kind: CompletionAssistantCandidateKind::Object,
+                database: Some(request.database.clone()),
+                schema: Some(pg_row_try_string(&row, 1)),
+                parent_schema: None,
+                parent_name: None,
+                comment: None,
+                data_type: Some("PACKAGE".to_string()),
+                signature: None,
+            });
+        }
+    }
+
     if candidates.len() < limit && kinds.iter().any(CompletionAssistantObjectKind::is_routine_like) {
         let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
         let rows = if has_proc_prokind {
             let prokinds = postgres_completion_prokinds(&kinds);
+            let sql = if exclude_package_members {
+                opengauss_completion_routines_sql(true)
+            } else {
+                postgres_completion_routines_sql(true).to_string()
+            };
             postgres_query_cached(
                 &client,
-                postgres_completion_routines_sql(true),
+                &sql,
                 &[&routine_schema, &pattern, &prokinds, &((limit - candidates.len()) as i64)],
             )
             .await
@@ -3379,13 +3648,14 @@ pub async fn completion_assistant_search(
         } else if kinds.iter().any(|kind| {
             matches!(kind, CompletionAssistantObjectKind::Function | CompletionAssistantObjectKind::Routine)
         }) {
-            postgres_query_cached(
-                &client,
-                postgres_completion_routines_sql(false),
-                &[&routine_schema, &pattern, &((limit - candidates.len()) as i64)],
-            )
-            .await
-            .map_err(|e| e.to_string())?
+            let sql = if exclude_package_members {
+                opengauss_completion_routines_sql(false)
+            } else {
+                postgres_completion_routines_sql(false).to_string()
+            };
+            postgres_query_cached(&client, &sql, &[&routine_schema, &pattern, &((limit - candidates.len()) as i64)])
+                .await
+                .map_err(|e| e.to_string())?
         } else {
             Vec::new()
         };
@@ -3512,6 +3782,30 @@ fn postgres_completion_routines_sql(has_proc_prokind: bool) -> &'static str {
      WHERE n.nspname = $1 \
        AND ($2 = '%%' OR p.proname ILIKE $2 ESCAPE '~') \
      ORDER BY p.proname LIMIT $3"
+}
+
+/// openGauss variant of [`postgres_completion_routines_sql`]: package members
+/// (`propackage = true`) and private members (`proisprivate = true`) are stored
+/// in the same `pg_proc` rows, but must not surface as top-level routines.
+/// The package/private columns only exist on openGauss kernels; plain
+/// PostgreSQL and the Redshift completion path never use this variant, so the
+/// extra predicates can be injected unconditionally here.
+fn opengauss_completion_routines_sql(has_proc_prokind: bool) -> String {
+    postgres_completion_routines_sql(has_proc_prokind).replace(
+        "WHERE n.nspname = $1",
+        "WHERE n.nspname = $1 AND COALESCE(p.propackage, false) = false \
+       AND COALESCE(p.proisprivate, false) = false",
+    )
+}
+
+fn opengauss_completion_packages_sql() -> &'static str {
+    "SELECT p.pkgname::text, n.nspname::text \
+     FROM pg_catalog.gs_package p \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pkgnamespace \
+     WHERE n.nspname = $1 \
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_database d WHERE d.datname = current_database() AND d.datcompatibility::text = 'A') \
+       AND ($2 = '%%' OR p.pkgname ILIKE $2 ESCAPE '~') \
+     ORDER BY p.pkgname LIMIT $3"
 }
 
 fn postgres_completion_sequences_sql() -> &'static str {
@@ -3662,6 +3956,9 @@ fn apply_partition_local_object_row(
 ) {
     match object_kind {
         "constraint" if object_type == "p" => entry.has_primary_key = true,
+        "constraint" if object_type == "u" && !object_name.is_empty() => {
+            entry.unique_constraints.insert(object_name);
+        }
         "constraint" if object_type == "f" && !object_name.is_empty() => {
             entry.foreign_keys.insert(object_name);
         }
@@ -4064,6 +4361,8 @@ async fn list_indexes_for_relations_with_sql(
         let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(11).unwrap_or_default();
         let key_is_expression =
             if all_is_expr.len() == all_cols.len() { all_is_expr[..split_at].to_vec() } else { Vec::new() };
+        let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(12).unwrap_or_default();
+        let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
         result.entry(relid).or_default().push(IndexInfo {
             name: pg_row_try_string(row, 1),
             columns: key_cols,
@@ -4075,7 +4374,8 @@ async fn list_indexes_for_relations_with_sql(
             comment: row.try_get::<_, Option<String>>(10).ok().flatten(),
             key_is_expression,
             column_opclasses: key_opclasses,
-            constraint_backed: false,
+            key_options,
+            constraint_backed: pg_row_try_bool(row, 13).unwrap_or(false),
         });
     }
     Ok(result)
@@ -4101,7 +4401,9 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              ix.indnkeyatts AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
-             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression \
+             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
+             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -4145,7 +4447,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
-             NULL::smallint AS nkeyatts, \
+             array_length(string_to_array(ix.indoption::text, ' '), 1)::smallint AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              ARRAY( \
@@ -4156,7 +4458,9 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
-             ) AS key_is_expression \
+             ) AS key_is_expression, \
+             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -4394,7 +4698,7 @@ fn postgres_table_partition_local_objects_for_relations_query_tiers() -> [&'stat
 fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
     "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
      FROM pg_catalog.pg_constraint con \
-     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','f') \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
      SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
@@ -4433,7 +4737,7 @@ fn postgres_table_partition_local_objects_for_relations_sql() -> &'static str {
 fn postgres_table_partition_local_objects_for_relations_compat_sql() -> &'static str {
     "SELECT con.conrelid::bigint AS relid, 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
      FROM pg_catalog.pg_constraint con \
-     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','f') \
+     WHERE con.conrelid = ANY($1::bigint[]) AND con.contype IN ('p','u','f') \
      UNION ALL \
      SELECT con.conrelid::bigint, 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
      FROM pg_catalog.pg_constraint con \
@@ -4821,7 +5125,7 @@ fn postgres_table_partition_local_objects_sql() -> &'static str {
      FROM pg_catalog.pg_constraint con \
      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','f') \
+     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','u','f') \
        AND COALESCE(NULLIF(pg_catalog.row_to_json(con)->>'conparentid', '')::oid, 0) = 0 \
      UNION ALL \
      SELECT 'check'::text AS object_kind, con.conname AS object_name, NULL::text AS object_type \
@@ -5193,13 +5497,24 @@ fn list_objects_sql(
     include_relations: bool,
     include_routines: bool,
     include_custom_types: bool,
+    exclude_package_members: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if include_relations {
         parts.push(list_object_relations_sql(include_timestamps).to_string());
     }
     if include_routines {
-        parts.push(list_object_routines_sql(include_timestamps, has_proc_prokind, has_proc_prosp).to_string());
+        let mut routine = list_object_routines_sql(include_timestamps, has_proc_prokind, has_proc_prosp).to_string();
+        // openGauss stores package members in pg_proc (propackage/propackageid).
+        // They are listed under their PACKAGE nodes by list_opengauss_packages, so
+        // exclude them from the top-level routine list to avoid duplicate entries.
+        // The column only exists on openGauss kernels; plain PostgreSQL never
+        // passes exclude_package_members=true.
+        if exclude_package_members {
+            routine = routine
+                .replace("WHERE n.nspname = $1", "WHERE n.nspname = $1 AND COALESCE(p.propackage, false) = false");
+        }
+        parts.push(routine);
     }
     if include_custom_types {
         parts.push(list_object_custom_types_sql().to_string());
@@ -5297,6 +5612,7 @@ async fn list_objects_rows(
     include_relations: bool,
     include_routines: bool,
     include_custom_types: bool,
+    exclude_package_members: bool,
 ) -> Result<Vec<Row>, String> {
     let sql = list_objects_sql(
         include_timestamps,
@@ -5306,6 +5622,7 @@ async fn list_objects_rows(
         include_relations,
         include_routines,
         include_custom_types,
+        exclude_package_members,
     );
     if sql.is_empty() {
         // No branch was selected (e.g. an object_types filter the catalog
@@ -5350,6 +5667,7 @@ pub async fn list_objects(
         include_relations,
         include_routines,
         include_custom_types,
+        false,
     )
     .await
     {
@@ -5366,6 +5684,7 @@ pub async fn list_objects(
                 include_relations,
                 include_routines,
                 include_custom_types,
+                false,
             )
             .await
             {
@@ -5380,6 +5699,424 @@ pub async fn list_objects(
     Ok(object_rows_to_infos(&rows, schema))
 }
 
+/// openGauss variant of [`list_objects`]: top-level routines exclude package
+/// members (`propackage = true`), which are surfaced under their PACKAGE nodes
+/// by [`list_opengauss_packages`] instead.
+pub async fn list_opengauss_objects(
+    pool: &Pool,
+    schema: &str,
+    include_relations: bool,
+    include_routines: bool,
+    include_custom_types: bool,
+) -> Result<Vec<ObjectInfo>, String> {
+    let include_custom_types = include_custom_types && !is_postgres_system_schema(schema);
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let (has_proc_prokind, has_proc_prosp, has_function_identity_arguments) = if include_routines {
+        let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
+        let has_proc_prosp = postgres_proc_has_prosp(&client).await?;
+        let has_function_identity_arguments = postgres_has_function_identity_arguments(&client).await?;
+        (has_proc_prokind, has_proc_prosp, has_function_identity_arguments)
+    } else {
+        (false, false, false)
+    };
+    let rows = match list_objects_rows(
+        &client,
+        schema,
+        true,
+        has_proc_prokind,
+        has_proc_prosp,
+        has_function_identity_arguments,
+        include_relations,
+        include_routines,
+        include_custom_types,
+        true,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(primary_error) => {
+            log::debug!("[postgres][list_opengauss_objects:timestamp-fallback] primary_error={}", primary_error);
+            match list_objects_rows(
+                &client,
+                schema,
+                false,
+                has_proc_prokind,
+                has_proc_prosp,
+                has_function_identity_arguments,
+                include_relations,
+                include_routines,
+                include_custom_types,
+                true,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                Err(fallback_error) => {
+                    return Err(format!("{primary_error}; timestamp fallback failed: {fallback_error}"));
+                }
+            }
+        }
+    };
+
+    Ok(object_rows_to_infos(&rows, schema))
+}
+
+pub async fn list_opengauss_packages(
+    pool: &Pool,
+    schema: &str,
+    include_spec: bool,
+    include_body: bool,
+) -> Result<Vec<ObjectInfo>, String> {
+    if !include_spec && !include_body {
+        return Ok(Vec::new());
+    }
+    match opengauss_is_oracle_compatible(pool).await {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Ok(Vec::new()),
+    }
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = match postgres_query_cached(
+        &client,
+        "SELECT p.pkgname::text, \
+                (p.pkgbodydeclsrc IS NOT NULL OR p.pkgbodyinitsrc IS NOT NULL) AS has_body \
+         FROM pg_catalog.gs_package p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pkgnamespace \
+         WHERE n.nspname = $1 \
+         ORDER BY p.pkgname",
+        &[&schema],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut objects = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        let name = pg_row_try_string(&row, 0);
+        let has_body = pg_row_try_bool(&row, 1).unwrap_or(false);
+        let object = |object_type: &str| ObjectInfo {
+            name: name.clone(),
+            object_type: object_type.to_string(),
+            schema: Some(schema.to_string()),
+            valid: None,
+            signature: None,
+            custom_type_kind: None,
+            has_members: None,
+            comment: None,
+            created_at: None,
+            updated_at: None,
+            parent_schema: None,
+            parent_name: None,
+            trigger: None,
+            xugu_type_members_expandable: None,
+        };
+        if include_spec {
+            objects.push(object("PACKAGE"));
+        }
+        if include_body && has_body {
+            objects.push(object("PACKAGE_BODY"));
+        }
+    }
+    Ok(objects)
+}
+
+fn opengauss_optional_package_catalog_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("insufficient privilege")
+        || lower.contains("does not exist")
+        || lower.contains("undefined table")
+        || lower.contains("undefined column")
+        || lower.contains("undefined schema")
+}
+
+/// Whether an openGauss gs_source lookup error means the catalog is not usable
+/// (missing relation/schema, or insufficient privileges) so the gs_package
+/// fallback should be attempted instead of surfacing the error. Connection
+/// failures and protocol errors are not swallowed.
+fn opengauss_gs_source_lookup_should_fallback(error: &str) -> bool {
+    opengauss_optional_package_catalog_error(error)
+}
+
+pub async fn opengauss_package_source(
+    pool: &Pool,
+    schema: &str,
+    name: &str,
+    package_body: bool,
+) -> Result<String, String> {
+    match opengauss_is_oracle_compatible(pool).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err("openGauss packages are only available in A compatibility mode".to_string());
+        }
+        Err(_) => {}
+    }
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let source_type = if package_body { "package body" } else { "package" };
+    let rows = match postgres_query_cached(
+        &client,
+        "SELECT s.src::text \
+         FROM dbe_pldeveloper.gs_source s \
+         JOIN pg_catalog.gs_package p ON p.oid = s.id \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pkgnamespace \
+         WHERE lower(n.nspname) = lower($1) \
+           AND lower(p.pkgname::text) = lower($2) \
+           AND lower(s.type) = $3 \
+           AND s.status = true \
+         ORDER BY (p.pkgname::text = $2) DESC, p.oid \
+         LIMIT 1",
+        &[&schema, &name, &source_type],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            let error = error.to_string();
+            if opengauss_gs_source_lookup_should_fallback(&error) {
+                Vec::new()
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    if let Some(source) = rows.first().map(|row| pg_row_try_string(row, 0)).filter(|source| !source.trim().is_empty()) {
+        return Ok(source);
+    }
+
+    // dbe_pldeveloper.gs_source is written asynchronously and can be absent when
+    // SKIP_GS_SOURCE is set, autonomous-transaction limits are hit, a compile
+    // failed, or the current user lacks privileges on the schema. Rebuild the
+    // source from the gs_package fragment columns so an existing package can
+    // still be viewed and exported. When the stored shape is unrecognised we
+    // fail loudly instead of emitting a broken CREATE statement.
+    let meta_rows = postgres_query_cached(
+        &client,
+        "SELECT p.pkgname::text, n.nspname::text, p.pkgsecdef, \
+                p.pkgspecsrc::text, p.pkgbodydeclsrc::text, p.pkgbodyinitsrc::text \
+         FROM pg_catalog.gs_package p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pkgnamespace \
+         WHERE lower(n.nspname) = lower($1) AND lower(p.pkgname::text) = lower($2) \
+         ORDER BY (p.pkgname::text = $2) DESC, (n.nspname::text = $1) DESC, p.oid \
+         LIMIT 1",
+        &[&schema, &name],
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(row) = meta_rows.first() else {
+        return Err(format!("openGauss {} source not found: {schema}.{name}", source_type));
+    };
+    let catalog_name = row
+        .try_get::<_, Option<String>>(0)
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| name.to_string());
+    let catalog_schema = row
+        .try_get::<_, Option<String>>(1)
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| schema.to_string());
+    let pkgsecdef = row.try_get::<_, bool>(2).map_err(|error| {
+        format!("Cannot read openGauss package security mode for {catalog_schema}.{catalog_name}: {error}")
+    })?;
+    let spec = row.try_get::<_, Option<String>>(3).ok().flatten().unwrap_or_default();
+    let body_decl = row.try_get::<_, Option<String>>(4).ok().flatten().unwrap_or_default();
+    let body_init = row.try_get::<_, Option<String>>(5).ok().flatten().unwrap_or_default();
+    if package_body {
+        opengauss_package_body_source(&catalog_schema, &catalog_name, &body_decl, &body_init).ok_or_else(|| {
+            format!("Cannot rebuild openGauss package body source from catalog for {catalog_schema}.{catalog_name}")
+        })
+    } else {
+        opengauss_package_spec_source(&catalog_schema, &catalog_name, &spec, pkgsecdef).ok_or_else(|| {
+            format!("Cannot rebuild openGauss package source from catalog for {catalog_schema}.{catalog_name}")
+        })
+    }
+}
+
+/// Marker openGauss stores at the start of the declaration fragment
+/// (`AS` is rewritten to this during CREATE processing).
+const OPENGAUSS_PACKAGE_DECL_MARKER: &str = "PACKAGE  DECLARE";
+/// Marker at the start of the package initialization fragment.
+const OPENGAUSS_PACKAGE_INIT_MARKER: &str = "INSTANTIATION";
+
+/// Strip the openGauss declaration-fragment wrapper: the ` PACKAGE  DECLARE `
+/// prefix and the trailing bare `END` marker that closes the fragment. Member
+/// terminators are always `END;` (with a semicolon) and are therefore kept.
+fn trim_opengauss_package_decl_fragment(fragment: &str) -> Option<String> {
+    let trimmed = fragment.trim();
+    let body = trimmed.strip_prefix(OPENGAUSS_PACKAGE_DECL_MARKER)?.trim();
+    let body = body.strip_suffix("END").unwrap_or(body).trim_end();
+    Some(body.trim().to_string())
+}
+
+/// Rebuild a full `CREATE OR REPLACE PACKAGE` statement from the gs_package
+/// declaration fragment. Used as the fallback when `dbe_pldeveloper.gs_source`
+/// has no row for the package.
+#[doc(hidden)]
+pub fn opengauss_package_spec_source(schema: &str, name: &str, spec_fragment: &str, pkgsecdef: bool) -> Option<String> {
+    let decl = trim_opengauss_package_decl_fragment(spec_fragment)?;
+    let authid = if pkgsecdef { " AUTHID DEFINER" } else { " AUTHID CURRENT_USER" };
+    Some(format!(
+        "CREATE OR REPLACE PACKAGE {}.{}{} AS\n{}\nEND {};",
+        pg_quote_ident(schema),
+        pg_quote_ident(name),
+        authid,
+        decl,
+        pg_quote_ident(name)
+    ))
+}
+
+/// Rebuild a full `CREATE OR REPLACE PACKAGE BODY` statement from the
+/// gs_package declaration and initialization fragments.
+#[doc(hidden)]
+pub fn opengauss_package_body_source(
+    schema: &str,
+    name: &str,
+    decl_fragment: &str,
+    init_fragment: &str,
+) -> Option<String> {
+    let decl = trim_opengauss_package_decl_fragment(decl_fragment)?;
+    let mut out = format!("CREATE OR REPLACE PACKAGE BODY {}.{} AS\n", pg_quote_ident(schema), pg_quote_ident(name));
+    if !decl.is_empty() {
+        out.push_str(&decl);
+        out.push('\n');
+    }
+
+    let init = init_fragment.trim();
+    if init.is_empty() {
+        // No initialization section: the declaration fragment's own trailing
+        // END marker was already removed, so close the body here.
+        out.push_str(&format!("END {};", pg_quote_ident(name)));
+        return Some(out);
+    }
+
+    // Initialization section is stored as `INSTANTIATION \nBEGIN ... END`.
+    let init = init.strip_prefix(OPENGAUSS_PACKAGE_INIT_MARKER)?.trim_start();
+    // The trailing `END` of the init fragment is the body terminator; give it
+    // the package name so the rebuilt DDL stays self-contained.
+    let core = init.strip_suffix("END").unwrap_or(init).trim_end();
+    out.push_str(core);
+    out.push('\n');
+    out.push_str(&format!("END {};", pg_quote_ident(name)));
+    Some(out)
+}
+
+/// SQL for the package identity lookup used by [`opengauss_package_members`].
+/// Prefer an exact spelling, while retaining a case-insensitive fallback for
+/// ordinary unquoted identifiers typed with a different case.
+fn opengauss_package_identity_sql() -> &'static str {
+    "SELECT p.oid::oid, p.pkgname::text, n.nspname::text \
+     FROM pg_catalog.gs_package p \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pkgnamespace \
+     WHERE lower(n.nspname) = lower($1) AND lower(p.pkgname::text) = lower($2) \
+     ORDER BY (p.pkgname::text = $2) DESC, (n.nspname::text = $1) DESC, p.oid \
+     LIMIT 1"
+}
+
+/// SQL for [`opengauss_package_members`]: members selected by the resolved
+/// package OID, preventing same-lowercase quoted packages from being merged.
+fn opengauss_package_members_sql() -> &'static str {
+    "SELECT f.proname::text, f.prokind::text, \
+            pg_catalog.pg_get_function_identity_arguments(f.oid)::text, \
+            pg_catalog.format_type(f.prorettype, NULL)::text \
+     FROM pg_catalog.pg_proc f \
+     JOIN pg_catalog.gs_package p ON p.oid = f.propackageid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pkgnamespace \
+     WHERE f.propackageid = $1 \
+       AND f.prokind IN ('f','p','v','b','i') \
+       AND COALESCE(f.proisprivate, false) = false \
+       AND ($2 = '%%' OR f.proname ILIKE $2 ESCAPE '~') \
+     ORDER BY f.proname, f.oid LIMIT $3"
+}
+
+pub async fn opengauss_package_members(
+    pool: &Pool,
+    request: &CompletionAssistantRequest,
+) -> Result<CompletionAssistantResponse, String> {
+    match opengauss_is_oracle_compatible(pool).await {
+        Ok(true) => {}
+        Ok(false) | Err(_) => {
+            return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
+        }
+    }
+    let package_name = request.parent_name.as_deref().unwrap_or("").trim();
+    if package_name.is_empty() {
+        return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
+    }
+    let schema = request.parent_schema.as_deref().or(request.schema.as_deref()).unwrap_or("public");
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    // Resolve one package identity before looking up members. Lowercase matching
+    // remains useful for ordinary unquoted names, while the exact-name ordering
+    // preserves quoted mixed-case package identity when it is available.
+    let identity_rows =
+        match postgres_query_cached(&client, opengauss_package_identity_sql(), &[&schema, &package_name]).await {
+            Ok(rows) => rows,
+            Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => {
+                return Ok(CompletionAssistantResponse {
+                    candidates: Vec::new(),
+                    incomplete: false,
+                    fallback_used: true,
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+    let Some(identity_row) = identity_rows.first() else {
+        return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
+    };
+    let Some(package_oid) = pg_row_try_u32(identity_row, 0) else {
+        return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
+    };
+    let catalog_name = pg_row_try_string(identity_row, 1);
+    let catalog_schema = pg_row_try_string(identity_row, 2);
+    let limit = request.max_results.unwrap_or(100).clamp(1, 1000);
+    // The member prefix mask is applied on the server before the LIMIT so a
+    // matching member is never shadowed by the first N rows of the full
+    // alphabetically-sorted member list (the editor only requests a limited
+    // slice and then filters locally).
+    let pattern = postgres_completion_like_pattern(&request.mask, request.match_mode.as_ref());
+    let rows = match postgres_query_cached(
+        &client,
+        opengauss_package_members_sql(),
+        &[&package_oid, &pattern, &(limit as i64)],
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => {
+            return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let candidates = rows
+        .iter()
+        .map(|row| {
+            let prokind = pg_row_try_string(row, 1);
+            // openGauss catalog reports ordinary f/p members on current releases.
+            // v (subfunction) / b (subprocedure) are kept defensive for
+            // variants that tag package members with subkind markers.
+            let kind = if matches!(prokind.as_str(), "p" | "b") {
+                CompletionAssistantCandidateKind::Procedure
+            } else {
+                CompletionAssistantCandidateKind::Function
+            };
+            CompletionAssistantCandidate {
+                name: pg_row_try_string(row, 0),
+                kind,
+                database: Some(request.database.clone()),
+                schema: Some(catalog_schema.clone()),
+                parent_schema: Some(catalog_schema.clone()),
+                parent_name: Some(catalog_name.clone()),
+                comment: None,
+                data_type: row.try_get::<_, Option<String>>(3).ok().flatten(),
+                signature: row.try_get::<_, Option<String>>(2).ok().flatten(),
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(CompletionAssistantResponse { incomplete: candidates.len() >= limit, candidates, fallback_used: false })
+}
+
 pub async fn list_redshift_objects(
     pool: &Pool,
     schema: &str,
@@ -5392,7 +6129,7 @@ pub async fn list_redshift_objects(
     if include_relations {
         // Redshift does not support PostgreSQL's generic file, object-location,
         // or transaction-ID helpers, so skip the timestamp variant entirely.
-        rows = list_objects_rows(&client, schema, false, false, false, false, true, false, false).await?;
+        rows = list_objects_rows(&client, schema, false, false, false, false, true, false, false, false).await?;
     }
 
     if include_routines {
@@ -6431,7 +7168,7 @@ pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<C
         .await
 }
 
-fn pg_quote_literal(value: &str) -> String {
+pub(crate) fn pg_quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -6602,7 +7339,16 @@ fn postgres_set_preserved_search_path_sql(
         configured.to_string()
     };
     let selected_schema = pg_quote_ident(schema);
-    let mut path = if baseline.first_resolved_schema.as_deref() == Some(schema) {
+    // The first resolved schema can come from "$user". Once that placeholder is
+    // removed for compatible servers, the selected schema must replace it unless
+    // the configured path also contains that schema explicitly.
+    let selected_schema_is_explicit = configured_elements
+        .iter()
+        .any(|element| !is_postgres_user_placeholder(element) && (*element == schema || *element == selected_schema));
+    let selected_schema_was_removed = drops_user_placeholder
+        && baseline.first_resolved_schema.as_deref() == Some(schema)
+        && !selected_schema_is_explicit;
+    let mut path = if baseline.first_resolved_schema.as_deref() == Some(schema) && !selected_schema_was_removed {
         configured
     } else if configured.is_empty() {
         selected_schema.clone()
@@ -6827,30 +7573,85 @@ pub async fn execute_query_with_max_rows(
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
-    if postgres_statement_returns_rows(sql) {
-        let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    // Drop stale notices from infrastructure statements so only messages raised
+    // by this statement are attached to its result.
+    let _ = drain_postgres_notices(&client).await;
+
+    let result = if postgres_statement_returns_rows(sql) {
         execute_select_query(&client, sql, start, row_limit).await
     } else {
-        let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-        let affected = client.execute(sql, &[]).await.map_err(pg_error_to_string)?;
-        clear_postgres_caches_after_ddl(pool, Some(&client), sql);
+        client.execute(sql, &[]).await.map_err(pg_error_to_string).map(|affected| {
+            clear_postgres_caches_after_ddl(pool, Some(&client), sql);
 
-        Ok(QueryResult {
-            columns: vec![],
-            column_types: Vec::new(),
-            column_sortables: Vec::new(),
-            spatial_columns: vec![],
-            spatial_values: vec![],
-            rows: vec![],
-            affected_rows: affected,
-            execution_time_ms: start.elapsed().as_millis(),
-            truncated: false,
-            session_id: None,
-            has_more: false,
-            elasticsearch_raw_body: None,
-            messages: Vec::new(),
+            QueryResult {
+                columns: vec![],
+                column_types: Vec::new(),
+                column_sortables: Vec::new(),
+                spatial_columns: vec![],
+                spatial_values: vec![],
+                rows: vec![],
+                affected_rows: affected,
+                execution_time_ms: start.elapsed().as_millis(),
+                truncated: false,
+                session_id: None,
+                has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
+            }
         })
+    };
+
+    match result {
+        Ok(mut result) => {
+            result.messages = drain_postgres_notices(&client).await;
+            Ok(result)
+        }
+        Err(error) => {
+            // Drop notices so an errored statement's messages cannot leak into
+            // the next query on this pooled connection.
+            let _ = drain_postgres_notices(&client).await;
+            Err(error)
+        }
     }
+}
+
+/// Progress-aware variant of [`execute_query_with_max_rows`] for long transfers.
+///
+/// Row-returning queries run under an *inactivity* budget: the clock is reset
+/// every time PostgreSQL actually delivers a row, so a large table that keeps
+/// streaming is never cancelled merely for exceeding the timeout in total. Only
+/// a genuine stall (no row for the whole timeout) is reported as a timeout.
+/// Statements that return no rows have no incremental progress to report, so
+/// they keep the plain wall-clock path.
+pub(crate) async fn execute_query_with_max_rows_progress(
+    pool: &Pool,
+    sql: &str,
+    max_rows: Option<usize>,
+    progress_clock: Arc<StreamProgressClock>,
+    timeout: Option<Duration>,
+) -> Result<QueryResult, String> {
+    if !postgres_statement_returns_rows(sql) {
+        // DDL/DML expose no incremental progress, so keep the original wall-clock
+        // budget: a hung write must still be bounded by the configured timeout.
+        return crate::query::wait_for_query_opt(None, timeout, execute_query_with_max_rows(pool, sql, max_rows)).await;
+    }
+
+    let start = Instant::now();
+    let row_limit = query_result_row_limit(max_rows);
+    let timeout_error = format!("Query timed out after {} seconds", timeout.map_or(0, |timeout| timeout.as_secs()));
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let clock_for_select = progress_clock.clone();
+    await_stream_with_progress_timeout(
+        async move {
+            execute_select_query_with_progress(&client, sql, start, row_limit, Some(&clock_for_select), false).await
+        },
+        timeout,
+        progress_clock,
+        None,
+        timeout_error,
+    )
+    .await
 }
 
 pub async fn execute_query_with_max_rows_and_cancel(
@@ -7246,7 +8047,7 @@ pub(crate) async fn execute_postgres_infra_statement(
     tokio::time::timeout(timeout_duration, client.execute_typed(sql, &[]))
         .await
         .map_err(|_| format!("PostgreSQL {stage} timed out after {} seconds", timeout_duration.as_secs()))?
-        .map_err(pg_error_to_string)
+        .map_err(pg_error_to_string_plain)
 }
 
 pub(crate) async fn wait_postgres_operation<T, F>(
@@ -7576,9 +8377,8 @@ async fn execute_query_with_max_rows_inner(
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
-    // Discard stale notices from infrastructure statements (e.g. the timezone
-    // SET issued at connect time) so only messages raised by this statement
-    // are attached to its result.
+    // Discard stale notices from infrastructure statements so only messages
+    // raised by this statement are attached to its result.
     let _ = drain_postgres_notices(client).await;
 
     let result = if postgres_statement_returns_rows(sql) {
@@ -7634,7 +8434,9 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              ix.indnkeyatts AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
-             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression \
+             array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
+             array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -7677,7 +8479,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
-             NULL::smallint AS nkeyatts, \
+             array_length(string_to_array(ix.indoption::text, ' '), 1)::smallint AS nkeyatts, \
              ix.indkey AS indkey, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              ARRAY( \
@@ -7688,7 +8490,9 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum = (string_to_array(ix.indkey::text, ' '))[pos.n]::int2 \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
-             ) AS key_is_expression \
+             ) AS key_is_expression, \
+             string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -7808,6 +8612,8 @@ async fn list_indexes_with_sql(
             let all_is_expr: Vec<bool> = row.try_get::<_, Vec<bool>>(10).unwrap_or_default();
             let key_is_expression =
                 if all_is_expr.len() == all_cols.len() { all_is_expr[..split_at].to_vec() } else { Vec::new() };
+            let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(11).unwrap_or_default();
+            let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
             IndexInfo {
                 name: pg_row_try_string(row, 0),
                 columns: key_cols,
@@ -7819,7 +8625,8 @@ async fn list_indexes_with_sql(
                 comment: row.try_get::<_, Option<String>>(9).ok().flatten(),
                 key_is_expression,
                 column_opclasses: key_opclasses,
-                constraint_backed: false,
+                key_options,
+                constraint_backed: pg_row_try_bool(row, 12).unwrap_or(false),
             }
         })
         .collect())
@@ -9153,6 +9960,79 @@ mod tests {
         assert_eq!(gaussdb_identifier_quote_for_compatibility_mode(""), None);
     }
 
+    #[test]
+    fn opengauss_package_catalog_fallback_rebuilds_spec_ddl() {
+        // Real shape captured from openGauss-lite 5.0.1 gs_package.pkgspecsrc.
+        let fragment = " PACKAGE  DECLARE  g_version VARCHAR2(20) := '1.0';\n  PROCEDURE log_message(p_message IN VARCHAR2);\n  FUNCTION add_numbers(p_left IN INTEGER, p_right IN INTEGER) RETURN INTEGER;\nEND ";
+        let ddl = opengauss_package_spec_source("public", "dbx_test_pkg_math", fragment, false).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE PACKAGE \"public\".\"dbx_test_pkg_math\" AUTHID CURRENT_USER AS\n"));
+        assert!(ddl.contains("AUTHID CURRENT_USER"));
+        assert!(ddl.contains("g_version VARCHAR2(20) := '1.0';"));
+        assert!(ddl.contains("PROCEDURE log_message(p_message IN VARCHAR2);"));
+        assert!(ddl.ends_with("END \"dbx_test_pkg_math\";"));
+        assert!(!ddl.contains("END  "));
+        assert_eq!(ddl.matches("END").count(), 1);
+    }
+
+    #[test]
+    fn opengauss_package_catalog_fallback_preserves_definer_security() {
+        let fragment = " PACKAGE  DECLARE  PROCEDURE ping;\nEND ";
+        let ddl = opengauss_package_spec_source("public", "secure_pkg", fragment, true).unwrap();
+        assert!(ddl.contains("AUTHID DEFINER"));
+        assert!(!ddl.contains("AUTHID CURRENT_USER"));
+    }
+
+    #[test]
+    fn opengauss_package_catalog_fallback_rebuilds_body_with_init_ddl() {
+        // Real shapes from gs_package.pkgbodydeclsrc / pkgbodyinitsrc.
+        let decl = " PACKAGE  DECLARE  PROCEDURE log_message(p_message IN VARCHAR2) IS\n  BEGIN\n    NULL;\n  END;\n\n  FUNCTION add_numbers(p_left IN INTEGER, p_right IN INTEGER) RETURN INTEGER IS\n  BEGIN\n    RETURN p_left + p_right;\n  END;\n\nEND\n";
+        let init = " INSTANTIATION \nBEGIN\n  g_version := '1.1';\nEND\n";
+        let ddl = opengauss_package_body_source("public", "dbx_test_pkg_math", decl, init).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE PACKAGE BODY \"public\".\"dbx_test_pkg_math\" AS\n"));
+        assert!(ddl.contains("PROCEDURE log_message(p_message IN VARCHAR2) IS"));
+        assert!(ddl.contains("FUNCTION add_numbers(p_left IN INTEGER, p_right IN INTEGER) RETURN INTEGER IS"));
+        assert!(ddl.contains("g_version := '1.1';"));
+        assert!(ddl.ends_with("END \"dbx_test_pkg_math\";"));
+    }
+
+    #[test]
+    fn opengauss_package_catalog_fallback_rebuilds_body_without_init_ddl() {
+        let decl = " PACKAGE  DECLARE  FUNCTION format_value(p_value IN INTEGER) RETURN VARCHAR2 IS\n  BEGIN\n    RETURN 'x';\n  END;\nEND ";
+        let ddl = opengauss_package_body_source("public", "dbx_test_pkg_overload", decl, "").unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE PACKAGE BODY \"public\".\"dbx_test_pkg_overload\" AS\n"));
+        assert!(ddl.contains("FUNCTION format_value(p_value IN INTEGER) RETURN VARCHAR2 IS"));
+        assert!(ddl.ends_with("END \"dbx_test_pkg_overload\";"));
+        assert!(!ddl.contains("INSTANTIATION"));
+    }
+
+    #[test]
+    fn opengauss_package_catalog_fallback_rejects_unrecognized_shape() {
+        assert!(opengauss_package_spec_source("public", "pkg", "CREATE OR REPLACE PACKAGE pkg AS\nEND pkg;", true)
+            .is_none());
+        assert!(opengauss_package_spec_source("public", "pkg", "", true).is_none());
+    }
+
+    #[test]
+    fn opengauss_gs_source_error_classification_falls_back_only_for_catalog_issues() {
+        for message in [
+            "ERROR: permission denied for schema dbe_pldeveloper",
+            "ERROR: insufficient privilege to query table gs_source",
+            "ERROR: relation \"gs_source\" does not exist",
+            "ERROR: schema \"dbe_pldeveloper\" does not exist",
+        ] {
+            assert!(opengauss_gs_source_lookup_should_fallback(message), "expected fallback for: {message}");
+        }
+        for message in [
+            "connection refused",
+            "server closed the connection unexpectedly",
+            "timeout expired",
+            "canceling statement due to statement timeout",
+            "syntax error at or near \"SELECT\"",
+        ] {
+            assert!(!opengauss_gs_source_lookup_should_fallback(message), "expected no fallback for: {message}");
+        }
+    }
+
     fn test_query_message(message: &str) -> QueryMessage {
         QueryMessage {
             severity: "NOTICE".to_string(),
@@ -9205,6 +10085,25 @@ mod tests {
         .expect("execute statement with notice");
 
         assert!(result.messages.iter().any(|message| message.message == "dbx notice identity regression"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn postgres_command_query_preserves_notice_capture() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(10), "UTC")
+            .await
+            .expect("connect PostgreSQL database");
+
+        // `execute_query_with_max_rows` is the public command helper (used by
+        // DROP DATABASE and the transfer/export fallback). A statement with no
+        // result set must still attach the notices it raised.
+        let result =
+            execute_query_with_max_rows(&pool, "DO $$ BEGIN RAISE NOTICE 'dbx public notice regression'; END $$", None)
+                .await
+                .expect("execute statement with notice");
+
+        assert!(result.messages.iter().any(|message| message.message == "dbx public notice regression"));
     }
 
     #[test]
@@ -9558,10 +10457,36 @@ mod tests {
     }
 
     #[test]
+    fn postgres_builtin_temporal_types_use_server_text_protocol() {
+        for (pg_type, type_name) in [
+            (&Type::TIMESTAMP, "timestamp"),
+            (&Type::TIMESTAMPTZ, "timestamptz"),
+            (&Type::DATE, "date"),
+            (&Type::TIME, "time"),
+            (&Type::TIMETZ, "timetz"),
+            (&Type::TIMESTAMP_ARRAY, "_timestamp"),
+            (&Type::TIMESTAMPTZ_ARRAY, "_timestamptz"),
+            (&Type::DATE_ARRAY, "_date"),
+            (&Type::TIME_ARRAY, "_time"),
+            (&Type::TIMETZ_ARRAY, "_timetz"),
+        ] {
+            assert!(
+                pg_type_requires_text_protocol(pg_type, classify_pg_type(type_name)),
+                "{type_name} should use PostgreSQL's session-formatted text output"
+            );
+        }
+        assert!(!pg_type_requires_text_protocol(&Type::INT4, PgColType::Other));
+    }
+
+    #[test]
     fn postgres_builtin_or_supported_type_keeps_binary_protocol() {
         assert!(!pg_type_requires_text_protocol(&Type::INT4, PgColType::Other));
         assert!(!pg_type_requires_text_protocol(&Type::VARCHAR, PgColType::Other));
         assert!(!pg_type_requires_text_protocol(&Type::INT4_ARRAY, PgColType::GenericArray));
+        assert!(!pg_type_requires_text_protocol(
+            &Type::TIMESTAMPTZ,
+            PgColType::Temporal { fallback: PgTemporalFallback::Vector }
+        ));
         assert!(!pg_scalar_type_requires_text_protocol(98_765, PgColType::Vector));
         assert!(!pg_scalar_type_requires_text_protocol(98_765, PgColType::Geometry));
     }
@@ -9712,6 +10637,47 @@ mod tests {
             postgres_set_preserved_search_path_sql("dwd_views", PostgresSearchPathContext::Query, &bare_baseline),
             "SET search_path TO \"dwd_views\", public, pg_catalog"
         );
+    }
+
+    #[test]
+    fn postgres_search_path_replaces_matching_user_placeholder_with_selected_schema() {
+        let baseline = PostgresSearchPathBaseline {
+            configured: "\"$user\", public".to_string(),
+            first_resolved_schema: Some("dbx_test".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &baseline),
+            "SET search_path TO \"dbx_test\", public, pg_catalog"
+        );
+
+        let explicit_baseline = PostgresSearchPathBaseline {
+            configured: "dbx_test, \"$user\", public".to_string(),
+            first_resolved_schema: Some("dbx_test".to_string()),
+            has_explicit_pg_catalog: false,
+        };
+        assert_eq!(
+            postgres_set_preserved_search_path_sql("dbx_test", PostgresSearchPathContext::Query, &explicit_baseline),
+            "SET search_path TO dbx_test, public, pg_catalog"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_GAUSSDB_URL, DBX_TEST_GAUSSDB_SCHEMA, and DBX_TEST_GAUSSDB_TABLE"]
+    async fn gaussdb_selected_schema_matching_user_is_applied() {
+        let url = std::env::var("DBX_TEST_GAUSSDB_URL").expect("DBX_TEST_GAUSSDB_URL");
+        let schema = std::env::var("DBX_TEST_GAUSSDB_SCHEMA").expect("DBX_TEST_GAUSSDB_SCHEMA");
+        let table = std::env::var("DBX_TEST_GAUSSDB_TABLE").expect("DBX_TEST_GAUSSDB_TABLE");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect gaussdb");
+
+        let current_schema =
+            execute_query_with_schema(&pool, &schema, "SELECT current_schema()").await.expect("query current schema");
+        assert_eq!(current_schema.rows[0][0].as_str(), Some(schema.as_str()));
+
+        execute_query_with_schema(&pool, &schema, &format!("SELECT 1 FROM {} LIMIT 1", pg_quote_ident(&table)))
+            .await
+            .expect("query unqualified table in selected schema");
     }
 
     #[test]
@@ -9878,8 +10844,15 @@ mod tests {
         assert_eq!(classify_pg_type("time"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
         assert_eq!(classify_pg_type("timetz"), PgColType::Temporal { fallback: PgTemporalFallback::Probe });
         assert_eq!(classify_pg_type("interval"), PgColType::Interval);
-        // 时间数组类型名在原实现中先进时间分支、解码失败后落到通用数组分支
+        // Temporal array type names use the generic array fallback after text decoding.
         assert_eq!(classify_pg_type("_timestamp"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
+        assert_eq!(
+            classify_pg_type("_timestamptz"),
+            PgColType::Temporal { fallback: PgTemporalFallback::GenericArray }
+        );
+        assert_eq!(classify_pg_type("_date"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
+        assert_eq!(classify_pg_type("_time"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
+        assert_eq!(classify_pg_type("_timetz"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
         assert_eq!(classify_pg_type("_interval"), PgColType::Temporal { fallback: PgTemporalFallback::GenericArray });
         // 同时命中时间关键字与 VECTOR( 前缀的类型名，原实现时间解码失败后走 vector 分支
         assert_eq!(classify_pg_type("vector(timestamp)"), PgColType::Temporal { fallback: PgTemporalFallback::Vector });
@@ -9901,7 +10874,6 @@ mod tests {
         assert_eq!(classify_pg_type("_bit"), PgColType::BitStringArray);
         assert_eq!(classify_pg_type("_varbit"), PgColType::BitStringArray);
         assert_eq!(classify_pg_type("_int4"), PgColType::GenericArray);
-        assert_eq!(classify_pg_type("_time"), PgColType::GenericArray);
         assert_eq!(classify_pg_type("vector"), PgColType::Vector);
         assert_eq!(classify_pg_type("vector(3)"), PgColType::Vector);
         assert_eq!(classify_pg_type("geometry"), PgColType::Geometry);
@@ -9961,6 +10933,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn postgres_temporal_text_fallback_keeps_session_wall_time_and_normalizes_offset() {
+        let temporal = PgColType::Temporal { fallback: PgTemporalFallback::Probe };
+        assert_eq!(
+            pg_text_fallback_value("2026-09-13 13:00:00+12", Some(temporal)),
+            (serde_json::json!("2026-09-13T13:00:00+12:00"), None)
+        );
+        assert_eq!(
+            pg_text_fallback_value("2026-09-13 01:00:00", Some(temporal)),
+            (serde_json::json!("2026-09-13 01:00:00"), None)
+        );
+    }
+
+    #[test]
+    fn postgres_temporal_text_array_fallback_preserves_values_and_nulls() {
+        let temporal = PgColType::Temporal { fallback: PgTemporalFallback::GenericArray };
+        assert_eq!(
+            pg_text_fallback_value(
+                r#"{"2026-09-13 13:00:00+12","2026-09-13 01:00:00-05:30",NULL,"NULL"}"#,
+                Some(temporal),
+            ),
+            (serde_json::json!(["2026-09-13T13:00:00+12:00", "2026-09-13T01:00:00-05:30", null, "NULL"]), None,)
+        );
+        assert_eq!(
+            pg_text_fallback_value(r#"[0:1]={{"2026-09-13 13:00:00+12"},{NULL}}"#, Some(temporal)),
+            (serde_json::json!([["2026-09-13T13:00:00+12:00"], [null]]), None,)
+        );
+    }
+
     struct DockerPostgres {
         name: String,
         port: u16,
@@ -9990,6 +10991,48 @@ mod tests {
         start_docker_postgres_image("postgres:16-alpine", &[]).await
     }
 
+    #[tokio::test]
+    async fn postgres_temporal_values_follow_server_timezone_and_preserve_grid_write_text() {
+        let Some(container) =
+            start_docker_postgres_image_with_postgres_args("postgres:16-alpine", &[], &["-c", "timezone=Etc/GMT-12"])
+                .await
+        else {
+            return;
+        };
+        let pool = connect(&container.url(), Duration::from_secs(5)).await.expect("connect postgres");
+        let client = pool.get().await.expect("checkout postgres");
+
+        let timezone: String = client.query_one("SHOW timezone", &[]).await.unwrap().get(0);
+        assert_eq!(timezone, "Etc/GMT-12");
+
+        let result = execute_select_query(
+            &client,
+            "SELECT TIMESTAMP '2026-09-13 01:00:00' AS without_timezone, TIMESTAMPTZ '2026-09-13 01:00:00+00' AS with_timezone",
+            Instant::now(),
+            10,
+        )
+        .await
+        .expect("query temporal values");
+        assert_eq!(result.rows[0][0], serde_json::json!("2026-09-13 01:00:00"));
+        assert_eq!(result.rows[0][1], serde_json::json!("2026-09-13T13:00:00+12:00"));
+
+        let separator = if container.url().contains('?') { '&' } else { '?' };
+        let explicit_url = format!("{}{separator}options=-c%20TimeZone%3DUTC", container.url());
+        let explicit_pool = connect(&explicit_url, Duration::from_secs(5)).await.expect("connect explicit timezone");
+        let explicit_client = explicit_pool.get().await.expect("checkout explicit timezone");
+        let explicit_timezone: String = explicit_client.query_one("SHOW timezone", &[]).await.unwrap().get(0);
+        assert_eq!(explicit_timezone, "UTC");
+        let explicit_result = execute_select_query(
+            &explicit_client,
+            "SELECT TIMESTAMPTZ '2026-09-13 01:00:00+00' AS with_timezone",
+            Instant::now(),
+            10,
+        )
+        .await
+        .expect("query explicitly zoned temporal value");
+        assert_eq!(explicit_result.rows[0][0], serde_json::json!("2026-09-13T01:00:00+00:00"));
+    }
+
     // PostgreSQL 9.3 (pre-pg_sequence/pg_sequence_last_value) only ships an
     // amd64 image, so Apple Silicon hosts need explicit emulation.
     async fn start_docker_postgres_9_3() -> Option<DockerPostgres> {
@@ -9997,6 +11040,14 @@ mod tests {
     }
 
     async fn start_docker_postgres_image(image: &str, extra_args: &[&str]) -> Option<DockerPostgres> {
+        start_docker_postgres_image_with_postgres_args(image, extra_args, &[]).await
+    }
+
+    async fn start_docker_postgres_image_with_postgres_args(
+        image: &str,
+        extra_args: &[&str],
+        postgres_args: &[&str],
+    ) -> Option<DockerPostgres> {
         if !docker_ready() {
             eprintln!("skipping docker-backed postgres test because Docker is unavailable");
             return None;
@@ -10019,6 +11070,7 @@ mod tests {
                 &format!("{port}:5432"),
                 image,
             ])
+            .args(postgres_args)
             .status()
             .expect("start docker postgres");
         assert!(status.success(), "docker run postgres container should succeed");
@@ -10985,9 +12037,9 @@ mod tests {
     }
 
     #[test]
-    fn timestamptz_display_preserves_local_offset() {
-        let text = format_pg_timestamptz(Local::now());
-        assert!(!text.ends_with("+00:00") || Local::now().offset().local_minus_utc() == 0);
+    fn timestamptz_binary_fallback_uses_utc_instead_of_host_timezone() {
+        let value = "2026-09-13T01:00:00+00:00".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(format_pg_timestamptz(value), "2026-09-13T01:00:00+00:00");
     }
 
     // --- validate_postgres_ssl_paths ---
@@ -11346,6 +12398,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires DBX_LIVE_PG_TRANSFER_SOURCE_URL pointing at a disposable PostgreSQL"]
+    async fn live_postgres_progress_read_survives_a_total_duration_beyond_the_timeout() {
+        let Ok(url) = std::env::var("DBX_LIVE_PG_TRANSFER_SOURCE_URL") else {
+            return;
+        };
+        let pool = connect(&url, Duration::from_secs(5)).await.unwrap();
+
+        // 20 rows produced ~50 ms apart: the statement streams for ~1 s in total,
+        // well beyond the 200 ms budget, while never stalling that long between
+        // rows — the exact shape a progress-aware transfer read has to survive.
+        // Each row carries >8 KB so PostgreSQL flushes it immediately instead of
+        // buffering the whole (tiny) result set and sending it in one packet.
+        let sql = "SELECT pg_sleep(0.05) IS NULL AS slept, repeat('x', 20000) AS payload, n \
+                   FROM generate_series(1, 20) AS n";
+
+        let progress_clock = Arc::new(StreamProgressClock::new());
+        let result =
+            execute_query_with_max_rows_progress(&pool, sql, None, progress_clock, Some(Duration::from_millis(200)))
+                .await;
+        assert!(result.is_ok(), "progress-aware read must survive a total duration beyond the timeout: {result:?}");
+        assert_eq!(result.unwrap().rows.len(), 20);
+
+        // Contrast: the same statement under a plain, never-reset wall-clock budget
+        // must time out, proving this test actually exercises the difference.
+        let wall_clock = await_stream_with_progress_timeout(
+            execute_query_with_max_rows(&pool, sql, None),
+            Some(Duration::from_millis(200)),
+            Arc::new(StreamProgressClock::new()),
+            None,
+            "Query timed out after 0 seconds".to_string(),
+        )
+        .await;
+        assert!(wall_clock.is_err(), "the wall-clock path must still time out");
+    }
+
+    #[tokio::test]
     async fn postgres_row_query_timeout_still_fires_after_no_progress() {
         let progress_clock = Arc::new(StreamProgressClock::new());
         let error = await_stream_with_progress_timeout(
@@ -11535,7 +12623,7 @@ mod tests {
         assert!(info_compat_sql.contains("c.relkind IN ('r','p','f')"));
         assert!(info_compat_sql.contains("LIMIT 1"));
         assert!(local_objects_sql.contains("row_to_json(con)->>'conparentid'"));
-        assert!(local_objects_sql.contains("con.contype IN ('p','f')"));
+        assert!(local_objects_sql.contains("con.contype IN ('p','u','f')"));
         assert!(local_objects_sql.contains("i.inhrelid = idx.oid"));
         assert!(local_objects_sql.contains("con.contype = 'c' AND con.conislocal"));
         assert!(!local_objects_sql.contains("con.coninhcount = 0"));
@@ -12899,7 +13987,8 @@ mod tests {
     fn postgres_index_metadata_has_legacy_catalog_fallback() {
         assert!(POSTGRES_INDEXES_SQL.contains("ix.indnkeyatts"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indnkeyatts"));
-        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("NULL::smallint AS nkeyatts"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("AS nkeyatts"));
+        assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("ix.indoption::text"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("LATERAL"));
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("WITH ORDINALITY"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("generate_series"));
@@ -12911,6 +14000,8 @@ mod tests {
             postgres_indexes_for_relations_compat_sql(),
         ] {
             assert!(sql.contains("ix.indisunique AND ix.indisvalid"));
+            assert!(sql.contains("AS constraint_backed"));
+            assert!(sql.contains("con.conindid = i.oid"));
         }
     }
 
@@ -12921,6 +14012,17 @@ mod tests {
         assert!(POSTGRES_INDEXES_SQL.contains("array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("SELECT a.attname IS NULL"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("AS key_is_expression"));
+    }
+
+    #[test]
+    fn postgres_index_metadata_tracks_per_key_ordering_without_include_columns() {
+        for sql in [POSTGRES_INDEXES_SQL, postgres_indexes_for_relations_sql()] {
+            assert!(sql.contains("ix.indoption[(k.n - 1)::int]"));
+            assert!(sql.contains("FILTER (WHERE k.n <= ix.indnkeyatts)"));
+        }
+        for sql in [POSTGRES_INDEXES_COMPAT_SQL, postgres_indexes_for_relations_compat_sql()] {
+            assert!(sql.contains("string_to_array(ix.indoption::text, ' ')") && sql.contains("AS key_options"));
+        }
     }
 
     #[test]
@@ -13299,7 +14401,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_includes_routines() {
-        let sql = list_objects_sql(true, true, false, true, true, true, false);
+        let sql = list_objects_sql(true, true, false, true, true, true, false, false);
         assert!(sql.contains("pg_catalog.pg_class"));
         assert!(sql.contains("pg_catalog.pg_proc"));
         assert!(sql.contains("pg_catalog.pg_inherits"));
@@ -13317,7 +14419,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_includes_custom_types_when_enabled() {
-        let sql = list_objects_sql(true, true, false, true, true, true, true);
+        let sql = list_objects_sql(true, true, false, true, true, true, true, false);
         assert!(sql.contains("pg_catalog.pg_type"));
         assert!(sql.contains("pg_catalog.pg_class"));
         assert!(sql.contains("pg_catalog.pg_description"));
@@ -13348,14 +14450,14 @@ mod tests {
 
     #[test]
     fn list_objects_sql_omits_custom_types_when_disabled() {
-        let sql = list_objects_sql(true, true, false, true, true, true, false);
+        let sql = list_objects_sql(true, true, false, true, true, true, false, false);
         assert!(!sql.contains("pg_type"));
         assert!(!sql.contains("t.typtype"));
     }
 
     #[test]
     fn list_objects_sql_type_only_skips_relations_and_routines() {
-        let sql = list_objects_sql(true, true, false, true, false, false, true);
+        let sql = list_objects_sql(true, true, false, true, false, false, true, false);
         assert!(sql.contains("pg_catalog.pg_type"));
         assert!(!sql.contains("FROM pg_catalog.pg_class"));
         assert!(!sql.contains("pg_catalog.pg_proc"));
@@ -13365,7 +14467,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_table_only_skips_routines_and_custom_types() {
-        let sql = list_objects_sql(true, true, false, true, true, false, false);
+        let sql = list_objects_sql(true, true, false, true, true, false, false, false);
         assert!(sql.contains("pg_catalog.pg_class"));
         assert!(!sql.contains("pg_catalog.pg_proc"));
         assert!(!sql.contains("pg_catalog.pg_type"));
@@ -13373,7 +14475,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_routine_only_skips_relations_and_custom_types() {
-        let sql = list_objects_sql(true, true, false, true, false, true, false);
+        let sql = list_objects_sql(true, true, false, true, false, true, false, false);
         assert!(sql.contains("pg_catalog.pg_proc"));
         assert!(!sql.contains("pg_catalog.pg_class"));
         assert!(!sql.contains("pg_catalog.pg_type"));
@@ -13381,7 +14483,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_empty_scope_produces_no_sql() {
-        let sql = list_objects_sql(true, true, false, true, false, false, false);
+        let sql = list_objects_sql(true, true, false, true, false, false, false, false);
         assert!(sql.is_empty());
     }
 
@@ -13390,8 +14492,8 @@ mod tests {
         // The pg_type branch carries the same filters whether the timestamp
         // query or the timestamp fallback query is used.
         for sql in [
-            list_objects_sql(true, true, false, true, false, false, true),
-            list_objects_sql(false, true, false, true, false, false, true),
+            list_objects_sql(true, true, false, true, false, false, true, false),
+            list_objects_sql(false, true, false, true, false, false, true, false),
         ] {
             assert!(sql.contains("pg_catalog.pg_type"));
             assert!(sql.contains("t.typtype IN ('b', 'c', 'd', 'e', 'r', 'm')"));
@@ -13403,7 +14505,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_custom_types_keeps_comment_join_semantics() {
-        let sql = list_objects_sql(true, true, false, true, false, false, true);
+        let sql = list_objects_sql(true, true, false, true, false, false, true, false);
         assert!(sql.contains("d.objoid = t.oid"));
         assert!(sql.contains("d.classoid = 'pg_catalog.pg_type'::regclass"));
         assert!(sql.contains("d.objsubid = 0"));
@@ -13412,7 +14514,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_custom_types_uses_null_timestamps() {
-        let sql = list_objects_sql(true, true, false, true, false, false, true);
+        let sql = list_objects_sql(true, true, false, true, false, false, true, false);
         assert!(sql.contains("NULL::text AS created_at"));
         assert!(sql.contains("NULL::text AS updated_at"));
         assert!(sql.contains("NULL::text AS parent_schema"));
@@ -13423,7 +14525,7 @@ mod tests {
 
     #[test]
     fn list_objects_sql_without_timestamps_omits_stat_file() {
-        let sql = list_objects_sql(false, true, false, true, true, true, false);
+        let sql = list_objects_sql(false, true, false, true, true, true, false, false);
         assert!(!sql.contains("pg_stat_file"));
         assert!(sql.contains("NULL::text AS created_at"));
         assert!(sql.contains("NULL::text AS updated_at"));
@@ -13431,7 +14533,7 @@ mod tests {
 
     #[test]
     fn redshift_compatible_list_objects_sql_uses_legacy_argument_formatter() {
-        let sql = list_objects_sql(false, false, false, false, true, true, false);
+        let sql = list_objects_sql(false, false, false, false, true, true, false, false);
         assert!(sql.contains("pg_get_function_arguments(p.oid) AS signature"));
         assert!(!sql.contains("pg_get_function_identity_arguments"));
     }
@@ -13451,7 +14553,7 @@ mod tests {
 
     #[test]
     fn redshift_relation_objects_sql_avoids_unsupported_postgres_helpers() {
-        let sql = list_objects_sql(false, false, false, false, true, false, false);
+        let sql = list_objects_sql(false, false, false, false, true, false, false, false);
         assert!(sql.contains("pg_catalog.pg_class"));
         assert!(!sql.contains("pg_catalog.pg_proc"));
         assert!(!sql.contains("pg_stat_file"));
@@ -13525,31 +14627,31 @@ mod tests {
 
     #[test]
     fn both_list_objects_sql_variants_use_parameter() {
-        assert!(list_objects_sql(true, true, true, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(false, true, true, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(true, true, false, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(false, true, false, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(true, false, true, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(false, false, true, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(true, false, false, true, true, true, false).contains("$1"));
-        assert!(list_objects_sql(false, false, false, true, true, true, false).contains("$1"));
+        assert!(list_objects_sql(true, true, true, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(false, true, true, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(true, true, false, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(false, true, false, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(true, false, true, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(false, false, true, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(true, false, false, true, true, true, false, false).contains("$1"));
+        assert!(list_objects_sql(false, false, false, true, true, true, false, false).contains("$1"));
     }
 
     #[test]
     fn both_list_objects_sql_variants_include_pg_proc() {
-        assert!(list_objects_sql(true, true, true, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, true, true, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(true, true, false, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, true, false, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(true, false, true, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, false, true, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(true, false, false, true, true, true, false).contains("pg_catalog.pg_proc"));
-        assert!(list_objects_sql(false, false, false, true, true, true, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, true, true, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, true, true, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, true, false, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, true, false, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, false, true, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, false, true, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(true, false, false, true, true, true, false, false).contains("pg_catalog.pg_proc"));
+        assert!(list_objects_sql(false, false, false, true, true, true, false, false).contains("pg_catalog.pg_proc"));
     }
 
     #[test]
     fn legacy_list_objects_sql_avoids_pg11_proc_kind_column() {
-        let sql = list_objects_sql(true, false, false, true, true, true, false);
+        let sql = list_objects_sql(true, false, false, true, true, true, false, false);
         assert!(!sql.contains("p.prokind"));
         assert!(!sql.contains("p.prosp"));
         assert!(sql.contains("NOT p.proisagg"));
@@ -13561,7 +14663,7 @@ mod tests {
 
     #[test]
     fn gaussdb_compatible_list_objects_sql_uses_prosp_when_prokind_is_missing() {
-        let sql = list_objects_sql(true, false, true, true, true, true, false);
+        let sql = list_objects_sql(true, false, true, true, true, true, false, false);
         assert!(!sql.contains("p.prokind"));
         assert!(sql.contains("CASE WHEN p.prosp THEN 'PROCEDURE' ELSE 'FUNCTION' END AS object_type"));
         assert!(sql.contains("CASE WHEN p.prosp THEN 2 ELSE 3 END AS sort_order"));
@@ -13572,7 +14674,7 @@ mod tests {
 
     #[test]
     fn gaussdb_compatible_list_objects_sql_uses_prosp_with_prokind_when_available() {
-        let sql = list_objects_sql(true, true, true, true, true, true, false);
+        let sql = list_objects_sql(true, true, true, true, true, true, false, false);
         assert!(
             sql.contains("CASE WHEN p.prokind = 'p' OR p.prosp THEN 'PROCEDURE' ELSE 'FUNCTION' END AS object_type")
         );
@@ -14202,6 +15304,48 @@ mod tests {
         assert!(postgres_completion_sequences_sql().contains("ORDER BY c.relname LIMIT $4"));
         assert!(postgres_completion_columns_sql().contains("a.attname ILIKE $3 ESCAPE '~'"));
         assert!(postgres_visible_table_schema_sql().contains("pg_catalog.pg_table_is_visible(c.oid)"));
+    }
+
+    #[test]
+    fn opengauss_completion_packages_sql_filters_a_mode_and_prefix_before_limit() {
+        let sql = opengauss_completion_packages_sql();
+        assert!(sql.contains("FROM pg_catalog.gs_package"));
+        assert!(sql.contains("d.datcompatibility::text = 'A'"));
+        assert!(sql.contains("p.pkgname ILIKE $2 ESCAPE '~'"));
+        assert!(sql.contains("ORDER BY p.pkgname LIMIT $3"));
+    }
+
+    #[test]
+    fn opengauss_completion_routines_sql_excludes_package_and_private_members() {
+        // openGauss stores package members (propackage=true) and private members
+        // (proisprivate=true) in pg_proc; the completion variant must not surface
+        // them as top-level routines. See review P1 #1.
+        for has_proc_prokind in [true, false] {
+            let sql = opengauss_completion_routines_sql(has_proc_prokind);
+            assert!(sql.contains("COALESCE(p.propackage, false) = false"));
+            assert!(sql.contains("COALESCE(p.proisprivate, false) = false"));
+            assert!(sql.contains("WHERE n.nspname = $1"));
+            // The prefix mask still applies before the LIMIT.
+            assert!(sql.contains("$2 = '%%' OR p.proname ILIKE $2 ESCAPE '~'"));
+        }
+        assert!(opengauss_completion_routines_sql(true).contains("p.prokind::text = ANY($3::text[])"));
+        assert!(!opengauss_completion_routines_sql(false).contains("p.prokind"));
+    }
+
+    #[test]
+    fn opengauss_package_members_sql_uses_case_insensitive_names_and_prefix_mask() {
+        // Package names are normalized by the parser, so catalog and
+        // user-typed spellings must match case-insensitively.
+        // #3: the member prefix must filter on the server before LIMIT so a
+        // matching member is not shadowed by the first N alphabetically-sorted
+        // rows.
+        let sql = opengauss_package_members_sql();
+        assert!(sql.contains("WHERE f.propackageid = $1"));
+        assert!(sql.contains("AND f.prokind IN ('f','p','v','b','i')"));
+        assert!(sql.contains("COALESCE(f.proisprivate, false) = false"));
+        let identity = opengauss_package_identity_sql();
+        assert!(identity.contains("SELECT p.oid::oid, p.pkgname::text, n.nspname::text"));
+        assert!(identity.contains("ORDER BY (p.pkgname::text = $2) DESC"));
     }
 
     #[test]

@@ -50,7 +50,6 @@ import {
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -156,7 +155,7 @@ import type { AiConfigItem, AiEffortCapability, AiEffortOption, AiEffortSelectio
 import type { ConnectionConfig, QueryTab, SavedSqlFile, TableInfo } from "@/types/database";
 import { fetchNamespaceOptionsForConnection, useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { useSchemaOptions } from "@/composables/useSchemaOptions";
-import { decodeSelectableDatabaseValue, encodeSelectableDatabaseValue, formatDatabaseLabel, resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
+import { encodeSelectableDatabaseValue, formatDatabaseLabel, resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { normalizeSqliteNamespace } from "@/lib/database/sqliteNamespace";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseCapabilities";
@@ -324,6 +323,10 @@ const conversationSearchInput = ref<HTMLInputElement | null>(null);
 const conversationSearchIndex = computed(() => buildAiConversationSearchIndex(conversations.value));
 const filteredConversations = computed(() => filterAiConversationSearchIndex(conversationSearchIndex.value, conversationSearchQuery.value));
 const showConversationList = ref(false);
+const renamingConversationId = ref<string | null>(null);
+const renamingConversationTitle = ref("");
+const renamingConversationInput = ref<HTMLInputElement | null>(null);
+const renamedConversationTitles = reactive(new Map<string, string>());
 const showTemplateSelector = ref(false);
 const modeActionOpen = ref(false);
 // A normal-send FIFO run recovered at startup as an editable pending draft.
@@ -1405,18 +1408,48 @@ const dbSelectOptions = computed(() => {
   }));
 });
 
-const selectedNamespace = computed(() => (props.connection && props.tab ? resolveAiNamespaceSelection(props.tab, props.connection).value : ""));
+// AI can inspect more than the tab's active database. Keep this selection local
+// to the composer so changing the visible query tab does not rewrite SQL state.
+const selectedDatabases = ref<string[]>([]);
+const databaseSearchQuery = ref("");
+const filteredDbSelectOptions = computed(() => {
+  const query = databaseSearchQuery.value.trim().toLowerCase();
+  if (!query) return dbSelectOptions.value;
+  return dbSelectOptions.value.filter((option) => option.label.toLowerCase().includes(query) || option.database.toLowerCase().includes(query));
+});
 
-const selectedDatabaseSelectValue = computed(() => (props.connection ? encodeSelectableDatabaseValue(props.connection.db_type, selectedNamespace.value) : ""));
-
+const selectedDatabaseValues = computed(() => new Set(selectedDatabases.value));
 const selectedDatabaseLabel = computed(() => {
   if (!props.connection) return t("editor.selectDatabase");
-  if (!props.tab) return t("editor.selectDatabase");
-  return formatDatabaseLabel(props.connection, selectedNamespace.value, {
-    defaultDatabase: t("editor.defaultDatabase"),
-    noDatabase: t("editor.noDatabase"),
-  });
+  const labels = dbSelectOptions.value.filter((option) => selectedDatabaseValues.value.has(option.database)).map((option) => option.label);
+  return labels.length ? labels.join(", ") : t("editor.selectDatabase");
 });
+
+function syncSelectedDatabases() {
+  const active = selectedNamespace.value;
+  const available = dbSelectOptions.value.map((option) => option.database);
+  const retained = selectedDatabases.value.filter((database) => available.includes(database));
+  selectedDatabases.value = retained.length ? retained : active ? [active] : [];
+}
+
+function toggleDatabase(database: string) {
+  if (selectedDatabaseValues.value.has(database)) {
+    if (selectedDatabases.value.length === 1) return;
+    selectedDatabases.value = selectedDatabases.value.filter((item) => item !== database);
+  } else {
+    selectedDatabases.value = [...selectedDatabases.value, database];
+  }
+}
+
+const selectedNamespace = computed(() => (props.connection && props.tab ? resolveAiNamespaceSelection(props.tab, props.connection).value : ""));
+
+watch(
+  () => `${props.connection?.id ?? ""}:${props.tab?.id ?? ""}`,
+  () => {
+    selectedDatabases.value = selectedNamespace.value ? [selectedNamespace.value] : [];
+  },
+);
+watch([dbSelectOptions, selectedNamespace], syncSelectedDatabases, { immediate: true });
 
 const showAiSchemaSelector = computed(() => {
   const connection = props.connection;
@@ -1475,20 +1508,6 @@ async function changeConnection(connectionId: string) {
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : String(e);
     toast(t("connection.connectFailed", { message: translateBackendError(t, message) }), 5000);
-  }
-}
-
-function changeNamespace(value: string) {
-  const tab = props.tab;
-  const connection = props.connection;
-  if (!tab || !connection) return;
-  const namespace = decodeSelectableDatabaseValue(connection.db_type, value);
-  if (resolveAiNamespaceSelection(tab, connection).value === namespace) return;
-  clearContextReferences();
-  if (resolveAiNamespaceSelection(tab, connection).kind === "schema") {
-    queryStore.updateSchema(tab.id, namespace || undefined);
-  } else {
-    queryStore.updateDatabase(tab.id, namespace);
   }
 }
 
@@ -1713,7 +1732,7 @@ function parseExplainFromData(explainData: unknown, dbType: string): ParsedExpla
     return parseOracleExplainText(explainData);
   }
   if (!explainData || typeof explainData !== "object") return undefined;
-  const supportedTypes = ["mysql", "postgres", "dameng", "questdb"] as const;
+  const supportedTypes = ["mysql", "postgres", "dameng", "questdb", "doris"] as const;
   if (!supportedTypes.includes(dbType as (typeof supportedTypes)[number])) return undefined;
   try {
     return parseExplainResult(dbType as (typeof supportedTypes)[number], explainData as import("@/types/database").QueryResult);
@@ -2793,6 +2812,9 @@ async function send() {
     clearPendingWriteGrant();
     return;
   }
+  // Capture the selection before context loading or queued run scheduling can
+  // yield to another conversation. Dameng's top-level selector is a schema.
+  const runDatabases = resolveAiNamespaceSelection(tab, connection).kind === "database" ? [...selectedDatabases.value] : [];
   const activeConfig = activeFullConfig.value;
   if (!activeConfig) {
     clearPendingWriteGrant();
@@ -3086,11 +3108,21 @@ async function send() {
     // paying for buildAiContext() too; it can do real backend/schema work that
     // would be entirely wasted on an already-abandoned request.
     if (!generationCanContinue()) return;
-    const context = await buildAiContext(tab, connection, {
-      mentionedTables,
-      sqlFiles,
-      csvFiles: csvAttachments,
-    });
+    const requestDatabase = runDatabases[0] ?? tab.database;
+    const context = await buildAiContext(
+      {
+        ...tab,
+        database: requestDatabase,
+        schema: runDatabases.length > 1 || requestDatabase !== tab.database ? undefined : tab.schema,
+      },
+      connection,
+      {
+        mentionedTables,
+        sqlFiles,
+        csvFiles: csvAttachments,
+      },
+    );
+    context.selectedDatabases = runDatabases;
     // Superseded while awaiting buildAiContext() above — must bail before ever
     // calling runAgentStream(), not just before writing its results. Without
     // this recheck, a clear/switch/unmount that fires during context
@@ -3813,9 +3845,10 @@ function clearAttachmentDraftState() {
 function buildConversationSnapshot(targetConversationId: string, targetMessages: ChatMessage[], connectionName: string, database: string, createdAt = new Date().toISOString()): AiConversation | null {
   if (!targetConversationId || !targetMessages.length) return null;
   const first = targetMessages.find((m) => m.role === "user" && m.kind !== "contextSummary");
+  const existingConversation = conversations.value.find((conversation) => conversation.id === targetConversationId);
   return {
     id: targetConversationId,
-    title: first ? messageTitle(first).slice(0, 50) : "Untitled",
+    title: renamedConversationTitles.get(targetConversationId) || existingConversation?.title || (first ? messageTitle(first).slice(0, 50) : "Untitled"),
     connectionName,
     database,
     messages: targetMessages.map((m) => ({
@@ -3967,6 +4000,38 @@ async function setConversationListOpen(open: boolean) {
     await nextTick();
     conversationSearchInput.value?.focus();
     conversations.value = await loadAiConversations().catch(() => []);
+  }
+}
+
+async function startRenameConversation(conv: AiConversation) {
+  renamingConversationId.value = conv.id;
+  renamingConversationTitle.value = conv.title;
+  await nextTick();
+  renamingConversationInput.value?.focus();
+  renamingConversationInput.value?.select();
+}
+function cancelRenameConversation() {
+  renamingConversationId.value = null;
+  renamingConversationTitle.value = "";
+}
+async function commitRenameConversation(conv: AiConversation) {
+  const title = renamingConversationTitle.value.trim().slice(0, 50);
+  if (!title || title === conv.title) return cancelRenameConversation();
+  try {
+    const activeRun = desktopAiRun<ChatMessage>(conv.id);
+    if (activeRun) await runSnapshotScheduler.save(activeRun);
+    const latestConversation = conversations.value.find((item) => item.id === conv.id) ?? conv;
+    const updated = { ...latestConversation, title, updatedAt: new Date().toISOString() };
+    // Claim the title before the async save so a throttled snapshot firing
+    // during the await window cannot persist the previous title over it.
+    renamedConversationTitles.set(conv.id, title);
+    await saveAiConversation(updated);
+    const i = conversations.value.findIndex((item) => item.id === conv.id);
+    if (i >= 0) conversations.value[i] = updated;
+  } catch {
+    toast(t("ai.conversationRenameFailed"), 5000);
+  } finally {
+    cancelRenameConversation();
   }
 }
 
@@ -4462,7 +4527,12 @@ function clearContextReferences() {
   mentionError.value = "";
 }
 
-defineExpose({ triggerAction, setPrompt, addTableMention, clearContextReferences, selectConversationById });
+function focusSearch(): boolean {
+  void setConversationListOpen(true);
+  return true;
+}
+
+defineExpose({ triggerAction, setPrompt, addTableMention, clearContextReferences, selectConversationById, focusSearch });
 
 const messageRenderer = computed(() => {
   const appearance = aiCodeAppearance.value;
@@ -4533,6 +4603,7 @@ async function openExternalUrl(url: string) {
             <Search class="pointer-events-none absolute left-3 h-3 w-3 text-muted-foreground" />
             <input
               ref="conversationSearchInput"
+              data-ai-conversation-search
               v-model="conversationSearchQuery"
               type="search"
               :aria-label="t('history.conversationSearch')"
@@ -4552,7 +4623,22 @@ async function openExternalUrl(url: string) {
           </div>
           <div v-else class="max-h-64 overflow-auto p-1">
             <div v-for="conv in filteredConversations" :key="conv.id" class="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted" :class="{ 'bg-muted': conv.id === conversationId }" @click="selectConversation(conv)">
-              <span class="min-w-0 flex-1 truncate" :title="conv.title">{{ conv.title }}</span>
+              <input
+                v-if="renamingConversationId === conv.id"
+                :ref="
+                  (element) => {
+                    renamingConversationInput = element as HTMLInputElement | null;
+                  }
+                "
+                v-model="renamingConversationTitle"
+                class="min-w-0 flex-1 rounded border bg-background px-1 py-0.5 text-xs"
+                @click.stop
+                @keydown.enter.stop.prevent="commitRenameConversation(conv)"
+                @keydown.esc.stop.prevent="cancelRenameConversation"
+                @blur="commitRenameConversation(conv)"
+              />
+              <span v-else class="min-w-0 flex-1 truncate" :title="conv.title">{{ conv.title }}</span>
+              <button v-if="renamingConversationId !== conv.id" type="button" class="shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground" :title="t('ai.renameConversation')" @click.stop="startRenameConversation(conv)"><Pencil class="h-3 w-3" /></button>
               <span v-if="conversationRowDetail(conv).hasQueuedInput" class="shrink-0 rounded border border-primary/40 bg-primary/10 px-1 py-px text-[10px] text-primary" :aria-label="t('ai.rowQueuedInput')" :title="t('ai.rowQueuedInput')">{{ t("ai.rowQueuedInput") }}</span>
               <span v-if="conversationRowDetail(conv).status === 'preparing' || conversationRowDetail(conv).status === 'running'" class="flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground" :aria-label="t('ai.runStatusRunning')" :title="t('ai.runStatusRunning')">
                 <Loader2 class="h-3 w-3 shrink-0 animate-spin" />
@@ -4752,7 +4838,7 @@ async function openExternalUrl(url: string) {
                           <span class="truncate">{{ mention.kind === "table" ? [mention.schema, mention.table].filter(Boolean).join(".") : mention.name }}</span>
                         </button>
                       </div>
-                      <div v-if="msg.content" class="whitespace-pre-wrap">{{ msg.content }}</div>
+                      <div v-if="msg.content" data-ai-user-message-content class="whitespace-pre-wrap">{{ msg.content }}</div>
                     </div>
                     <div v-if="canCopyMessage(msg)" class="mt-1 flex justify-end">
                       <button
@@ -4860,7 +4946,7 @@ async function openExternalUrl(url: string) {
                         </button>
                       </div>
                     </div>
-                    <pre class="ai-code-block whitespace-pre-wrap break-words p-3 text-xs leading-relaxed text-zinc-900 dark:text-zinc-100"><code v-html="seg.html"></code></pre>
+                    <pre class="ai-code-block whitespace-pre-wrap break-words [overflow-wrap:anywhere] p-3 text-xs leading-relaxed text-zinc-900 dark:text-zinc-100"><code v-html="seg.html"></code></pre>
                   </div>
                 </template>
                 <div v-if="msg === proposalConfirmMessage" class="mt-2 flex gap-2" :title="t('ai.proposalConfirmTitle')">
@@ -4970,27 +5056,33 @@ async function openExternalUrl(url: string) {
               />
               <template v-if="connection">
                 <Database class="h-3 w-3 shrink-0 text-foreground/40" />
-                <Select
-                  :model-value="selectedDatabaseSelectValue"
-                  @update:model-value="
-                    (v) => {
-                      if (typeof v === 'string') changeNamespace(v);
-                    }
-                  "
+                <Popover
                   @update:open="
                     (open: boolean) => {
                       if (open) loadDatabases();
                     }
                   "
                 >
-                  <SelectTrigger :class="['h-5 w-auto border-0 rounded-md bg-transparent dark:bg-transparent p-0 px-1 text-xs text-foreground/80 shadow-none focus:ring-0 focus-visible:ring-0 [&_svg]:size-3', showAiSchemaSelector && 'min-w-0 max-w-56 flex-1']">
-                    <SelectValue :placeholder="t('editor.selectDatabase')">{{ selectedDatabaseLabel }}</SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="option in dbSelectOptions" :key="option.value" :value="option.value">{{ option.label }}</SelectItem>
-                    <SelectItem v-if="!dbSelectOptions.length && connection && tab" :value="selectedDatabaseSelectValue">{{ selectedDatabaseLabel }}</SelectItem>
-                  </SelectContent>
-                </Select>
+                  <PopoverTrigger as-child>
+                    <Button variant="ghost" :class="['h-5 max-w-64 justify-start border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'min-w-0 flex-1']">
+                      <span class="truncate">{{ selectedDatabaseLabel }}</span>
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent align="start" class="w-64 p-1">
+                    <div class="relative mb-1 flex items-center border-b px-2 py-1">
+                      <Search class="pointer-events-none absolute left-3 h-3 w-3 text-muted-foreground" />
+                      <input v-model="databaseSearchQuery" type="search" class="h-6 w-full bg-transparent pl-5 text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('ai.searchDatabases')" />
+                    </div>
+                    <button v-if="selectedDatabases.length > 1" type="button" class="mb-1 flex w-full items-center justify-end gap-1 border-b px-2 py-1 text-xs" @click.stop="selectedDatabases = []"><X class="h-3 w-3" />{{ t("ai.clearDatabaseSelection") }}</button>
+                    <div class="max-h-64 overflow-y-auto overscroll-contain">
+                      <button v-for="option in filteredDbSelectOptions" :key="option.value" type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted" @click="toggleDatabase(option.database)">
+                        <Check :class="['h-4 w-4', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
+                        <span class="truncate">{{ option.label }}</span>
+                      </button>
+                      <div v-if="!filteredDbSelectOptions.length" class="px-2 py-1.5 text-sm text-muted-foreground">{{ t("ai.noDatabasesFound") }}</div>
+                    </div>
+                  </PopoverContent>
+                </Popover>
                 <template v-if="showAiSchemaSelector">
                   <Layers class="h-3 w-3 shrink-0 text-foreground/40" />
                   <SearchableSelect
@@ -5687,6 +5779,10 @@ html.dbx-legacy-webview.dark .ai-markdown :deep(.ai-markdown-table-wrap:hover::-
 
 .ai-message-scroll :deep([data-slot="scroll-area-viewport"]) {
   overflow-anchor: none;
+}
+
+.ai-message-scroll :deep([data-ai-user-message-content]) {
+  overflow-wrap: anywhere;
 }
 
 .resize-handle {

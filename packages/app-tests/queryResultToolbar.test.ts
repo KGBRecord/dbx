@@ -4,6 +4,7 @@ import { test } from "vitest";
 import { compileScript, compileTemplate, parse } from "vue/compiler-sfc";
 
 const contentAreaPath = "apps/desktop/src/components/layout/ContentArea.vue";
+const resultSetNavigatorPath = "apps/desktop/src/components/layout/ResultSetNavigator.vue";
 const appPath = "apps/desktop/src/App.vue";
 const dataGridPath = "apps/desktop/src/components/grid/DataGrid.vue";
 const dataGridExportMenuPath = "apps/desktop/src/components/grid/DataGridExportMenu.vue";
@@ -51,7 +52,7 @@ test("query result toolbar reuses the production icon contract", () => {
   assert.match(contentArea, /<Wrench class="h-4 w-4"/);
   assert.match(contentArea, /<ChevronDown class="h-3\.5 w-3\.5"/);
   assert.match(viewSwitcher, /import \{ BarChart3, ListChecks, MessageSquareText \} from "@lucide\/vue"/);
-  assert.match(toolbarActions, /import \{ GitBranch, Gauge, Loader2, Upload \} from "@lucide\/vue"/);
+  assert.match(toolbarActions, /import \{ GitBranch, Gauge, Loader2, PlugZap, Upload \} from "@lucide\/vue"/);
   assert.match(editorToolbar, /@click="emit\('importResultArchive'\)"[\s\S]{0,100}<Download/);
   assert.match(toolbarActions, /@click="emit\('exportArchive'\)"[\s\S]{0,200}<Upload v-else/);
   assert.match(dataGrid, /return \{ label: t\("grid\.export"\), icon: Upload, children: items \};/);
@@ -66,7 +67,7 @@ test("ContentArea exposes retained result runs as switchable tabs or a compact l
   const contentArea = source(contentAreaPath);
   const runScrollerStart = contentArea.indexOf('ref="resultTabsScrollerRef"');
   const listSelectorStart = contentArea.indexOf('<div v-else-if="showResultRunSelector"', runScrollerStart);
-  const fixedResultSetStart = contentArea.indexOf("data-result-set-tabs-region", listSelectorStart);
+  const fixedResultSetStart = contentArea.indexOf("<ResultSetNavigator", listSelectorStart);
 
   assert.match(contentArea, /showResultRunTabs = computed\(\(\) => resultRuns\.value\.length > 0 && resultRunDisplayMode\.value === "tabs"\)/);
   assert.match(contentArea, /showResultRunSelector = computed\(\(\) => resultRuns\.value\.length > 0 && resultRunDisplayMode\.value === "list"\)/);
@@ -85,6 +86,7 @@ test("ContentArea exposes retained result runs as switchable tabs or a compact l
   assert.ok(runScrollerStart >= 0);
   assert.ok(listSelectorStart > runScrollerStart);
   assert.ok(fixedResultSetStart > listSelectorStart);
+  assert.match(source(resultSetNavigatorPath), /data-result-set-tabs-region/);
   assert.doesNotMatch(contentArea.slice(runScrollerStart, listSelectorStart), /visibleResultItems/);
   assert.match(contentArea, /resultAutoSave \? 'bg-primary\/10 text-primary[\s\S]*: 'text-muted-foreground hover:bg-accent hover:text-foreground'/);
   assert.doesNotMatch(contentArea, /queryResultAutoRefresh|QUERY_RESULT_AUTO_REFRESH|nextResultToolbarLayout/);
@@ -110,12 +112,12 @@ test("appending a result run preserves the tab-strip scroll position", () => {
 
 test("the close-tab shortcut clears query results before closing the tab", () => {
   const app = source(appPath);
-  const closeShortcutStart = app.indexOf("if (isCloseTabShortcut(e, shortcuts))");
-  const closeShortcutEnd = app.indexOf("if (isSaveShortcut", closeShortcutStart);
-  const closeShortcut = app.slice(closeShortcutStart, closeShortcutEnd);
+  const closeSurfaceStart = app.indexOf("async function closeActiveSurface()");
+  const closeSurfaceEnd = app.indexOf("function activateMainContentSurface", closeSurfaceStart);
+  const closeSurface = app.slice(closeSurfaceStart, closeSurfaceEnd);
 
-  assert.ok(closeShortcutStart >= 0);
-  assert.ok(closeShortcut.indexOf("await queryStore.clearQueryResults(queryStore.activeTabId)") < closeShortcut.indexOf("queryStore.closeTab(queryStore.activeTabId)"));
+  assert.ok(closeSurfaceStart >= 0);
+  assert.ok(closeSurface.indexOf("await queryStore.clearQueryResults(queryStore.activeTabId)") < closeSurface.indexOf("queryStore.closeTab(queryStore.activeTabId)"));
 });
 
 test("the configurable results pane shortcut only toggles existing output", () => {
@@ -168,7 +170,7 @@ test("table-data toolbar refresh keeps page size independent from SQL editor set
   assert.match(dataGrid, /watch\([\s\S]*\(\) => settingsStore\.editorSettings\.pageSize,[\s\S]*if \(pageSizePreference\.value !== "results"\) return;[\s\S]*pageSize\.value = normalizeResultPageSize\(value, pageSize\.value\)/);
   assert.match(dataGrid, /settingsStore\.updateEditorSettings\(dataGridPageSizeSettingsPatch\(pageSizePreference\.value, normalizedSize\)\)/);
   assert.match(dataGrid, /const resetToFirstPage = hasPendingConditionInputs\(\);/);
-  assert.match(dataGrid, /emit\("reload", props\.sql, searchText\.value, currentWhereInput\(\), currentOrderBy\(\), pageSize\.value, resetToFirstPage \? 0 : \(currentPage\.value - 1\) \* pageSize\.value, "refresh"\)/);
+  assert.match(dataGrid, /emit\("reload", props\.sql, searchText\.value, currentWhereInput\(\), currentOrderBy\(\), pageSize\.value, resetToFirstPage \? 0 : \(currentPage\.value - 1\) \* pageSize\.value, intent\)/);
 });
 
 test("standalone result views use the same compact toolbar breakpoint", () => {
@@ -241,7 +243,9 @@ test("embedded result toolbar cannot scroll vertically", () => {
 test("DataGrid marks toolbar refresh separately from current-result reloads", () => {
   const dataGrid = source(dataGridPath);
 
-  assert.match(dataGrid, /emit\("reload", props\.sql,[^;]+"refresh"\);/);
+  assert.match(dataGrid, /async function onToolbarRefresh\(\)\s*\{\s*await reloadTableData\("refresh"\);/);
+  assert.match(dataGrid, /refresh: \(\) => reloadTableData\("auto-refresh"\)/);
+  assert.match(dataGrid, /async function reloadTableData\(intent: DataGridReloadIntent\)[\s\S]*?emit\("reload", props\.sql,[^;]+intent\);/);
   assert.match(dataGrid, /function onToolbarRollback\(\)[\s\S]*?emit\("reload", props\.sql,[^;]+\);/);
 });
 

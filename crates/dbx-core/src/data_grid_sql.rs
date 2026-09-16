@@ -531,7 +531,9 @@ pub fn build_data_grid_copy_insert_statement(options: DataGridCopyInsertStatemen
     );
     let columns = insert_columns
         .iter()
-        .map(|(column, _, _)| data_grid_identifier(options.database_type, column, options.identifier_quote.as_deref()))
+        .map(|(_, index, _)| {
+            data_grid_identifier(options.database_type, &options.columns[*index], options.identifier_quote.as_deref())
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let value_rows = options
@@ -1510,7 +1512,7 @@ fn build_data_grid_save_statements(
         }
     }
     if !delete_predicates.is_empty() {
-        push_mysql_predicate_batches(&mut statements, &format!("DELETE FROM {table} WHERE "), delete_predicates);
+        push_mysql_delete_batches(&mut statements, &format!("DELETE FROM {table} WHERE "), delete_predicates);
     }
 
     for row in &options.new_rows {
@@ -1778,6 +1780,96 @@ fn supports_mysql_data_grid_batch(options: &DataGridSaveStatementOptions) -> boo
 
 fn push_mysql_predicate_batches(statements: &mut Vec<String>, prefix: &str, predicates: Vec<String>) {
     push_mysql_joined_batches(statements, prefix, predicates, " OR ", true);
+}
+
+/// Render a batch of delete predicates for MySQL. Rows deleted through the grid
+/// usually differ only in a single primary-key equality predicate, so equal-key
+/// runs collapse into `id IN (...)` instead of a chain of ORs (#8857). Anything
+/// that is not a plain `column = literal` equality (compound keys, NULL checks,
+/// BINARY comparisons, ...) falls back to the OR form, which stays correct for
+/// every predicate shape.
+fn push_mysql_delete_batches(statements: &mut Vec<String>, prefix: &str, predicates: Vec<String>) {
+    const IN_JOINER: &str = ", ";
+
+    struct InRun {
+        column: Option<String>,
+        values: Vec<String>,
+        bytes: usize,
+    }
+
+    fn flush_in(run: &mut InRun, batches: &mut Vec<String>) {
+        if let Some(column) = run.column.take() {
+            if run.values.len() == 1 {
+                batches.push(format!("{column} = {}", run.values[0]));
+            } else {
+                batches.push(format!("{column} IN ({})", run.values.join(IN_JOINER)));
+            }
+            run.values.clear();
+            run.bytes = 0;
+        }
+    }
+
+    let mut in_run = InRun { column: None, values: Vec::new(), bytes: 0 };
+    let mut in_batches: Vec<String> = Vec::new();
+    let mut pending_batches: Vec<String> = Vec::new();
+
+    for predicate in &predicates {
+        match parse_mysql_equality_predicate(predicate) {
+            Some((column, literal)) => {
+                let literal_bytes = literal.len() + IN_JOINER.len();
+                let column_switch = in_run.column.as_deref().is_some_and(|existing| existing != column);
+                let over_budget = in_run.bytes + literal_bytes > MYSQL_DATA_GRID_BATCH_TARGET_SQL_BYTES;
+                let over_rows = in_run.values.len() >= MYSQL_DATA_GRID_BATCH_MAX_ROWS;
+                if column_switch || over_budget || over_rows {
+                    flush_in(&mut in_run, &mut in_batches);
+                }
+                if in_run.column.is_none() {
+                    in_run.column = Some(column);
+                }
+                in_run.bytes += literal_bytes;
+                in_run.values.push(literal);
+            }
+            None => {
+                flush_in(&mut in_run, &mut in_batches);
+                pending_batches.push(predicate.clone());
+            }
+        }
+    }
+    flush_in(&mut in_run, &mut in_batches);
+
+    let mut batches = pending_batches;
+    batches.extend(in_batches);
+    if batches.len() == 1 {
+        statements.push(format!("{prefix}{};", batches.remove(0)));
+    } else if !batches.is_empty() {
+        push_mysql_predicate_batches(statements, prefix, batches);
+    }
+}
+
+/// Recognize predicates shaped exactly like `` `column` = literal `` (with or
+/// without backticks) so they can merge into an IN list. Anything else —
+/// compound-key AND chains, IS NULL, BINARY comparisons — returns None.
+fn parse_mysql_equality_predicate(predicate: &str) -> Option<(String, String)> {
+    let mut trimmed = predicate;
+    while let Some(inner) = trimmed.strip_prefix('(').and_then(|inner| inner.strip_suffix(')')) {
+        trimmed = inner;
+    }
+    let separator = trimmed.find(" = ")?;
+    let column = trimmed.get(..separator)?.trim().to_string();
+    if !column.starts_with('`') || !column.ends_with('`') || column.len() < 3 {
+        return None;
+    }
+    let literal = trimmed.get(separator + 3..)?.trim().to_string();
+    if literal.is_empty() || literal.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    // Compound-key predicates contain further AND/OR/IS clauses after the first
+    // equality; merging those into an IN list would change the row targeting.
+    let upper = literal.to_ascii_uppercase();
+    if upper.contains(" AND ") || upper.contains(" OR ") || upper.starts_with("IS ") {
+        return None;
+    }
+    Some((column, literal))
 }
 
 fn push_mysql_values_insert_batches(
@@ -2331,9 +2423,9 @@ pub(crate) fn format_grid_sql_literal_with_identifier_quote(
     }
     let escaped_text = if database_type == Some(DatabaseType::Neo4j) {
         literal_text.replace('\\', "\\\\").replace('\'', "\\'")
-    } else if is_sqlite_literal_database(database_type) {
-        // SQLite-family engines do not treat backslash as a string-literal
-        // escape character, so only the quote delimiter needs escaping.
+    } else if is_sqlite_literal_database(database_type) || database_type == Some(DatabaseType::Dameng) {
+        // These engines keep backslashes literal in ordinary string literals,
+        // so only the quote delimiter needs escaping.
         literal_text.replace('\'', "''")
     } else {
         literal_text.replace('\\', "\\\\").replace('\'', "''")
@@ -3933,6 +4025,127 @@ mod tests {
             statement.as_deref(),
             Some("INSERT INTO `users` (`login_name`, `display_name`) VALUES\n('ada', 'Ada'),\n('linus', 'Linus');")
         );
+    }
+
+    #[test]
+    fn copy_insert_uses_display_columns_but_source_columns_for_metadata() {
+        let statement = build_data_grid_copy_insert_statement(DataGridCopyInsertStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: Some(DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "psn_basic_info".to_string(),
+                primary_keys: vec![],
+                columns: Some(vec![
+                    DataGridColumnInfo {
+                        name: "PSN_NO".to_string(),
+                        data_type: "varchar(32)".to_string(),
+                        is_nullable: false,
+                        is_primary_key: false,
+                        column_default: None,
+                        extra: None,
+                    },
+                    DataGridColumnInfo {
+                        name: "NAME".to_string(),
+                        data_type: "varchar(32)".to_string(),
+                        is_nullable: true,
+                        is_primary_key: false,
+                        column_default: None,
+                        extra: None,
+                    },
+                ]),
+            }),
+            columns: vec!["psn".to_string(), "psn_no".to_string(), "name".to_string()],
+            column_types: None,
+            source_columns: Some(vec![
+                Some("PSN_NO".to_string()),
+                Some("PSN_NO".to_string()),
+                Some("NAME".to_string()),
+            ]),
+            rows: vec![vec![json!("A-1"), json!("A-1"), json!("Ada")]],
+            exclude_primary_keys: false,
+            include_computed_columns: false,
+            insert_mode: DataGridCopyInsertMode::Merged,
+        });
+        assert_eq!(
+            statement.as_deref(),
+            Some("INSERT INTO `psn_basic_info` (`psn`, `psn_no`, `name`) VALUES ('A-1', 'A-1', 'Ada');")
+        );
+    }
+
+    #[test]
+    fn copy_insert_uses_source_columns_for_generated_column_exclusions() {
+        let statement = build_data_grid_copy_insert_statement(DataGridCopyInsertStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: Some(DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "users".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![
+                    DataGridColumnInfo {
+                        name: "id".to_string(),
+                        data_type: "bigint".to_string(),
+                        is_nullable: false,
+                        is_primary_key: true,
+                        column_default: None,
+                        extra: Some("auto_increment".to_string()),
+                    },
+                    DataGridColumnInfo {
+                        name: "display_name".to_string(),
+                        data_type: "varchar(64)".to_string(),
+                        is_nullable: true,
+                        is_primary_key: false,
+                        column_default: None,
+                        extra: None,
+                    },
+                    DataGridColumnInfo {
+                        name: "display_name_upper".to_string(),
+                        data_type: "varchar(64)".to_string(),
+                        is_nullable: true,
+                        is_primary_key: false,
+                        column_default: None,
+                        extra: Some("virtual generated".to_string()),
+                    },
+                ]),
+            }),
+            columns: vec!["identifier".to_string(), "label".to_string(), "label_upper".to_string()],
+            column_types: None,
+            source_columns: Some(vec![
+                Some("id".to_string()),
+                Some("display_name".to_string()),
+                Some("display_name_upper".to_string()),
+            ]),
+            rows: vec![vec![json!(1), json!("Ada"), json!("ADA")]],
+            exclude_primary_keys: true,
+            include_computed_columns: false,
+            insert_mode: DataGridCopyInsertMode::Merged,
+        });
+        assert_eq!(statement.as_deref(), Some("INSERT INTO `users` (`label`) VALUES ('Ada');"));
+    }
+
+    #[test]
+    fn copy_update_keeps_source_columns_for_writeback() {
+        let statements = build_data_grid_copy_update_statements(DataGridCopyUpdateStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "users".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: None,
+            },
+            columns: vec!["identifier".to_string(), "label".to_string()],
+            source_columns: Some(vec![Some("id".to_string()), Some("display_name".to_string())]),
+            rows: vec![vec![json!(1), json!("Ada")]],
+        });
+        assert_eq!(statements, vec!["UPDATE `users` SET `display_name` = 'Ada' WHERE `id` = 1;"]);
     }
 
     #[test]
@@ -7092,12 +7305,32 @@ mod tests {
         options.deleted_rows = vec![0, 1, 2];
 
         let result = prepare_data_grid_save(options);
+        for statement in &result.statements {
+            println!("statement: {statement}");
+        }
 
         assert_eq!(result.validation_error, None);
-        assert_eq!(result.statements, vec!["DELETE FROM `app`.`people` WHERE (`id` = 1) OR (`id` = 2) OR (`id` = 3);"]);
+        assert_eq!(result.statements, vec!["DELETE FROM `app`.`people` WHERE `id` IN (1, 2, 3);"]);
         assert_eq!(
             result.rollback_statements,
             vec!["INSERT INTO `app`.`people` (`id`, `status`) VALUES (1, 'active'), (2, 'active'), (3, 'active');"]
+        );
+    }
+
+    #[test]
+    fn batches_mysql_compound_key_deletes_keep_or_form() {
+        let mut options = mysql_people_save_options(3);
+        options.table_meta.primary_keys = vec!["id".to_string(), "status".to_string()];
+        options.deleted_rows = vec![0, 1];
+
+        let result = prepare_data_grid_save(options);
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![
+                "DELETE FROM `app`.`people` WHERE (`id` = 1 AND `status` = 'active') OR (`id` = 2 AND `status` = 'active');"
+            ]
         );
     }
 
@@ -7108,9 +7341,11 @@ mod tests {
 
         let result = prepare_data_grid_save(options);
 
-        assert_eq!(result.statements.len(), 2);
-        assert!(result.statements[0].contains("(`id` = 500)"));
-        assert_eq!(result.statements[1], "DELETE FROM `app`.`people` WHERE `id` = 501;");
+        // IN lists are far more compact than OR chains, so the batch fits in a
+        // single statement up to the row limit.
+        assert_eq!(result.statements.len(), 1);
+        assert!(result.statements[0].contains("`id` IN ("));
+        assert!(result.statements[0].contains("501"));
         assert_eq!(result.rollback_statements.len(), 2);
         assert!(result.rollback_statements[0].contains("(500, 'active')"));
         assert_eq!(
@@ -7128,6 +7363,8 @@ mod tests {
 
         let result = prepare_data_grid_save(options);
 
+        // The IN list stays within the SQL byte budget, splitting into a
+        // second statement once the accumulated literals would exceed it.
         assert_eq!(result.statements.len(), 2);
         assert!(result.statements.iter().all(|statement| statement.len() <= MYSQL_DATA_GRID_BATCH_TARGET_SQL_BYTES));
     }
@@ -7333,6 +7570,25 @@ mod tests {
     }
 
     #[test]
+    fn postgres_temporal_literals_preserve_session_formatted_values_for_grid_writes() {
+        let timestamp = column("created_at", "timestamp without time zone", false, None);
+        let timestamptz = column("created_at", "timestamp with time zone", false, None);
+
+        assert_eq!(
+            format_grid_sql_literal(&json!("2026-09-13 01:00:00"), Some(DatabaseType::Postgres), Some(&timestamp),),
+            "'2026-09-13 01:00:00'"
+        );
+        assert_eq!(
+            format_grid_sql_literal(
+                &json!("2026-09-13T13:00:00+12:00"),
+                Some(DatabaseType::Postgres),
+                Some(&timestamptz),
+            ),
+            "'2026-09-13T13:00:00+12:00'"
+        );
+    }
+
+    #[test]
     fn postgres_bytea_literals_decode_prefixed_hex_values() {
         let bytea = column("payload", "bytea", true, None);
         let text = column("label", "text", true, None);
@@ -7361,6 +7617,40 @@ mod tests {
             );
             assert_eq!(format_grid_sql_literal(&json!("it's"), Some(database_type), None), "'it''s'");
         }
+    }
+
+    #[test]
+    fn dameng_data_grid_writes_do_not_double_escape_backslashes() {
+        assert_eq!(format_grid_sql_literal(&json!(r"\n"), Some(DatabaseType::Dameng), None), r"'\n'");
+        assert_eq!(format_grid_sql_literal(&json!(r"line\n's"), Some(DatabaseType::Dameng), None), r"'line\n''s'");
+
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Dameng),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("DBX_TEST".to_string()),
+                table_name: "DBX_NEWLINE_REPRO".to_string(),
+                primary_keys: vec!["ID".to_string()],
+                columns: Some(vec![column("ID", "INT", false, None), column("VAL", "VARCHAR(100)", true, None)]),
+            },
+            columns: vec!["ID".to_string(), "VAL".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!("old")]],
+            dirty_rows: vec![(0, vec![(1, json!(r"line\n's"))])],
+            deleted_rows: vec![],
+            new_rows: vec![vec![json!(2), json!(r"\n")]],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![
+                r#"UPDATE "DBX_TEST"."DBX_NEWLINE_REPRO" SET "VAL" = 'line\n''s' WHERE "ID" = 1;"#,
+                r#"INSERT INTO "DBX_TEST"."DBX_NEWLINE_REPRO" ("ID", "VAL") VALUES (2, '\n');"#,
+            ]
+        );
     }
 
     #[test]

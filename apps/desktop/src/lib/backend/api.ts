@@ -79,6 +79,35 @@ export const readKeychainPassword = forward("readKeychainPassword");
 export const readKeychainPasswords = forward("readKeychainPasswords");
 export const decryptConfig = forward("decryptConfig");
 export const listPlugins = forward("listPlugins");
+export const listPluginTrustedKeys = forward("listPluginTrustedKeys");
+export const savePluginTrustedKey = forward("savePluginTrustedKey");
+export const removePluginTrustedKey = forward("removePluginTrustedKey");
+export const listPluginRepositories = forward("listPluginRepositories");
+export const savePluginRepository = forward("savePluginRepository");
+export const removePluginRepository = forward("removePluginRepository");
+export const fetchPluginMarketplaceCatalogs = forward("fetchPluginMarketplaceCatalogs");
+export const installMarketplacePlugin = forward("installMarketplacePlugin");
+export const installPluginPackage = forward("installPluginPackage");
+export const installPluginPackageFromUrl = forward("installPluginPackageFromUrl");
+export const rollbackPlugin = forward("rollbackPlugin");
+export const uninstallPlugin = forward("uninstallPlugin");
+export const activatePlugin = forward("activatePlugin");
+export const listActivePlugins = forward("listActivePlugins");
+export const stopPlugin = forward("stopPlugin");
+export const invokePlugin = forward("invokePlugin");
+export const invokePluginConnectionAction = forward("invokePluginConnectionAction");
+export const notifyPlugin = forward("notifyPlugin");
+export const sendPluginBinary = forward("sendPluginBinary");
+export const listPluginFilesystemEntries = forward("listPluginFilesystemEntries");
+export const readPluginFilesystemFile = forward("readPluginFilesystemFile");
+export const writePluginFilesystemFile = forward("writePluginFilesystemFile");
+export const createPluginFilesystemDirectory = forward("createPluginFilesystemDirectory");
+export const deletePluginFilesystemEntry = forward("deletePluginFilesystemEntry");
+export const renamePluginFilesystemEntry = forward("renamePluginFilesystemEntry");
+export const readPluginAsset = forward("readPluginAsset");
+export const readPluginUiEntry = forward("readPluginUiEntry");
+export const readPluginUiAsset = forward("readPluginUiAsset");
+export const subscribePluginEvents = forward("subscribePluginEvents");
 export const listJdbcDrivers = forward("listJdbcDrivers");
 export const listJdbcMavenBundles = forward("listJdbcMavenBundles");
 export const listJdbcLocalBundles = forward("listJdbcLocalBundles");
@@ -378,17 +407,20 @@ export const setAiGlobalCustomInstructions = forward("setAiGlobalCustomInstructi
 // System
 export const listSystemFonts = forward("listSystemFonts");
 export const listSshConfigHosts = forward("listSshConfigHosts");
+export const listLocalSshKeys = forward("listLocalSshKeys");
 
 // SQL File Execution
 export const previewSqlFile = forward("previewSqlFile");
 export const executeSqlFile = forward("executeSqlFile");
 export const executeSqlFiles = forward("executeSqlFiles");
 export const cancelSqlFileExecution = forward("cancelSqlFileExecution");
+export const inspectSqlFileTables = forward("inspectSqlFileTables");
 export const listenSqlFileProgress = forward("listenSqlFileProgress");
 export const pendingOpenSqlFiles = forward("pendingOpenSqlFiles");
 export const pendingOpenDbFiles = forward("pendingOpenDbFiles");
 export const pendingOpenConnectionLinks = forward("pendingOpenConnectionLinks");
 export const pendingOpenAiConfigLinks = forward("pendingOpenAiConfigLinks");
+export const pendingOpenPluginInstallLinks = forward("pendingOpenPluginInstallLinks");
 export const readExternalSqlFile = forward("readExternalSqlFile");
 export const readExternalSqlFileSnapshot = forward("readExternalSqlFileSnapshot");
 export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
@@ -457,6 +489,12 @@ export const previewTableImportFile = forward("previewTableImportFile");
 export const importTableFile = forward("importTableFile");
 export const cancelTableImport = forward("cancelTableImport");
 export const releaseTableImportSource = forward("releaseTableImportSource");
+export const previewMongodbImportFile = forward("previewMongodbImportFile");
+export const importMongodbFile = forward("importMongodbFile");
+export const cancelMongodbImport = forward("cancelMongodbImport");
+export const releaseMongodbImportSource = forward("releaseMongodbImportSource");
+export const exportMongodbQuery = forward("exportMongodbQuery");
+export const cancelMongodbExport = forward("cancelMongodbExport");
 
 // Database Export
 export const beginDatabaseBackupSnapshot = forward("beginDatabaseBackupSnapshot");
@@ -508,6 +546,8 @@ export const redisJsonSet = forward("redisJsonSet");
 export const redisCheckJsonModule = forward("redisCheckJsonModule");
 export const redisSetTtl = forward("redisSetTtl");
 export const redisSetExpireAt = forward("redisSetExpireAt");
+export const redisSetKeysTtl = forward("redisSetKeysTtl");
+export const redisSetKeysExpireAt = forward("redisSetKeysExpireAt");
 export const redisDeleteKeys = forward("redisDeleteKeys");
 export const redisFlushDb = forward("redisFlushDb");
 export const redisExecuteCommand = forward("redisExecuteCommand");
@@ -775,6 +815,7 @@ export const mongoInsertDocuments = forward("mongoInsertDocuments");
 export const documentUpdateDocument = forward("documentUpdateDocument");
 export const mongoUpdateDocument = forward("mongoUpdateDocument");
 export const mongoUpdateDocuments = forward("mongoUpdateDocuments");
+export const mongoReplaceDocument = forward("mongoReplaceDocument");
 export const documentDeleteDocument = forward("documentDeleteDocument");
 export const documentSaveMeilisearchBatch = forward("documentSaveMeilisearchBatch");
 export const meilisearchSearchDocuments = forward("meilisearchSearchDocuments");
@@ -833,6 +874,8 @@ export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadUpdate = forward("downloadUpdate");
 export const cancelUpdateDownload = forward("cancelUpdateDownload");
+export const getDownloadedUpdate = forward("getDownloadedUpdate");
+export const discardDownloadedUpdate = forward("discardDownloadedUpdate");
 export const installDownloadedUpdate = forward("installDownloadedUpdate");
 export const getAppVersion = forward("getAppVersion");
 export const getAppSupportInfo = forward("getAppSupportInfo");
@@ -891,11 +934,13 @@ export type {
   McpHttpServerStatus,
   WebMcpHttpStatus,
   UpdateInfo,
+  DownloadedUpdate,
   RedisBlob,
   RedisCollectionPage,
   RedisDatabaseInfo,
   RedisHashItem,
   RedisKeyInfo,
+  RedisKeysExpiryResult,
   RedisListItem,
   RedisSetItem,
   RedisStreamConsumer,
@@ -964,6 +1009,7 @@ export type {
   SqlFileStatus,
   SqlFileRequest,
   SqlFilePreview,
+  SqlFileTable,
   SqlFileProgress,
   TransferRequest,
   TransferProgress,
@@ -987,6 +1033,21 @@ export type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  MongoImportFormat,
+  MongoImportTypeMode,
+  MongoImportInferredType,
+  MongoImportColumn,
+  MongoImportIssue,
+  MongoImportParseOptions,
+  MongoImportPreviewRequest,
+  MongoImportPreview,
+  MongoImportRequest,
+  MongoImportProgress,
+  MongoImportSummary,
+  MongoExportFormat,
+  MongoExportRequest,
+  MongoExportProgress,
+  MongoExportSummary,
   DatabaseExportRequest,
   ExportProgress,
   TableExportProgress,

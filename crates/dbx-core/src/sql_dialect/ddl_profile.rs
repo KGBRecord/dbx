@@ -209,6 +209,14 @@ impl DdlDialectProfile {
         }
     }
 
+    pub fn alter_modify_keyword(&self) -> &'static str {
+        if self.database_type == DatabaseType::Dameng {
+            "MODIFY"
+        } else {
+            "MODIFY COLUMN"
+        }
+    }
+
     /// Replace `{key}` placeholders. Unknown keys are left unchanged.
     pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
         let mut out = template.to_string();
@@ -531,7 +539,7 @@ fn sqlite_family(db: DatabaseType) -> DdlDialectProfile {
     DdlDialectProfile {
         database_type: db,
         quote: QuoteStyle::DoubleQuote,
-        auto_inc: AutoIncSyntax::None,
+        auto_inc: AutoIncSyntax::Suffix(" AUTOINCREMENT"),
         supports_display_width: false,
         requires_explicit_varchar_length: false,
         max_varchar_len: None,
@@ -759,6 +767,12 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
         // MySQL family
         Mysql | Doris | StarRocks | Goldendb | Sundb | Databend | Gbase | ManticoreSearch => mysql_family(db_type),
 
+        Dameng => {
+            let mut profile = oracle_family(db_type);
+            profile.alter_uses_modify_column = true;
+            profile
+        }
+
         // PostgreSQL family
         Postgres | Redshift | Gaussdb | Kingbase | Highgo | Vastbase | OpenGauss | Kwdb | Uxdb => {
             postgres_family(db_type)
@@ -775,7 +789,7 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
         }
 
         // Oracle family
-        Oracle | Dameng | OceanbaseOracle | Yashandb | Xugu | Iris => oracle_family(db_type),
+        Oracle | OceanbaseOracle | Yashandb | Xugu | Iris => oracle_family(db_type),
 
         // SQL Server (not Access)
         SqlServer => sqlserver_family(db_type),
@@ -803,6 +817,8 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
         }
 
         InfluxDb => influxdb_profile(),
+
+        Plugin => conservative_ansi(db_type),
 
         // Non-tabular / not applicable for relational CREATE TABLE
         Redis | MongoDb | DynamoDb | Elasticsearch | Easysearch | Meilisearch | Qdrant | Milvus | Weaviate

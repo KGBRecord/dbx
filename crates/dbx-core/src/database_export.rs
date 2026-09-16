@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -117,16 +117,28 @@ pub struct DatabaseExportRequest {
     pub omit_auto_increment: bool,
     #[serde(default)]
     pub fail_on_error: bool,
+    /// Refuse to truncate an existing destination. Scheduled backups enable
+    /// this because user-defined templates may resolve to a previous file.
+    #[serde(default)]
+    pub prevent_overwrite: bool,
     #[serde(default)]
     pub output_compression: DatabaseExportOutputCompression,
     #[serde(default)]
     pub snapshot_session_id: Option<String>,
     pub batch_size: usize,
+    /// When set, the export is packaged as a `.zip` archive containing
+    /// multiple `part-N.sql` entries (plus a `manifest.json`), each capped
+    /// at this many megabytes, instead of one unbounded `.sql`/`.sql.gz`
+    /// file. Mutually exclusive with `output_compression` -- a zip archive
+    /// is its own compressed container.
+    #[serde(default)]
+    pub split_max_mb: Option<u32>,
 }
 
 enum DatabaseExportWriter {
     Plain(BufWriter<std::fs::File>),
     Gzip(Box<GzEncoder<BufWriter<std::fs::File>>>),
+    SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
 }
 
 impl Write for DatabaseExportWriter {
@@ -134,6 +146,7 @@ impl Write for DatabaseExportWriter {
         match self {
             Self::Plain(writer) => writer.write(buffer),
             Self::Gzip(writer) => writer.write(buffer),
+            Self::SplitZip(writer) => writer.write(buffer),
         }
     }
 
@@ -141,17 +154,23 @@ impl Write for DatabaseExportWriter {
         match self {
             Self::Plain(writer) => writer.flush(),
             Self::Gzip(writer) => writer.flush(),
+            Self::SplitZip(writer) => writer.flush(),
         }
     }
 }
 
 impl DatabaseExportWriter {
-    fn finish(self) -> Result<(), String> {
+    fn finish(self, source_file_name: &str) -> Result<(), String> {
         match self {
-            Self::Plain(mut writer) => writer.flush(),
-            Self::Gzip(writer) => writer.finish().and_then(|mut output| output.flush()),
+            Self::Plain(mut writer) => {
+                writer.flush().map_err(|error| format!("Failed to finalize export file: {error}"))
+            }
+            Self::Gzip(writer) => writer
+                .finish()
+                .and_then(|mut output| output.flush())
+                .map_err(|error| format!("Failed to finalize export file: {error}")),
+            Self::SplitZip(writer) => writer.finish(source_file_name),
         }
-        .map_err(|error| format!("Failed to finalize export file: {error}"))
     }
 }
 
@@ -1192,10 +1211,14 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
         .collect::<Vec<_>>()
         .join(", ");
     let mut statements = Vec::new();
-    let needs_dameng_identity_insert = options.database_type == Some(DatabaseType::Dameng)
-        && insert_columns.iter().any(|(index, _, _)| {
-            is_identity_column_extra(options.column_extras.get(*index).and_then(|value| value.as_deref()))
-        });
+    // Dameng and SQL Server both reject explicit values for identity columns
+    // unless `SET IDENTITY_INSERT <table> ON` wraps the statement (SQL Server
+    // error 544), so exported INSERTs must carry the wrapper.
+    let needs_identity_insert_wrapper =
+        matches!(options.database_type, Some(DatabaseType::Dameng) | Some(DatabaseType::SqlServer))
+            && insert_columns.iter().any(|(index, _, _)| {
+                is_identity_column_extra(options.column_extras.get(*index).and_then(|value| value.as_deref()))
+            });
 
     let statement_prefix = format!("INSERT INTO {table} ({columns}) VALUES ");
     let statement_overhead_bytes = export_sql_statement_bytes(options.database_type, &statement_prefix) + 1;
@@ -1214,7 +1237,7 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
             insert_sql.push_str(&statement_prefix);
             insert_sql.push_str(values);
             insert_sql.push(';');
-            if needs_dameng_identity_insert {
+            if needs_identity_insert_wrapper {
                 statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
             } else {
                 statements.push(insert_sql);
@@ -1428,133 +1451,13 @@ fn normalize_export_table_ddl(
 
 fn format_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>, opts: DdlNormalizeOptions) -> String {
     let ddl = normalize_export_table_ddl(ddl, database_type, opts);
-    let ddl =
-        if database_type == Some(DatabaseType::OpenGauss) { normalize_opengauss_table_ddl_comments(&ddl) } else { ddl };
+    let ddl = if database_type == Some(DatabaseType::OpenGauss) {
+        crate::schema::normalize_opengauss_table_ddl_comments(&ddl)
+    } else {
+        ddl
+    };
     let ddl = ddl.trim().trim_end_matches(';').trim_end();
     format!("{ddl};")
-}
-
-/// openGauss 6.x `pg_get_tabledef` can concatenate comment text into a
-/// `COMMENT ON` literal without escaping embedded single quotes. Normalize
-/// only those generated comment statements; all other DDL text remains
-/// untouched.
-fn normalize_opengauss_table_ddl_comments(ddl: &str) -> String {
-    let mut normalized = String::with_capacity(ddl.len());
-    for line in ddl.split_inclusive('\n') {
-        let (line_body, line_ending) = match line.strip_suffix('\n') {
-            Some(body) => match body.strip_suffix('\r') {
-                Some(body) => (body, "\r\n"),
-                None => (body, "\n"),
-            },
-            None => (line, ""),
-        };
-        let leading = line_body.len() - line_body.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
-        let statement = &line_body[leading..];
-        if let Some(statement) = normalize_opengauss_comment_statement(statement) {
-            normalized.push_str(&line_body[..leading]);
-            normalized.push_str(&statement);
-        } else {
-            normalized.push_str(line_body);
-        }
-        normalized.push_str(line_ending);
-    }
-    normalized
-}
-
-fn normalize_opengauss_comment_statement(statement: &str) -> Option<String> {
-    let uppercase = statement.to_ascii_uppercase();
-    if !uppercase.starts_with("COMMENT ON ") {
-        return None;
-    }
-
-    let is_pos = find_opengauss_comment_is_keyword(statement, &uppercase)?;
-    let value_start = is_pos + " IS ".len();
-    let value = &statement[value_start..];
-    let value_leading = value.len() - value.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
-    let value = &value[value_leading..];
-    let quote_offset = match value.as_bytes() {
-        [b'\'', ..] => 0,
-        [b'e' | b'E', b'\'', ..] => 1,
-        _ => return None,
-    };
-    let opening_quote = value_start + value_leading + quote_offset;
-    let statement_end = statement.trim_end().len();
-    let literal_end = statement[..statement_end]
-        .strip_suffix(';')
-        .map_or(statement_end, |without_terminator| without_terminator.len());
-    if opening_quote >= literal_end {
-        return None;
-    }
-
-    let closing_quote = statement[..literal_end].rfind('\'')?;
-    if closing_quote <= opening_quote || !statement[closing_quote + 1..literal_end].trim().is_empty() {
-        return None;
-    }
-    let literal = &statement[opening_quote..=closing_quote];
-    if opengauss_comment_literal_is_valid(literal) {
-        return Some(statement.to_string());
-    }
-
-    let raw_comment = &statement[opening_quote + 1..closing_quote];
-    let escaped_comment = raw_comment.replace('\'', "''");
-    let mut normalized = String::with_capacity(statement.len() + escaped_comment.len() - raw_comment.len());
-    normalized.push_str(&statement[..opening_quote + 1]);
-    normalized.push_str(&escaped_comment);
-    normalized.push_str(&statement[closing_quote..]);
-    Some(normalized)
-}
-
-fn find_opengauss_comment_is_keyword(statement: &str, uppercase: &str) -> Option<usize> {
-    let mut cursor = "COMMENT ON ".len();
-    while cursor + " IS ".len() <= statement.len() {
-        if statement.as_bytes().get(cursor) == Some(&b'\"') {
-            cursor = skip_opengauss_quoted_identifier(statement, cursor);
-            continue;
-        }
-        if uppercase.get(cursor..cursor + " IS ".len()) == Some(" IS ") {
-            return Some(cursor);
-        }
-        cursor += statement[cursor..].chars().next()?.len_utf8();
-    }
-    None
-}
-
-fn skip_opengauss_quoted_identifier(sql: &str, start: usize) -> usize {
-    let bytes = sql.as_bytes();
-    let mut cursor = start + 1;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'\"' {
-            if bytes.get(cursor + 1) == Some(&b'\"') {
-                cursor += 2;
-            } else {
-                return cursor + 1;
-            }
-        } else {
-            cursor += 1;
-        }
-    }
-    bytes.len()
-}
-
-fn opengauss_comment_literal_is_valid(literal: &str) -> bool {
-    let bytes = literal.as_bytes();
-    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
-        return false;
-    }
-
-    let mut cursor = 1;
-    while cursor < bytes.len() - 1 {
-        if bytes[cursor] == b'\'' {
-            if cursor + 1 < bytes.len() - 1 && bytes[cursor + 1] == b'\'' {
-                cursor += 2;
-            } else {
-                return false;
-            }
-        } else {
-            cursor += 1;
-        }
-    }
-    true
 }
 
 fn split_postgres_export_table_triggers(ddl: &str, database_type: DatabaseType) -> (String, Vec<String>) {
@@ -2690,6 +2593,15 @@ fn export_destination_parent_dir(file_path: &str) -> Option<&std::path::Path> {
     (!parent.as_os_str().is_empty()).then_some(parent)
 }
 
+/// Name recorded inside `manifest.json` as the logical "source file" the
+/// split parts represent, e.g. `mydb.zip` -> `mydb.sql`. When splitting is
+/// disabled this is unused (the writer variant never calls it).
+fn export_source_file_name(file_path: &str) -> String {
+    let path = std::path::Path::new(file_path);
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("export");
+    format!("{stem}.sql")
+}
+
 async fn create_database_export_writer(
     state: &Arc<crate::connection::AppState>,
     request: &DatabaseExportRequest,
@@ -2698,8 +2610,46 @@ async fn create_database_export_writer(
     if let Some(parent) = export_destination_parent_dir(&request.file_path) {
         expected_destination_identity = ensure_export_destination_dir(state, parent).await?;
     }
-    let file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to write file: {e}"))?;
-    // The directory check above and this `File::create` are separate
+    if let Some(max_mb) = request.split_max_mb {
+        let zip_path = std::path::Path::new(&request.file_path);
+        let stem = zip_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("export");
+        let writer = crate::export_split_zip::SplitZipExportWriter::create_with_overwrite(
+            zip_path,
+            max_mb,
+            stem,
+            "sql",
+            request.prevent_overwrite,
+        )?;
+        let opened_destination_identity =
+            std::fs::File::open(&request.file_path).ok().as_ref().and_then(export_destination_identity_for_file);
+        if export_destination_identity_mismatch(
+            expected_destination_identity.as_ref(),
+            opened_destination_identity.as_ref(),
+        ) {
+            let _ = std::fs::remove_file(&request.file_path);
+            return Err(format!(
+                "Backup destination for {} changed while opening the output file -- the directory now \
+                 resolves to a different filesystem than the one just verified. If a removable or network \
+                 drive was disconnected and reconnected, retry the backup.",
+                request.file_path
+            ));
+        }
+        return Ok(DatabaseExportWriter::SplitZip(Box::new(writer)));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(!request.prevent_overwrite)
+        .create_new(request.prevent_overwrite)
+        .open(&request.file_path)
+        .map_err(|error| {
+            if request.prevent_overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("Backup file already exists: {}", request.file_path)
+            } else {
+                format!("Failed to write file: {error}")
+            }
+        })?;
+    // The directory check above and this file open are separate
     // operations: the mount can disappear and be replaced by something else
     // at the same path in between. Re-check the identity of the handle we
     // actually opened, not just the path, and refuse to keep a backup that
@@ -2740,6 +2690,21 @@ fn postgres_create_schema_sql(schema: &str) -> String {
     format!("CREATE SCHEMA IF NOT EXISTS {};", quote_identifier(schema, &DatabaseType::Postgres))
 }
 
+// Copy one line at a time so a `SplitZipExportWriter` can only rotate between
+// complete SQL statements; `std::io::copy` would feed it arbitrary 8KB chunks.
+fn combine_schema_sql_export<W: Write>(source: &mut dyn BufRead, destination: &mut W) -> std::io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = source.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        destination.write_all(&line)?;
+    }
+    Ok(())
+}
+
 async fn export_postgres_all_schemas_sql_core(
     state: &Arc<crate::connection::AppState>,
     request: &DatabaseExportRequest,
@@ -2774,6 +2739,7 @@ async fn export_postgres_all_schemas_sql_core(
             schema_request.schema = schema_name.clone();
             schema_request.file_path = temp_dir.path().join(format!("schema-{schema_index}.sql")).display().to_string();
             schema_request.output_compression = DatabaseExportOutputCompression::None;
+            schema_request.split_max_mb = None;
 
             let terminal = Arc::new(std::sync::Mutex::new(None::<ExportProgress>));
             let terminal_for_callback = terminal.clone();
@@ -2834,10 +2800,11 @@ async fn export_postgres_all_schemas_sql_core(
             let mut source = std::io::BufReader::new(
                 std::fs::File::open(path).map_err(|e| format!("Failed to read temporary schema export: {e}"))?,
             );
-            std::io::copy(&mut source, &mut file).map_err(|e| format!("Failed to combine schema export: {e}"))?;
+            combine_schema_sql_export(&mut source, &mut file)
+                .map_err(|e| format!("Failed to combine schema export: {e}"))?;
             writeln!(file).map_err(|e| format!("Failed to write file: {e}"))?;
         }
-        file.finish()?;
+        file.finish(&export_source_file_name(&request.file_path))?;
         on_progress(ExportProgress {
             export_id: request.export_id.clone(),
             current_object: request.database.clone(),
@@ -3799,7 +3766,7 @@ async fn export_database_sql_core_inner(
         writeln!(file, "SET FOREIGN_KEY_CHECKS = 1;").map_err(|e| format!("Failed to write file: {e}"))?;
     }
 
-    file.finish()?;
+    file.finish(&export_source_file_name(&request.file_path))?;
 
     // Emit Done progress
     on_progress(ExportProgress {
@@ -3834,7 +3801,8 @@ fn filter_export_table_infos(
 }
 
 fn drop_table_if_exists_sql(table_name: &str, schema: &str, db_type: &DatabaseType) -> String {
-    format!("DROP TABLE IF EXISTS {};", crate::transfer::qualified_table(table_name, schema, db_type, None))
+    let cascade = if db_type == &DatabaseType::Postgres { " CASCADE" } else { "" };
+    format!("DROP TABLE IF EXISTS {}{};", crate::transfer::qualified_table(table_name, schema, db_type, None), cascade)
 }
 
 fn build_database_export_object_source_sql(
@@ -3862,18 +3830,18 @@ fn build_database_export_object_source_sql(
 #[cfg(test)]
 mod tests {
     use super::{
-        await_export_operation, await_export_stream_operation, clear_export_cancelled,
+        await_export_operation, await_export_stream_operation, clear_export_cancelled, combine_schema_sql_export,
         concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency,
         emit_database_export_cancelled, postgres_create_schema_sql, postgres_export_schema_names, set_export_cancelled,
         snapshot_batch_cancelled, ExportStatus, EXPORT_CANCELLED_ERROR,
     };
     use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
-        database_export_query_options_for_timeout, database_export_select_sql, database_export_total_objects,
-        drop_table_if_exists_sql, ensure_export_destination_dir, export_destination_identity_mismatch,
-        filter_export_table_infos, format_export_sql_literal, format_export_table_ddl,
-        format_mysql_spatial_export_literal, format_xugu_spatial_export_literal, generate_postgres_extension_ddl,
-        generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
+        create_database_export_writer, database_export_query_options_for_timeout, database_export_select_sql,
+        database_export_total_objects, drop_table_if_exists_sql, ensure_export_destination_dir,
+        export_destination_identity_mismatch, filter_export_table_infos, format_export_sql_literal,
+        format_export_table_ddl, format_mysql_spatial_export_literal, format_xugu_spatial_export_literal,
+        generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
         generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, mysql_database_export_preamble,
         mysql_view_dependencies_from_rows, mysql_view_dependencies_sql, normalize_export_table_ddl,
         record_export_destination_identity, record_export_error, replace_database_export_select_list,
@@ -4078,9 +4046,11 @@ mod tests {
             drop_table_if_exists: false,
             omit_auto_increment: false,
             fail_on_error: false,
+            prevent_overwrite: false,
             output_compression: Default::default(),
             snapshot_session_id: None,
             batch_size: 1000,
+            split_max_mb: None,
         }
     }
 
@@ -4094,11 +4064,30 @@ mod tests {
             flate2::Compression::default(),
         )));
         writer.write_all(b"SELECT 1;\n").unwrap();
-        writer.finish().unwrap();
+        writer.finish("backup.sql").unwrap();
 
         let mut output = String::new();
         flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()).read_to_string(&mut output).unwrap();
         assert_eq!(output, "SELECT 1;\n");
+    }
+
+    #[tokio::test]
+    async fn backup_writer_does_not_overwrite_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.sql");
+        std::fs::write(&path, b"keep me").unwrap();
+        let state = Arc::new(test_app_state(directory.path()).await);
+        let mut request = export_request(true, true, true, Vec::new());
+        request.file_path = path.to_string_lossy().to_string();
+        request.prevent_overwrite = true;
+
+        let error = match create_database_export_writer(&state, &request).await {
+            Ok(_) => panic!("existing backup should not be overwritten"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
     }
 
     #[test]
@@ -4321,7 +4310,7 @@ mod tests {
     fn builds_drop_table_if_exists_without_empty_schema() {
         let sql = drop_table_if_exists_sql("users", "", &DatabaseType::Postgres);
 
-        assert_eq!(sql, "DROP TABLE IF EXISTS \"users\";");
+        assert_eq!(sql, "DROP TABLE IF EXISTS \"users\" CASCADE;");
     }
 
     #[test]
@@ -5556,6 +5545,136 @@ mod tests {
     }
 
     #[test]
+    fn split_zip_export_writer_splits_across_insert_batches_into_valid_sql() {
+        let directory = tempfile::tempdir().unwrap();
+        let zip_path = directory.path().join("orders.zip");
+        let mut writer = crate::export_split_zip::SplitZipExportWriter::create(
+            &zip_path,
+            crate::export_split_zip::MIN_SPLIT_PART_MAX_MB,
+            "orders",
+            "sql",
+        )
+        .unwrap();
+
+        // Each call is one full INSERT batch statement, exactly like the real
+        // write_database_export_rows call sites -- the writer must only cut
+        // between these calls, never inside one.
+        let long_value = "x".repeat(200_000);
+        for row_index in 0..20 {
+            write_database_export_rows(
+                &mut writer,
+                &[vec![json!(row_index), json!(long_value.clone())]],
+                &["id".to_string(), "payload".to_string()],
+                &[Some("bigint".to_string()), Some("text".to_string())],
+                &[None, None],
+                "orders",
+                "shop",
+                &DatabaseType::Postgres,
+            )
+            .unwrap();
+        }
+        writer.finish("orders.sql").unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sql_parts = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if !entry.name().ends_with(".sql") {
+                continue;
+            }
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            sql_parts.push((entry.name().to_string(), contents));
+        }
+        sql_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert!(
+            sql_parts.len() > 1,
+            "expected the large export to be split into multiple parts, got {}",
+            sql_parts.len()
+        );
+        for (name, contents) in &sql_parts {
+            assert!(!contents.is_empty(), "{name} must not be empty");
+            // Every non-blank line must be a syntactically complete INSERT
+            // statement -- proof that no cut landed inside one.
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    line.trim_start().starts_with("INSERT INTO") && line.trim_end().ends_with(';'),
+                    "{name} has a malformed line from a mid-statement cut: {line}"
+                );
+            }
+        }
+        // Reassembling every part in order must reproduce all 20 rows.
+        let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined.matches("INSERT INTO").count(), 20);
+    }
+
+    #[test]
+    fn all_schemas_combine_keeps_split_part_boundaries_statement_safe() {
+        // Mirror of the per-schema temporary files that
+        // `export_postgres_all_schemas_sql_core` combines: whole SQL
+        // statements, one per line, each newline-terminated.
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("schema-0.sql");
+        let long_value = "x".repeat(200_000);
+        let mut schema_sql = String::new();
+        for row_index in 0..20 {
+            schema_sql.push_str(&format!("INSERT INTO orders VALUES ({row_index}, '{long_value}');\n"));
+        }
+        std::fs::write(&schema_path, &schema_sql).unwrap();
+
+        let zip_path = directory.path().join("combined.zip");
+        let mut writer = crate::export_split_zip::SplitZipExportWriter::create(
+            &zip_path,
+            crate::export_split_zip::MIN_SPLIT_PART_MAX_MB,
+            "combined",
+            "sql",
+        )
+        .unwrap();
+        let mut source = std::io::BufReader::new(std::fs::File::open(&schema_path).unwrap());
+        combine_schema_sql_export(&mut source, &mut writer).unwrap();
+        writer.finish("combined.sql").unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sql_parts = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if !entry.name().ends_with(".sql") {
+                continue;
+            }
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            sql_parts.push((entry.name().to_string(), contents));
+        }
+        sql_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert!(
+            sql_parts.len() > 1,
+            "expected the combined export to be split into multiple parts, got {}",
+            sql_parts.len()
+        );
+        for (name, contents) in &sql_parts {
+            assert!(!contents.is_empty(), "{name} must not be empty");
+            // Every non-blank line must be a complete statement -- proof that
+            // the copy never cut inside one.
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    line.trim_start().starts_with("INSERT INTO") && line.trim_end().ends_with(';'),
+                    "{name} has a malformed line from a mid-statement cut"
+                );
+            }
+        }
+        // Reassembling the parts in order must reproduce the temporary file
+        // byte for byte: the line-by-line copy adds, drops, and alters
+        // nothing, including the trailing newline.
+        let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined, schema_sql);
+        assert_eq!(combined.matches("INSERT INTO").count(), 20);
+    }
+
+    #[test]
     fn dameng_identity_export_inserts_enable_identity_insert() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Dameng),
@@ -5577,6 +5696,35 @@ mod tests {
             statements,
             vec![
                 "SET IDENTITY_INSERT \"SYSDBA\".\"USERS\" ON;\nINSERT INTO \"SYSDBA\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');\nSET IDENTITY_INSERT \"SYSDBA\".\"USERS\" OFF;"
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlserver_identity_export_inserts_enable_identity_insert() {
+        // The SQL Server column metadata reports `identity(seed,increment)`;
+        // explicit values for such columns are rejected with error 544 unless
+        // the INSERT is wrapped in SET IDENTITY_INSERT.
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
+            schema: Some("dbo".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["id".to_string(), "name".to_string()],
+            column_types: vec![Some("int".to_string()), Some("nvarchar(50)".to_string())],
+            column_extras: vec![Some("identity(1,1)".to_string()), None],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![vec![json!(1), json!("Ada")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "SET IDENTITY_INSERT [dbo].[events] ON;\nINSERT INTO [dbo].[events] ([id], [name]) VALUES (1, N'Ada');\nSET IDENTITY_INSERT [dbo].[events] OFF;"
             ]
         );
     }

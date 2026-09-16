@@ -1,7 +1,8 @@
 use crate::connection::{AppState, PoolKind};
 use crate::db::redis_driver::{
-    self, RedisCollectionPage, RedisCommandResult, RedisConnection, RedisDatabaseInfo, RedisScanResult,
-    RedisStreamConsumer, RedisStreamGroup, RedisStreamPage, RedisStreamPendingPage, RedisValue,
+    self, RedisCollectionPage, RedisCommandResult, RedisConnection, RedisDatabaseInfo, RedisKeysExpiry,
+    RedisKeysExpiryResult, RedisScanResult, RedisStreamConsumer, RedisStreamGroup, RedisStreamPage,
+    RedisStreamPendingPage, RedisValue,
 };
 
 async fn ensure_redis_pool(state: &AppState, connection_id: &str) -> Result<(), String> {
@@ -979,6 +980,67 @@ pub async fn redis_set_expire_at_in_db_core(
     }
 }
 
+pub async fn redis_set_keys_ttl_in_db_core(
+    state: &AppState,
+    connection_id: &str,
+    db: u32,
+    key_raws: &[String],
+    ttl: i64,
+) -> Result<RedisKeysExpiryResult, String> {
+    apply_redis_keys_expiry(state, connection_id, db, key_raws, RedisKeysExpiry::from_ttl(ttl)).await
+}
+
+pub async fn redis_set_keys_expire_at_in_db_core(
+    state: &AppState,
+    connection_id: &str,
+    db: u32,
+    key_raws: &[String],
+    expire_at: i64,
+) -> Result<RedisKeysExpiryResult, String> {
+    apply_redis_keys_expiry(state, connection_id, db, key_raws, RedisKeysExpiry::At(expire_at)).await
+}
+
+/// Applies one expiration policy to every selected key, reporting per-key misses.
+async fn apply_redis_keys_expiry(
+    state: &AppState,
+    connection_id: &str,
+    db: u32,
+    key_raws: &[String],
+    expiry: RedisKeysExpiry,
+) -> Result<RedisKeysExpiryResult, String> {
+    ensure_redis_pool(state, connection_id).await?;
+    let pool = state.pool_handle(connection_id).await.ok_or("Not found")?;
+    match &pool {
+        PoolKind::Redis(redis) => {
+            let keys: Result<Vec<Vec<u8>>, String> =
+                key_raws.iter().map(|key| redis_driver::redis_key_raw_to_bytes(key)).collect();
+            let keys = keys?;
+            match redis.as_ref() {
+                RedisConnection::Direct(con) => {
+                    let mut con = con.lock().await;
+                    redis_driver::select_db(&mut *con, db).await?;
+                    redis_driver::set_keys_expiry(&mut *con, &keys, expiry).await
+                }
+                RedisConnection::Cluster(cluster) => {
+                    redis_driver::ensure_cluster_db(db)?;
+                    // A cluster pipeline cannot span slots, so every key keeps
+                    // its own slot-routed connection, like `redis_delete_keys`.
+                    let mut result = RedisKeysExpiryResult::default();
+                    for key in &keys {
+                        let mut con = redis_driver::cluster_key_connection(cluster, key).await?;
+                        let applied =
+                            redis_driver::set_keys_expiry(&mut con, std::slice::from_ref(key), expiry).await?;
+                        result.applied += applied.applied;
+                        result.missing_key_raws.extend(applied.missing_key_raws);
+                    }
+                    Ok(result)
+                }
+            }
+        }
+        _ => Err("Not a Redis connection".to_string()),
+    }
+}
+
 pub async fn redis_delete_keys_in_db_core(
     state: &AppState,
     connection_id: &str,
@@ -1139,6 +1201,28 @@ pub async fn redis_publish_core(
         },
         _ => Err("Not a Redis connection".to_string()),
     }
+}
+
+pub async fn redis_create_monitor_core(state: &AppState, connection_id: &str) -> Result<redis::aio::Monitor, String> {
+    let config = state.configs.read().await.get(connection_id).ok_or("Connection config not found")?.clone();
+    if config.db_type != crate::models::connection::DatabaseType::Redis {
+        return Err("Not a Redis connection".to_string());
+    }
+    if config.uses_redis_sentinel() || config.uses_redis_cluster() {
+        return Err(
+            "MONITOR requires a direct Redis node connection; connect to the node you want to monitor".to_string()
+        );
+    }
+    let (host, port) = state.connection_host_port(connection_id, &config).await?;
+    let mut runtime_config = config.clone();
+    state.apply_session_credential(&config, &mut runtime_config, connection_id);
+    redis_driver::connect_monitor(
+        &runtime_config,
+        &host,
+        port,
+        std::time::Duration::from_secs(config.effective_connect_timeout_secs()),
+    )
+    .await
 }
 
 pub async fn redis_create_pubsub_core(state: &AppState, connection_id: &str) -> Result<redis::aio::PubSub, String> {

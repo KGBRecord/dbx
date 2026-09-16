@@ -21,11 +21,12 @@ const groupHandleModRCalls = vi.hoisted(() => [] as Element[]);
 const groupFocusSearchCalls = vi.hoisted(() => [] as Array<Element | null>);
 const resultHandleModRCalls = vi.hoisted(() => [] as Element[]);
 const resultFocusSearchCalls = vi.hoisted(() => [] as boolean[]);
+const groupExecutionCalls = vi.hoisted(() => ({ capture: [] as string[], request: [] as string[] }));
 
 vi.mock("@/components/layout/EditorGroup.vue", () => ({
   default: {
     name: "EditorGroupStub",
-    props: ["groupId", "tabIds", "activeTabId"],
+    props: ["groupId", "tabIds", "activeTabId", "contentSuppressed"],
     emits: ["execute"],
     methods: {
       previewStatementRange(tabId: string, range: unknown) {
@@ -44,8 +45,16 @@ vi.mock("@/components/layout/EditorGroup.vue", () => ({
         groupFocusSearchCalls.push(target ?? null);
         return true;
       },
+      captureQueryEditorExecutionSnapshot(this: { groupId: string }) {
+        groupExecutionCalls.capture.push(this.groupId);
+        return { fullSql: `SELECT ${this.groupId}`, selectedSql: `SELECT ${this.groupId}`, cursorPos: 0, selectionFrom: 0, selectionTo: 13 };
+      },
+      requestQueryEditorExecute(this: { groupId: string }) {
+        groupExecutionCalls.request.push(this.groupId);
+        return true;
+      },
     },
-    template: `<div data-test="editor-group" :data-group-id="groupId" :data-tab-ids="tabIds.join(',')" :data-active-tab-id="activeTabId"><button data-test="emit-execute" @click="$emit('execute', { fullSql: 'SELECT 1', selectedSql: 'SELECT 1', cursorPos: 0, selectionFrom: 0, selectionTo: 8 })">execute</button></div>`,
+    template: `<div data-test="editor-group" :data-group-id="groupId" :data-tab-ids="tabIds.join(',')" :data-active-tab-id="activeTabId" :data-content-suppressed="contentSuppressed ? 'true' : 'false'"><button data-test="emit-execute" @click="$emit('execute', { fullSql: 'SELECT 1', selectedSql: 'SELECT 1', cursorPos: 0, selectionFrom: 0, selectionTo: 8 })">execute</button></div>`,
   },
 }));
 
@@ -78,6 +87,7 @@ vi.mock("@/components/layout/QueryResultSurface.vue", () => ({
 
 import SqlEditorWorkspace from "../SqlEditorWorkspace.vue";
 import { useQueryStore } from "@/stores/queryStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import type { QueryTab } from "@/types/database";
 
 function tab(id: string): QueryTab {
@@ -149,6 +159,8 @@ describe("SqlEditorWorkspace mount contract", () => {
     groupFocusSearchCalls.length = 0;
     resultHandleModRCalls.length = 0;
     resultFocusSearchCalls.length = 0;
+    groupExecutionCalls.capture.length = 0;
+    groupExecutionCalls.request.length = 0;
     pinia = createPinia();
     setActivePinia(pinia);
     i18n = createI18n({
@@ -156,6 +168,47 @@ describe("SqlEditorWorkspace mount contract", () => {
       locale: "en",
       messages: { en: {} },
     });
+  });
+
+  it("routes toolbar execution to the requested tab's editor group", async () => {
+    const store = useQueryStore();
+    const tabs = [tab("tab-a"), tab("tab-b")];
+    store.tabs = tabs;
+    store.activeTabId = "tab-a";
+    store.groups = [
+      { id: "g1", tabIds: ["tab-a"], activeTabId: "tab-a" },
+      { id: "g2", tabIds: ["tab-b"], activeTabId: "tab-b" },
+    ];
+    store.focusedGroupId = "g1";
+    store.sizes = [50, 50];
+    const host = createHost();
+    const app = createApp(SqlEditorWorkspace, {
+      activeTab: tabs[0]!,
+      activeConnection: undefined,
+      executableSql: "SELECT 1",
+      activeOutputView: "result",
+      formatSqlRequest: null,
+      compressSqlRequest: null,
+      selectedSql: "",
+      cursorPos: 0,
+      blockDangerousRedisCommands: false,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    const vm = app.mount(host) as unknown as {
+      captureQueryEditorExecutionSnapshot: (tabId?: string) => { selectedSql: string } | undefined;
+      requestQueryEditorExecute: (tabId?: string) => boolean;
+    };
+    await nextTick();
+
+    const snapshot = vm.captureQueryEditorExecutionSnapshot("tab-b");
+    expect(snapshot?.selectedSql).toBe("SELECT g2");
+    expect(groupExecutionCalls.capture).toEqual(["g2"]);
+    expect(vm.requestQueryEditorExecute("tab-b")).toBe(true);
+    expect(groupExecutionCalls.request).toEqual(["g2"]);
+
+    app.unmount();
+    host.remove();
   });
 
   it("gives an idle query the full editor pane without a result surface or re-show button", async () => {
@@ -279,6 +332,96 @@ describe("SqlEditorWorkspace mount contract", () => {
 
     const result = host.querySelector<HTMLElement>('[data-test="result-surface"]');
     expect(result?.textContent).toContain("tab-a");
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps group tab strips mounted and drops the splitpanes workspace while suppressed", async () => {
+    const store = useQueryStore();
+    const settingsStore = useSettingsStore();
+    store.tabs = [tab("tab-a"), { ...tab("tab-b"), mode: "plugin-workbench" } as unknown as ReturnType<typeof tab>];
+    store.activeTabId = "tab-b";
+    store.groups = [
+      { id: "g1", tabIds: ["tab-a"], activeTabId: "tab-a" },
+      { id: "g2", tabIds: ["tab-b"], activeTabId: "tab-b" },
+    ];
+    store.focusedGroupId = "g2";
+    store.orientation = "vertical";
+    store.sizes = [50, 50];
+    settingsStore.editorSettings.tabPlacement = "left";
+
+    const host = createHost();
+    const app = createApp(SqlEditorWorkspace, {
+      activeTab: { ...tab("tab-b"), mode: "plugin-workbench" } as unknown as ReturnType<typeof tab>,
+      activeConnection: undefined,
+      executableSql: "",
+      activeOutputView: "result",
+      formatSqlRequest: null,
+      compressSqlRequest: null,
+      selectedSql: "",
+      cursorPos: 0,
+      blockDangerousRedisCommands: false,
+      contentSuppressed: true,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    // Suppressed mode renders the groups' tab strips directly (no Splitpanes,
+    // no shared result pane) so App.vue's always-mounted plugin workbench
+    // layer can own the remaining column while the strips stay visible.
+    expect(host.querySelector('[data-test="splitpanes-stub"]')).toBeNull();
+    expect(host.querySelector('[data-test="result-surface"]')).toBeNull();
+    const groups = host.querySelectorAll('[data-test="editor-group"]');
+    expect(groups).toHaveLength(2);
+    expect(groups[1]?.getAttribute("data-group-id")).toBe("g2");
+    expect(groups[1]?.getAttribute("data-content-suppressed")).toBe("true");
+
+    // Vertical plugin tabs share the row with the plugin workbench, so their
+    // workspace must keep the full-height contract while content is suppressed.
+    const workspaceRoot = host.querySelector<HTMLElement>(".sql-editor-workspace");
+    expect(workspaceRoot?.classList.contains("h-full")).toBe(true);
+    expect(workspaceRoot?.classList.contains("flex-none")).toBe(true);
+    expect(workspaceRoot?.classList.contains("h-auto")).toBe(false);
+    expect(host.querySelector<HTMLElement>("[data-workspace-content]")?.classList.contains("hidden")).toBe(true);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps the fill-height contract on the workspace root outside suppressed mode", async () => {
+    const store = useQueryStore();
+    store.tabs = [tab("tab-a")];
+    store.activeTabId = "tab-a";
+    store.groups = [{ id: "g1", tabIds: ["tab-a"], activeTabId: "tab-a" }];
+    store.focusedGroupId = "g1";
+    store.orientation = "vertical";
+    store.sizes = [100];
+
+    const host = createHost();
+    const app = createApp(SqlEditorWorkspace, {
+      activeTab: tab("tab-a"),
+      activeConnection: undefined,
+      executableSql: "",
+      activeOutputView: "result",
+      formatSqlRequest: null,
+      compressSqlRequest: null,
+      selectedSql: "",
+      cursorPos: 0,
+      blockDangerousRedisCommands: false,
+      contentSuppressed: false,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    const workspaceRoot = host.querySelector<HTMLElement>(".sql-editor-workspace");
+    expect(workspaceRoot?.classList.contains("h-full")).toBe(true);
+    expect(workspaceRoot?.classList.contains("flex-1")).toBe(true);
+    expect(workspaceRoot?.classList.contains("h-auto")).toBe(false);
 
     app.unmount();
     host.remove();

@@ -19,6 +19,8 @@ const mocks = vi.hoisted(() => ({
   redisStreamAdd: vi.fn(),
   redisSetTtl: vi.fn(),
   redisSetExpireAt: vi.fn(),
+  redisSetKeysTtl: vi.fn(),
+  redisSetKeysExpireAt: vi.fn(),
   redisCheckJsonModule: vi.fn(),
   redisDeleteKey: vi.fn(),
   redisDeleteKeys: vi.fn(),
@@ -58,6 +60,8 @@ vi.mock("@/lib/backend/api", () => ({
   redisStreamAdd: mocks.redisStreamAdd,
   redisSetTtl: mocks.redisSetTtl,
   redisSetExpireAt: mocks.redisSetExpireAt,
+  redisSetKeysTtl: mocks.redisSetKeysTtl,
+  redisSetKeysExpireAt: mocks.redisSetKeysExpireAt,
   redisCheckJsonModule: mocks.redisCheckJsonModule,
   redisDeleteKey: mocks.redisDeleteKey,
   redisDeleteKeys: mocks.redisDeleteKeys,
@@ -491,6 +495,8 @@ function resetApiMocks() {
   mocks.redisStreamAdd.mockResolvedValue(undefined);
   mocks.redisSetTtl.mockResolvedValue(undefined);
   mocks.redisSetExpireAt.mockResolvedValue(undefined);
+  mocks.redisSetKeysTtl.mockResolvedValue({ applied: 0, missing_key_raws: [] });
+  mocks.redisSetKeysExpireAt.mockResolvedValue({ applied: 0, missing_key_raws: [] });
   mocks.redisCheckJsonModule.mockResolvedValue(true);
   mocks.redisDeleteKey.mockResolvedValue(undefined);
   mocks.redisDeleteKeys.mockResolvedValue(0);
@@ -518,6 +524,9 @@ function mountBrowser(withDeleteDetails = false) {
       redis: {
         deleteGroupDetails: withDeleteDetails ? "{target}\n{count} keys" : "redis.deleteGroupDetails",
         keys: "{count} keys",
+        batchExpirySelected: "redis.batchExpirySelected",
+        batchExpirySuccess: "applied {count}",
+        batchExpiryPartial: "applied {success} failed {failed}",
       },
     },
   };
@@ -1241,6 +1250,16 @@ describe("RedisKeyBrowser command console echo", () => {
 });
 
 describe("RedisKeyBrowser expiry creation", () => {
+  it("opens the create-key dialog with an empty key name", async () => {
+    mountBrowser();
+    await settle();
+
+    requiredElement<HTMLButtonElement>('button[title="redis.createKey"]').click();
+    await settle();
+
+    expect(requiredElement<HTMLInputElement>('input[placeholder="redis.createKeyNamePlaceholder"]').value).toBe("");
+  });
+
   it.each(["string", "hash", "list", "set", "zset", "stream", "json"] as const)("writes %s before applying one relative TTL", async (type) => {
     mountBrowser();
     await settle();
@@ -1340,6 +1359,198 @@ describe("RedisKeyBrowser expiry creation", () => {
 
     expect(mocks.updateRedisDbKeyStats).not.toHaveBeenCalledWith("connection", 0, { loaded: 0, totalDelta: -1 });
     expect(mocks.toast).toHaveBeenCalledWith("TTL command failed", 5000);
+  });
+});
+
+describe("RedisKeyBrowser batch expiration", () => {
+  const batchKeys = [
+    { key_display: "alpha", key_raw: "YWxwaGE=", key_type: "string", ttl: -1 },
+    { key_display: "bravo", key_raw: "YnJhdm8=", key_type: "string", ttl: -1 },
+  ];
+
+  function batchExpiryButton(): HTMLButtonElement | null {
+    return document.querySelector<HTMLButtonElement>("[data-redis-batch-expiry]");
+  }
+
+  async function openBatchExpiryDialog(rows = batchKeys) {
+    mocks.redisScanKeysBatch.mockResolvedValue({ cursor: 0, keys: rows, total_keys: rows.length });
+    mountBrowser();
+    await settle();
+    requiredElement<HTMLButtonElement>("[data-redis-select-all]").click();
+    await settle();
+    requiredElement<HTMLButtonElement>("[data-redis-batch-expiry]").click();
+    await settle();
+  }
+
+  async function applyBatchExpiry() {
+    requiredElement<HTMLButtonElement>("[data-redis-batch-expiry-apply]").click();
+    await settle();
+  }
+
+  function rowTtlBadge(label: string): HTMLElement | null {
+    return groupRow(label).querySelector<HTMLElement>("span[title]");
+  }
+
+  it("only offers the action for a non-empty selection and applies one TTL to every key", async () => {
+    mocks.redisSetKeysTtl.mockResolvedValue({ applied: 2, missing_key_raws: [] });
+    await openBatchExpiryDialog();
+
+    expect(document.body.textContent).toContain("redis.batchExpirySelected");
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "3600");
+    await applyBatchExpiry();
+
+    // One request for the whole selection, never one call per key.
+    expect(mocks.redisSetKeysTtl).toHaveBeenCalledTimes(1);
+    expect(mocks.redisSetKeysTtl).toHaveBeenCalledWith("connection", 0, ["YWxwaGE=", "YnJhdm8="], 3600);
+    expect(mocks.redisSetKeysExpireAt).not.toHaveBeenCalled();
+    expect(mocks.toast).toHaveBeenCalledWith("applied 2", 3000);
+    // A fully applied batch releases the selection like a completed batch delete does.
+    expect(document.querySelector("[data-redis-batch-delete]")).toBeNull();
+    expect(document.querySelector("[data-test-dialog]")).toBeNull();
+  });
+
+  it("applies PERSIST to every selected key when no expiry is chosen", async () => {
+    mocks.redisSetKeysTtl.mockResolvedValue({ applied: 2, missing_key_raws: [] });
+    await openBatchExpiryDialog();
+
+    await applyBatchExpiry();
+
+    expect(mocks.redisSetKeysTtl).toHaveBeenCalledWith("connection", 0, ["YWxwaGE=", "YnJhdm8="], -1);
+    expect(mocks.redisSetKeysExpireAt).not.toHaveBeenCalled();
+  });
+
+  it("applies the same absolute expiration time to every selected key", async () => {
+    mocks.redisSetKeysExpireAt.mockResolvedValue({ applied: 2, missing_key_raws: [] });
+    await openBatchExpiryDialog();
+
+    await select("at");
+    requiredElement<HTMLButtonElement>("[data-test-absolute-date]").click();
+    await settle();
+    await applyBatchExpiry();
+
+    const expireAt = calendarDateTimeToUnixSeconds(new CalendarDateTime(2030, 1, 2, 3, 4, 5));
+    expect(mocks.redisSetKeysExpireAt).toHaveBeenCalledTimes(1);
+    expect(mocks.redisSetKeysExpireAt).toHaveBeenCalledWith("connection", 0, ["YWxwaGE=", "YnJhdm8="], expireAt);
+    expect(mocks.redisSetKeysTtl).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid TTL before reaching the backend and keeps the dialog open", async () => {
+    await openBatchExpiryDialog();
+
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "0");
+    await applyBatchExpiry();
+
+    expect(mocks.redisSetKeysTtl).not.toHaveBeenCalled();
+    expect(mocks.toast).toHaveBeenCalledWith("redis.expiryTtlInvalid", 3000);
+    expect(document.querySelector("[data-redis-batch-expiry-apply]")).not.toBeNull();
+  });
+
+  it("keeps only the keys the server did not update selected so they can be retried", async () => {
+    mocks.redisSetKeysTtl.mockResolvedValueOnce({ applied: 1, missing_key_raws: ["YnJhdm8="] });
+    mocks.redisSetKeysTtl.mockResolvedValueOnce({ applied: 1, missing_key_raws: [] });
+    await openBatchExpiryDialog();
+
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "3600");
+    await applyBatchExpiry();
+
+    expect(mocks.toast).toHaveBeenCalledWith("applied 1 failed 1", 5000);
+    expect(requiredElement<HTMLElement>("[data-redis-batch-delete]").textContent).toContain("1");
+
+    // Retrying only targets the key the server missed.
+    requiredElement<HTMLButtonElement>("[data-redis-batch-expiry]").click();
+    await settle();
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "120");
+    await applyBatchExpiry();
+
+    expect(mocks.redisSetKeysTtl).toHaveBeenNthCalledWith(2, "connection", 0, ["YnJhdm8="], 120);
+    expect(document.querySelector("[data-redis-batch-delete]")).toBeNull();
+  });
+
+  it("reports a failed chunk together with the keys an earlier chunk already updated", async () => {
+    mocks.redisSetKeysTtl.mockResolvedValueOnce({ applied: 1_000, missing_key_raws: [] });
+    mocks.redisSetKeysTtl.mockRejectedValueOnce(new Error("connection lost"));
+    const rows = Array.from({ length: 1_001 }, (_, index) => ({
+      key_display: `batch:${String(index).padStart(4, "0")}`,
+      key_raw: `cmF3LWJhdGNoLS${index}`,
+      key_type: "string",
+      ttl: -1,
+    }));
+    await openBatchExpiryDialog(rows);
+
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "3600");
+    await applyBatchExpiry();
+
+    // Bounded chunks keep a 1001-key selection to two requests.
+    expect(mocks.redisSetKeysTtl.mock.calls.map((call) => call[2].length)).toEqual([1_000, 1]);
+    expect(mocks.toast).toHaveBeenCalledWith("applied 1000 failed 1", 5000);
+    expect(mocks.toast).toHaveBeenCalledWith("connection lost", 5000);
+    expect(requiredElement<HTMLElement>("[data-redis-batch-delete]").textContent).toContain("1");
+  });
+
+  it("does not start a second request while the batch is still running", async () => {
+    const pending = deferred<{ applied: number; missing_key_raws: string[] }>();
+    mocks.redisSetKeysTtl.mockReturnValue(pending.promise);
+    await openBatchExpiryDialog();
+
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "3600");
+
+    const applyButton = requiredElement<HTMLButtonElement>("[data-redis-batch-expiry-apply]");
+    applyButton.click();
+    await settle();
+    applyButton.click();
+    await settle();
+
+    expect(mocks.redisSetKeysTtl).toHaveBeenCalledTimes(1);
+    // A conflicting batch delete stays blocked while the expiry request owns the selection.
+    expect(requiredElement<HTMLButtonElement>("[data-redis-batch-delete]").disabled).toBe(true);
+
+    pending.resolve({ applied: 2, missing_key_raws: [] });
+    await settle();
+    expect(mocks.toast).toHaveBeenCalledWith("applied 2", 3000);
+  });
+
+  it("updates the loaded TTL badge without rescanning the key list", async () => {
+    const rows = [{ key_display: "alpha", key_raw: "YWxwaGE=", key_type: "string", ttl: -1 }];
+    mocks.redisSetKeysTtl.mockResolvedValue({ applied: 1, missing_key_raws: [] });
+    await openBatchExpiryDialog(rows);
+
+    expect(rowTtlBadge("alpha")?.textContent).toContain("redis.noExpiry");
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(1);
+
+    await select("ttl");
+    await setInput("[data-redis-batch-expiry-ttl]", "3600");
+    await applyBatchExpiry();
+
+    // The applied TTL is reflected locally instead of one refresh request per key.
+    expect(rowTtlBadge("alpha")?.textContent).toContain("redis.ttlHour");
+    expect(rowTtlBadge("alpha")?.textContent).not.toContain("redis.noExpiry");
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(1);
+
+    // PERSIST flips the same badge back to the no-expiry label.
+    requiredElement<HTMLButtonElement>("[data-redis-select-all]").click();
+    await settle();
+    requiredElement<HTMLButtonElement>("[data-redis-batch-expiry]").click();
+    await settle();
+    await applyBatchExpiry();
+
+    expect(mocks.redisSetKeysTtl).toHaveBeenLastCalledWith("connection", 0, ["YWxwaGE="], -1);
+    expect(rowTtlBadge("alpha")?.textContent).toContain("redis.noExpiry");
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the action while nothing is selected", async () => {
+    mocks.redisScanKeysBatch.mockResolvedValue({ cursor: 0, keys: batchKeys, total_keys: batchKeys.length });
+    mountBrowser();
+    await settle();
+
+    expect(batchExpiryButton()).toBeNull();
+    expect(document.querySelector("[data-redis-batch-expiry-apply]")).toBeNull();
   });
 });
 
@@ -1896,6 +2107,66 @@ describe("RedisKeyBrowser KeepAlive scan budget (issue #7779)", () => {
 });
 
 describe("RedisKeyBrowser interrupted Fetch All", () => {
+  it("keeps the complete snapshot when a group is opened during preparation", async () => {
+    const initial = { key_display: "group:first", key_raw: btoa("group:first"), key_type: "string", ttl: -1 };
+    const buffered = { key_display: "group:second", key_raw: btoa("group:second"), key_type: "string", ttl: -1 };
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => Promise.resolve(cursor === 0 ? { cursor: 1, keys: [initial], total_keys: 2 } : { cursor: 0, keys: [buffered], total_keys: 0 }));
+    const buildStarted = deferred<void>();
+    const releaseBuild = deferred<void>();
+    const buildSnapshot = mocks.buildRedisKeySnapshotCooperatively.getMockImplementation()!;
+    mocks.buildRedisKeySnapshotCooperatively.mockImplementationOnce(async (...args) => {
+      buildStarted.resolve();
+      await releaseBuild.promise;
+      return buildSnapshot(...args);
+    });
+    mountBrowser();
+    await settle();
+    clickButtonWithText("redis.fetchAllKeys");
+    await buildStarted.promise;
+    groupRow("group").click();
+    releaseBuild.resolve();
+    await settle();
+    await vi.waitFor(() => expect(document.body.textContent).not.toContain("redis.stopFetchAll"));
+    await submitKeySearch("group:second");
+
+    expect(document.querySelector(`[data-redis-leaf="${buffered.key_raw}"]`)).not.toBeNull();
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).not.toContain("redis.fetchAllKeys");
+  });
+
+  it("filters a completed Fetch All snapshot while editing a key search", async () => {
+    const unrelated = { key_display: "session:unrelated", key_raw: "c2Vzc2lvbjp1bnJlbGF0ZWQ=", key_type: "string", ttl: -1 };
+    const target = { key_display: "prod:login_fail_count", key_raw: "cHJvZDpsb2dpbl9mYWlsX2NvdW50", key_type: "string", ttl: -1 };
+    mocks.redisScanKeysBatch.mockImplementation((_connectionId: string, _db: number, cursor: number) => Promise.resolve(cursor === 0 ? { cursor: 1, keys: [unrelated], total_keys: 2 } : { cursor: 0, keys: [target], total_keys: 0 }));
+    mountBrowser();
+    await settle();
+
+    clickButtonWithText("redis.fetchAllKeys");
+    await vi.waitFor(() => expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(document.body.textContent).not.toContain("redis.stopFetchAll"));
+    const scanCalls = mocks.redisScanKeysBatch.mock.calls.length;
+
+    await setInput("[data-redis-search-input]", "prod:login_fail_count");
+
+    expect(document.body.textContent).toContain(target.key_display);
+    expect(document.body.textContent).not.toContain(unrelated.key_display);
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(scanCalls);
+    const input = requiredElement<HTMLInputElement>("[data-redis-search-input]");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await settle();
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(scanCalls);
+    expect(document.body.textContent).toContain(target.key_display);
+    requiredElement<HTMLButtonElement>("[data-redis-select-all]").click();
+    await settle();
+    expect(document.querySelector("[data-redis-batch-delete]")?.textContent).toContain("1");
+    expect(document.querySelector("[data-redis-select-all]")).toBeNull();
+
+    await setInput("[data-redis-search-input]", "");
+    expect(mocks.redisScanKeysBatch).toHaveBeenCalledTimes(scanCalls);
+    expect(mocks.scrollerItems[mocks.scrollerItems.length - 1]).toHaveLength(2);
+  });
+
   it("publishes Fetch All rows through one stable Array facade and explicitly refreshes its viewport", async () => {
     const initial = { key_display: "initial", key_raw: "aW5pdGlhbA==", key_type: "string", ttl: -1 };
     const buffered = { key_display: "buffered", key_raw: "YnVmZmVyZWQ=", key_type: "string", ttl: -1 };

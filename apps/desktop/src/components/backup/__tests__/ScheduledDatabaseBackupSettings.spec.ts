@@ -63,6 +63,16 @@ vi.mock("@/composables/useToast", () => ({
   useToast: () => ({ toast: mocks.toast }),
 }));
 
+vi.mock("@/components/connection/ConnectionGroupBadge.vue", async () => {
+  const { defineComponent, h } = await import("vue");
+  return {
+    default: defineComponent({
+      props: { connectionId: { type: String, required: true } },
+      setup: (props) => () => h("span", { "data-connection-group-badge": "", "data-connection-id": props.connectionId }),
+    }),
+  };
+});
+
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: mocks.openDirectory,
 }));
@@ -437,7 +447,7 @@ describe("ScheduledDatabaseBackupSettings schedule dialog", () => {
     expect(mocks.listDatabases).not.toHaveBeenCalled();
   });
 
-  it("previews the rendered run directory and updates it when the template changes", async () => {
+  it("previews the rendered output path and updates it when the directory template changes", async () => {
     mocks.connections.push({ id: "mysql-1", name: "Local MySQL", db_type: "mysql" });
     await mountSettings();
 
@@ -446,7 +456,7 @@ describe("ScheduledDatabaseBackupSettings schedule dialog", () => {
     buttonWithTitle(String(i18n.global.t("databaseBackup.selectDestination"))).click();
     await flush();
 
-    const preview = currentDialog().querySelector<HTMLElement>("[data-backup-run-directory-preview]");
+    const preview = currentDialog().querySelector<HTMLElement>("[data-backup-output-path-preview]");
     expect(preview?.textContent).toContain("/backups/dbx-backup__");
     expect(preview?.textContent).toContain("preview0");
 
@@ -457,7 +467,20 @@ describe("ScheduledDatabaseBackupSettings schedule dialog", () => {
     await flush();
 
     expect(currentDialog().textContent).toContain("{timestamp}");
-    expect(currentDialog().querySelector<HTMLElement>("[data-backup-run-directory-preview]")?.textContent).toContain("/backups/archive/");
+    expect(currentDialog().querySelector<HTMLElement>("[data-backup-output-path-preview]")?.textContent).toContain("/backups/archive/");
+  });
+
+  it("shows connection group badges in the backup connection picker", async () => {
+    mocks.connections.push({ id: "mysql-primary", name: "Shared name", db_type: "mysql" }, { id: "mysql-archive", name: "Shared name", db_type: "mysql" });
+    await mountSettings();
+
+    addScheduleButton().click();
+    await flush();
+    currentDialog().querySelector<HTMLButtonElement>("[data-backup-connection-picker]")?.click();
+    await flush();
+
+    const connectionIds = Array.from(document.body.querySelectorAll<HTMLElement>("[data-connection-group-badge]")).map((badge) => badge.dataset.connectionId);
+    expect(connectionIds).toEqual(["mysql-primary", "mysql-archive"]);
   });
 
   it("opens an independent one-shot dialog without schedule fields", async () => {

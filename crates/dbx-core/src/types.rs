@@ -17,6 +17,10 @@ pub struct DatabaseInfo {
     pub default_charset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_collation: Option<String>,
+    /// Database-level compatibility mode reported by compatible engines.
+    /// openGauss uses values such as A, B, C, and PG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -591,6 +595,11 @@ pub struct IndexInfo {
     /// `None` means the default operator class is used (can be omitted in DDL).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_opclasses: Vec<Option<String>>,
+    /// Parallel to `columns`: PostgreSQL `pg_index.indoption` flags for each key.
+    /// Bit 0 is DESC and bit 1 is NULLS FIRST. Empty when the introspection source
+    /// does not expose per-key ordering metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_options: Vec<i16>,
     /// `true` when this index is the object *behind* a table constraint (PRIMARY KEY or
     /// UNIQUE) rather than a standalone index. Dameng lists both kinds in `ALL_INDEXES`
     /// but only a standalone ("real") index accepts index-level DDL: a constraint-backed

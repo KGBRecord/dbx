@@ -245,6 +245,43 @@ test("suggests database-specific data types and functions", () => {
   assert.ok(mysqlCreateViewItems.some((item) => item.type === "function" && item.label === "DATE"));
 });
 
+test("suggests PostgreSQL CURRENT_DATE as a keyword without parentheses", () => {
+  const itemsFor = (sql: string, databaseType: DatabaseType = "postgres") =>
+    buildSqlCompletionItems(sql, sql.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType,
+    });
+  const assertBareKeyword = (items: ReturnType<typeof itemsFor>, label: string) => {
+    const item = items.find((candidate) => candidate.label === label);
+    assert.ok(item, `expected keyword ${label}`);
+    assert.equal(item.type, "keyword");
+    assert.equal((item.apply ?? item.label).includes("("), false);
+  };
+
+  assertBareKeyword(itemsFor("select current_d"), "CURRENT_DATE");
+
+  const currentPrefixItems = itemsFor("select current");
+  assertBareKeyword(currentPrefixItems, "CURRENT_DATE");
+  assertBareKeyword(currentPrefixItems, "CURRENT_TIMESTAMP");
+  assertBareKeyword(currentPrefixItems, "CURRENT_TIME");
+
+  const localtimeItems = itemsFor("select localt");
+  assertBareKeyword(localtimeItems, "LOCALTIME");
+  assertBareKeyword(localtimeItems, "LOCALTIMESTAMP");
+
+  const reportedSql = `SELECT * FROM "public"."table" where "CreateTime" >= current`;
+  assertBareKeyword(itemsFor(reportedSql), "CURRENT_DATE");
+
+  const mysqlCurrentDate = itemsFor("select current_d", "mysql").find((item) => item.label === "CURRENT_DATE");
+  assert.equal(mysqlCurrentDate?.type, "function");
+
+  assert.equal(
+    itemsFor("select current_d", "sqlserver").some((item) => item.label === "CURRENT_DATE"),
+    false,
+  );
+});
+
 test("suggests MySQL VERSION and REVERSE without broadening other dialects", () => {
   const buildFunctionItems = (prefix: string, databaseType?: "mysql" | "postgres" | "sqlserver") =>
     buildSqlCompletionItems(`select ${prefix}`, `select ${prefix}`.length, {
@@ -993,6 +1030,63 @@ test("replaces typed Unicode prefixes through semantic SQL Server completion", (
     assert.equal(replacement.from, cursor - fixture.prefix.length, fixture.prefix);
     assert.equal(`${sql.slice(0, replacement.from)}${column.apply ?? column.label}${sql.slice(cursor)}`, `select * from test where ${fixture.column}`, fixture.prefix);
   }
+});
+
+test("brackets only SQL Server completion identifiers that require delimiters", () => {
+  const sql = "select * from ";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "Orders", schema: "dbo", type: "table" },
+      { name: "名称", schema: "dbo", type: "table" },
+      { name: "04保险事前", schema: "dbo", type: "table" },
+      { name: "含]括号", schema: "dbo", type: "table" },
+      { name: "BACKUP", schema: "dbo", type: "table" },
+    ],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    dialect: "sqlserver",
+  });
+
+  assert.deepEqual(Object.fromEntries(items.filter((item) => item.type === "table").map((item) => [item.label, item.apply])), {
+    Orders: "Orders",
+    名称: "名称",
+    "04保险事前": "[04保险事前]",
+    "含]括号": "[含]]括号]",
+    BACKUP: "[BACKUP]",
+  });
+});
+
+test("quotes qualified SQL Server table apply names", () => {
+  const sql = "select * from ";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [
+      { name: "04保险事前", schema: "dbo", type: "table", applyName: "dbo.04保险事前" },
+      { name: "04归档", schema: "dbo", type: "table", applyName: "dbo.[04归档]" },
+      { name: "04省略模式", schema: "dbo", type: "table", applyName: "datacenter..04省略模式" },
+      { name: "含].括号", schema: "dbo", type: "table", applyName: "dbo.[含]].括号]" },
+    ],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    dialect: "sqlserver",
+  });
+
+  assert.equal(items.find((item) => item.label === "04保险事前")?.apply, "dbo.[04保险事前]");
+  assert.equal(items.find((item) => item.label === "04归档")?.apply, "dbo.[04归档]");
+  assert.equal(items.find((item) => item.label === "04省略模式")?.apply, "datacenter..[04省略模式]");
+  assert.equal(items.find((item) => item.label === "含].括号")?.apply, "dbo.[含]].括号]");
+});
+
+test("quotes qualified SQL Server routine apply names", () => {
+  const sql = "select run";
+  const items = buildSqlCompletionItems(sql, sql.length, {
+    tables: [],
+    objects: [{ name: "run_report", schema: "dbo", type: "procedure", applyName: "dbo.04备份" }],
+    columnsByTable: new Map(),
+    databaseType: "sqlserver",
+    dialect: "sqlserver",
+  });
+
+  assert.equal(items.find((item) => item.label === "run_report")?.apply, "dbo.[04备份]()");
 });
 
 test("replaces a Unicode prefix inside an open SQL Server bracket identifier", () => {

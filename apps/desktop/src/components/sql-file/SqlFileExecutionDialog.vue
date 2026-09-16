@@ -18,8 +18,8 @@ import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { connectionIsEffectivelyReadOnly, ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
 import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
-import { requiresSqlFileTargetDatabaseSelection } from "@/lib/connection/connectionLevelDatabaseBootstrap";
-import { cancelSqlFileExecution, executeSqlFiles, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/backend/api";
+import { requiresSqlFileTargetDatabaseSelection, supportsConnectionLevelDatabaseBootstrap } from "@/lib/connection/connectionLevelDatabaseBootstrap";
+import { cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -85,6 +85,7 @@ const database = ref("");
 const databaseOptions = ref<string[]>([]);
 const loadingDatabases = ref(false);
 const continueOnError = ref(false);
+const skipRelationalConstraints = ref(false);
 
 const running = ref(false);
 const cancelling = ref(false);
@@ -132,12 +133,71 @@ function resetPerFileState() {
 }
 
 const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
+// Mirrors the core executor gate (`supports_connection_level_database_bootstrap_target`): the
+// MySQL-family types it runs for, so the constraint toggle appears wherever the backend honors it.
+const MYSQL_BOOTSTRAP_IMPORT_TYPES = new Set(["mysql", "doris", "starrocks", "goldendb"]);
+const MYSQL_BOOTSTRAP_IMPORT_PROFILES = new Set(["mariadb", "tidb", "oceanbase", "custom_mysql", "doris", "starrocks", "selectdb", "goldendb"]);
+const isMysqlCompatibleTarget = computed(() => {
+  const config = store.getConfig(connectionId.value);
+  if (!config) return false;
+  return MYSQL_BOOTSTRAP_IMPORT_TYPES.has(config.db_type) || (!!config.driver_profile && MYSQL_BOOTSTRAP_IMPORT_PROFILES.has(config.driver_profile.toLowerCase()));
+});
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
+
+const restoreSelectedTables = ref(false);
+const backupTables = ref<SqlFileTable[]>([]);
+const selectedTableKeys = ref(new Set<string>());
+const tableSearch = ref("");
+const loadingTables = ref(false);
+const tableScanError = ref("");
+let tableScanGeneration = 0;
+const canSelectTables = computed(() => previews.value.length === 1 && supportsConnectionLevelDatabaseBootstrap(selectedConnection.value));
+const tableKey = (table: SqlFileTable) => JSON.stringify([table.database, table.name]);
+const tableLabel = (table: SqlFileTable) => (table.database ? `${table.database}.${table.name}` : table.name);
+const filteredBackupTables = computed(() => backupTables.value.filter((table) => tableLabel(table).toLocaleLowerCase().includes(tableSearch.value.trim().toLocaleLowerCase())));
+const selectedTables = computed(() => backupTables.value.filter((table) => selectedTableKeys.value.has(tableKey(table))));
+const allFilteredTablesSelected = computed(() => filteredBackupTables.value.length > 0 && filteredBackupTables.value.every((table) => selectedTableKeys.value.has(tableKey(table))));
+
+function toggleTable(table: SqlFileTable) {
+  const key = tableKey(table);
+  if (selectedTableKeys.value.has(key)) selectedTableKeys.value.delete(key);
+  else selectedTableKeys.value.add(key);
+}
+
+function toggleFilteredTables() {
+  const deselect = allFilteredTablesSelected.value;
+  for (const table of filteredBackupTables.value) {
+    if (deselect) selectedTableKeys.value.delete(tableKey(table));
+    else selectedTableKeys.value.add(tableKey(table));
+  }
+}
+
+watch([restoreSelectedTables, canSelectTables, () => previews.value[0]?.filePath, connectionId, open], async () => {
+  const generation = ++tableScanGeneration;
+  backupTables.value = [];
+  selectedTableKeys.value = new Set();
+  tableSearch.value = "";
+  tableScanError.value = "";
+  loadingTables.value = false;
+  if (!canSelectTables.value) restoreSelectedTables.value = false;
+  if (!open.value || !restoreSelectedTables.value || !canSelectTables.value) return;
+  loadingTables.value = true;
+  try {
+    const tables = await inspectSqlFileTables(previews.value[0]!.filePath);
+    if (generation !== tableScanGeneration) return;
+    backupTables.value = tables;
+  } catch (error: any) {
+    if (generation === tableScanGeneration) tableScanError.value = error?.message || String(error);
+  } finally {
+    if (generation === tableScanGeneration) loadingTables.value = false;
+  }
+});
 
 const canStart = computed(() => {
   const connection = selectedConnection.value;
   if (previews.value.length === 0 || !connection || running.value || loadingPreview.value || loadingDatabases.value) return false;
+  if (restoreSelectedTables.value && (loadingTables.value || tableScanError.value || selectedTables.value.length === 0)) return false;
   let hasDatabaseContext = false;
   const canExecuteWithoutSelectedDatabase = previews.value.every((item) => {
     if (!hasDatabaseContext && !item.canExecuteWithoutSelectedDatabase) return false;
@@ -259,6 +319,8 @@ function resetState() {
   databaseOptions.value = [];
   loadingDatabases.value = false;
   continueOnError.value = false;
+  skipRelationalConstraints.value = false;
+  restoreSelectedTables.value = false;
   resetExecution();
 }
 
@@ -335,7 +397,7 @@ async function selectFile() {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
       multiple: true,
-      filters: [{ name: "SQL", extensions: ["sql", "gz"] }],
+      filters: [{ name: "SQL package", extensions: ["sql", "gz", "zip"] }],
     });
     const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
     if (paths.length > 0) {
@@ -488,15 +550,19 @@ async function startExecution() {
 
     try {
       executionStarted.value = true;
+      const executionPaths = previews.value.flatMap((item) => item.packageFilePaths ?? [item.filePath]);
       await executeSqlFiles(
         {
           executionId: batchId,
           connectionId: connectionId.value,
           database: database.value.trim(),
-          filePath: previews.value[0]!.filePath,
+          filePath: executionPaths[0]!,
           continueOnError: continueOnError.value,
+          ...(restoreSelectedTables.value ? { selectedTables: selectedTables.value.map((table) => ({ ...table })) } : {}),
+          partCooldownMs: previews.value.some((item) => item.packageFilePaths) ? 500 : 0,
+          skipRelationalConstraints: skipRelationalConstraints.value,
         },
-        previews.value.map((item) => item.filePath),
+        executionPaths,
       );
       const terminal = await terminalProgress;
       if (terminal.status === "error") {
@@ -604,7 +670,7 @@ watch(
           </div>
 
           <div class="flex items-center gap-2">
-            <input ref="fileInput" type="file" accept=".sql,.sql.gz,text/sql,application/gzip" multiple class="hidden" @change="handleFileInputChange" />
+            <input ref="fileInput" type="file" accept=".sql,.sql.gz,.zip,text/sql,application/gzip,application/zip" multiple class="hidden" @change="handleFileInputChange" />
             <Input :model-value="filePathDisplay" readonly class="h-8 text-xs font-mono" :placeholder="t('sqlFile.selectSqlFile')" />
             <Button variant="outline" size="sm" class="h-8 shrink-0" :disabled="running || selectingFile" @click="selectFile">
               <Loader2 v-if="selectingFile || loadingPreview" class="w-3.5 h-3.5 mr-1.5 animate-spin" />
@@ -644,6 +710,7 @@ watch(
                   <span>{{ previewLineSummary(activePreview) }}</span>
                   <span class="h-3 w-px bg-border" />
                   <span>{{ formatBytes(activePreview.sizeBytes) }}</span>
+                  <span v-if="activePreview.packagePartCount">{{ t("sqlFile.packageParts", { count: activePreview.packagePartCount }) }}</span>
                 </div>
               </div>
               <div class="sql-file-preview-viewer flex max-w-full overflow-auto bg-muted/15 text-xs rounded-b-md border border-t-0" :class="previews.length === 1 ? 'min-h-56 max-h-[min(46vh,420px)]' : 'min-h-0 max-h-[min(46vh,420px)]'">
@@ -702,6 +769,33 @@ watch(
           </div>
         </div>
 
+        <div v-if="canSelectTables" class="min-w-0 space-y-2.5" data-table-restore>
+          <Label class="text-xs">{{ t("sqlFile.restoreScope") }}</Label>
+          <div class="flex items-center gap-4 text-xs">
+            <label class="flex items-center gap-2"><input v-model="restoreSelectedTables" type="radio" :value="false" :disabled="running" name="sql-file-restore-scope" />{{ t("sqlFile.restoreAll") }}</label>
+            <label class="flex items-center gap-2"><input v-model="restoreSelectedTables" type="radio" :value="true" :disabled="running" name="sql-file-restore-scope" />{{ t("sqlFile.restoreSelectedTables") }}</label>
+          </div>
+          <template v-if="restoreSelectedTables">
+            <p class="text-xs text-muted-foreground">{{ t("sqlFile.restoreTablesOnly") }}</p>
+            <div v-if="loadingTables" class="flex items-center gap-2 text-xs" role="status"><Loader2 class="h-3.5 w-3.5 animate-spin" />{{ t("sqlFile.scanningTables") }}</div>
+            <p v-else-if="tableScanError" class="break-words text-xs text-destructive" role="alert">{{ tableScanError }}</p>
+            <template v-else>
+              <Input v-model="tableSearch" :placeholder="t('sqlFile.searchBackupTables')" :aria-label="t('sqlFile.searchBackupTables')" :disabled="running" class="h-8 text-xs" />
+              <div class="flex items-center justify-between gap-3 text-xs">
+                <label class="flex items-center gap-2"><input type="checkbox" :checked="allFilteredTablesSelected" :disabled="running || filteredBackupTables.length === 0" @change="toggleFilteredTables" />{{ t("sqlFile.selectVisibleTables") }}</label>
+                <span>{{ t("sqlFile.selectedTableCount", { selected: selectedTables.length, total: backupTables.length }) }}</span>
+              </div>
+              <div class="max-h-44 overflow-y-auto border rounded-md p-2 text-xs">
+                <label v-for="table in filteredBackupTables" :key="tableKey(table)" class="flex min-w-0 items-center gap-2 py-1">
+                  <input type="checkbox" :checked="selectedTableKeys.has(tableKey(table))" :disabled="running" @change="toggleTable(table)" />
+                  <span class="min-w-0 break-all">{{ tableLabel(table) }}</span>
+                </label>
+                <p v-if="filteredBackupTables.length === 0" class="text-muted-foreground">{{ t("sqlFile.noBackupTables") }}</p>
+              </div>
+            </template>
+          </template>
+        </div>
+
         <div class="min-w-0 space-y-2.5">
           <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
             {{ t("sqlFile.options") }}
@@ -711,6 +805,11 @@ watch(
             <CheckSquare v-if="continueOnError" class="w-3.5 h-3.5 text-primary shrink-0" />
             <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
             {{ t("sqlFile.continueOnError") }}
+          </button>
+          <button v-if="isMysqlCompatibleTarget" type="button" class="flex items-center gap-2 text-xs text-left" :disabled="running" @click="skipRelationalConstraints = !skipRelationalConstraints">
+            <CheckSquare v-if="skipRelationalConstraints" class="w-3.5 h-3.5 text-primary shrink-0" />
+            <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
+            {{ t("sqlFile.skipRelationalConstraints") }}
           </button>
         </div>
 

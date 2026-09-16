@@ -11,6 +11,7 @@ import {
   editableRowIdentifierColumns,
   hasCompleteTdengineRowIdentity,
   isClickHouseExistingRowReadonlyColumn,
+  isHiddenGridColumn,
   isTdengineExistingRowReadonlyColumn,
   isTableDataEditable,
   supportsDataGridTransaction,
@@ -42,6 +43,7 @@ function index(columns: string[], isUnique = true, filter: string | null = null)
 
 describe("tableEditing", () => {
   it("synthesizes ROWID only for Oracle-compatible base tables", () => {
+    expect(editablePrimaryKeys("oracle", [column("ID"), column("NAME")])).toEqual([]);
     expect(editablePrimaryKeys("oracle", [column("ID"), column("NAME")], "VIEW")).toEqual([]);
     expect(editablePrimaryKeys("oracle", [column("ID"), column("NAME")], "TABLE")).toEqual([DBX_ROWID_COLUMN]);
     expect(editablePrimaryKeys("oceanbase-oracle", [column("ID"), column("NAME")], "TABLE")).toEqual([DBX_ROWID_COLUMN]);
@@ -71,6 +73,13 @@ describe("tableEditing", () => {
     expect(shouldIncludeSyntheticRowId("oracle", [], "TABLE")).toBe(false);
   });
 
+  it("keeps Xugu's internal ROWID hidden after primary-key metadata arrives", () => {
+    expect(isHiddenGridColumn("xugu", DBX_ROWID_COLUMN, ["ID"], "TABLE")).toBe(true);
+    expect(isHiddenGridColumn("xugu", DBX_ROWID_COLUMN, [], "TABLE")).toBe(true);
+    expect(isHiddenGridColumn("xugu", DBX_ROWID_COLUMN, ["ID"], "VIEW")).toBe(false);
+    expect(isHiddenGridColumn("xugu", "ID", ["ID"], "TABLE")).toBe(false);
+  });
+
   it("treats view data tabs as readonly", () => {
     expect(isTableDataEditable("oracle", [DBX_ROWID_COLUMN], "VIEW")).toBe(false);
   });
@@ -82,6 +91,9 @@ describe("tableEditing", () => {
   });
 
   it("does not include Oracle ROWID for view data tabs", () => {
+    expect(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN])).toBe(true);
+    expect(shouldIncludeSyntheticRowId("oracle", [DBX_ROWID_COLUMN])).toBe(false);
+    expect(shouldIncludeSyntheticRowId("oracle", [DBX_ROWID_COLUMN], "TABLE")).toBe(true);
     expect(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN], "VIEW")).toBe(false);
     expect(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN], "MATERIALIZED_VIEW")).toBe(false);
     expect(usesSyntheticRowIdKey("oceanbase-oracle", [DBX_ROWID_COLUMN], "TABLE")).toBe(true);

@@ -18,6 +18,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,6 +49,47 @@ class Db2AgentTest extends JdbcFakeExecutionBehaviorTest {
         params.setUrl_params("sslConnection=true");
 
         assertEquals("jdbc:db2://db.example.com:50000/SAMPLE:sslConnection=true;", Db2Agent.buildUrl(params));
+    }
+
+    @Test
+    void readsClobValuesAsTextInsteadOfVendorObjectNames() {
+        Db2Agent agent = new Db2Agent();
+        ResultSet resultSet = proxy(ResultSet.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getString".equals(method.getName())) {
+                    return "long text value";
+                }
+                if ("wasNull".equals(method.getName())) {
+                    return false;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+
+        assertEquals("long text value", agent.resultValue(resultSet, 1, Types.CLOB));
+    }
+
+    @Test
+    void readsBlobValuesAsHexInsteadOfVendorObjectNames() {
+        Db2Agent agent = new Db2Agent();
+        ResultSet resultSet = proxy(ResultSet.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getBytes".equals(method.getName())) {
+                    return new byte[] {(byte) 0x89, 0x50, 0x4e};
+                }
+                if ("wasNull".equals(method.getName())) {
+                    return false;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+
+        assertEquals("0x89504e", agent.resultValue(resultSet, 1, Types.BLOB));
+        assertEquals("0x89504e", agent.resultValue(resultSet, 1, Types.BINARY));
+        assertEquals("0x89504e", agent.resultValue(resultSet, 1, Types.VARBINARY));
+        assertEquals("0x89504e", agent.resultValue(resultSet, 1, Types.LONGVARBINARY));
     }
 
     @Test

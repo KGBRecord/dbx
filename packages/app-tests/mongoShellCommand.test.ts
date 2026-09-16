@@ -313,6 +313,139 @@ test("parseMongoFindCommand rewrites NumberLong into extended JSON", () => {
   assert.deepEqual(JSON.parse(unquoted.filter), { snowflake: { $numberLong: "9007199254740993" } });
 });
 
+test("parseMongoWriteCommand fills in zero-argument new Date, ISODate and ObjectId", () => {
+  const before = Date.now();
+  const command = parseMongoWriteCommand(`db.reports.updateOne(
+    { phone_number: "+84905421172", code: "VN" },
+    { $set: { type: ObjectId("5bbc28701f3fd80f00e0211c"), created_at: new Date(), updated_at: ISODate() } },
+    { upsert: true }
+  )`);
+  assert.ok(command);
+  assert.equal(command.kind, "update");
+  const update = JSON.parse(command.update) as { $set: Record<string, { $date?: string; $oid?: string }> };
+  assert.deepEqual(update.$set.type, { $oid: "5bbc28701f3fd80f00e0211c" });
+  for (const field of ["created_at", "updated_at"] as const) {
+    const filled = Date.parse(update.$set[field]!.$date!);
+    assert.ok(filled >= before && filled <= Date.now(), `${field} is not the current time`);
+  }
+  assert.match(JSON.parse(parseMongoFindCommand("db.reports.find({_id: ObjectId()})")!.filter)._id.$oid, /^[0-9a-f]{24}$/);
+});
+
+test("parseMongoFindCommand rewrites epoch-millisecond and numeric BSON constructors", () => {
+  const command = parseMongoFindCommand('db.orders.find({at: new Date(1735689600000), qty: NumberInt(3), total: NumberDecimal("12.34")})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), {
+    at: { $date: { $numberLong: "1735689600000" } },
+    qty: { $numberInt: "3" },
+    total: { $numberDecimal: "12.34" },
+  });
+});
+
+test("parseMongoFindCommand rejects out-of-range integer constructor arguments", () => {
+  assert.equal(parseMongoFindCommand("db.orders.find({a: NumberLong(9223372036854775808)})"), null);
+  assert.equal(parseMongoFindCommand("db.orders.find({a: NumberLong(-9223372036854775809)})"), null);
+  assert.equal(parseMongoFindCommand("db.orders.find({a: NumberInt(2147483648)})"), null);
+  assert.equal(parseMongoFindCommand("db.orders.find({a: new Date(99999999999999999999)})"), null);
+  const atBounds = parseMongoFindCommand("db.orders.find({a: NumberLong(9223372036854775807), b: NumberInt(-2147483648)})");
+  assert.ok(atBounds);
+  assert.deepEqual(JSON.parse(atBounds.filter), { a: { $numberLong: "9223372036854775807" }, b: { $numberInt: "-2147483648" } });
+});
+
+test("parseMongoFindCommand does not rewrite constructor text inside strings", () => {
+  const command = parseMongoFindCommand(`db.orders.find({label: "new Date()", note: 'ObjectId()'})`);
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { label: "new Date()", note: "ObjectId()" });
+});
+
+test('parseMongoCommand accepts db["name"] bracket collection accessors', () => {
+  const find = parseMongoFindCommand('db["orders-2024"].find({a: 1})');
+  assert.ok(find);
+  assert.equal(find.collection, "orders-2024");
+  assert.deepEqual(JSON.parse(find.filter), { a: 1 });
+
+  // Single quotes and a dotted name behave like db.<name>.
+  assert.equal(parseMongoFindCommand("db['audit.logs'].find({})")?.collection, "audit.logs");
+
+  assert.deepEqual(parseMongoWriteCommand('db["orders-2024"].updateOne({a: 1}, {$set: {b: 2}}, {upsert: true})'), {
+    kind: "update",
+    collection: "orders-2024",
+    filter: '{"a": 1}',
+    update: '{"$set": {"b": 2}}',
+    options: '{"upsert": true}',
+    many: false,
+  });
+
+  for (const source of ["db[].find({})", 'db["x"]find({})', 'db["x"]']) {
+    assert.equal(parseMongoCommand(source), null, source);
+  }
+});
+
+test("parseMongoFindCommand rewrites UUID, BinData, Timestamp and MinKey/MaxKey", () => {
+  const command = parseMongoFindCommand(`db.c.find({
+    u: UUID("3b241101-e2bb-4255-8caf-4136c566a962"),
+    b: BinData(128, "AQID"),
+    t: Timestamp(1735689600, 7),
+    lo: MinKey,
+    hi: MaxKey(),
+    range: {$gt: MinKey(), $lt: MaxKey},
+    list: [MinKey, MaxKey]
+  })`);
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), {
+    u: { $uuid: "3b241101-e2bb-4255-8caf-4136c566a962" },
+    b: { $binary: { base64: "AQID", subType: "80" } },
+    t: { $timestamp: { t: 1735689600, i: 7 } },
+    lo: { $minKey: 1 },
+    hi: { $maxKey: 1 },
+    range: { $gt: { $minKey: 1 }, $lt: { $maxKey: 1 } },
+    list: [{ $minKey: 1 }, { $maxKey: 1 }],
+  });
+
+  const generated = JSON.parse(parseMongoFindCommand("db.c.find({u: UUID()})")!.filter).u.$uuid;
+  assert.match(generated, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
+test("parseMongoFindCommand leaves MinKey/MaxKey alone outside value positions", () => {
+  const command = parseMongoFindCommand('db.c.find({MinKey: 1, MaxKey: 2, label: "MinKey", nested: {MaxKey: true}})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { MinKey: 1, MaxKey: 2, label: "MinKey", nested: { MaxKey: true } });
+});
+
+test("parseMongoFindCommand rejects malformed UUID, BinData, Timestamp and MinKey/MaxKey", () => {
+  for (const source of [
+    'db.c.find({b: BinData(256, "x")})',
+    "db.c.find({b: BinData(0)})",
+    'db.c.find({b: BinData("00", "x")})',
+    "db.c.find({t: Timestamp(1)})",
+    "db.c.find({t: Timestamp(-1, 0)})",
+    "db.c.find({t: Timestamp(4294967296, 0)})",
+    "db.c.find({u: UUID(1)})",
+    "db.c.find({a: MinKey(1)})",
+    'db.c.find({a: MaxKey("x")})',
+  ]) {
+    assert.equal(parseMongoFindCommand(source), null, source);
+  }
+});
+
+test("parseMongoFindCommand validates UUID strings at parse time", () => {
+  // mongosh requires the canonical 8-4-4-4-12 hex form: dashes at fixed
+  // positions, hex digits elsewhere.
+  for (const source of [
+    'db.c.find({u: UUID("3b241101e2bb42558caf4136c566a962")})',
+    'db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a96")})',
+    'db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a9620")})',
+    'db.c.find({u: UUID("zb241101-e2bb-4255-8caf-4136c566a962")})',
+    'db.c.find({u: UUID("3b241101_e2bb_4255_8caf_4136c566a962")})',
+  ]) {
+    assert.equal(parseMongoFindCommand(source), null, source);
+  }
+
+  // Upper-case hex is accepted and preserved verbatim.
+  const command = parseMongoFindCommand('db.c.find({u: UUID("3B241101-E2BB-4255-8CAF-4136C566A962")})');
+  assert.ok(command);
+  assert.deepEqual(JSON.parse(command.filter), { u: { $uuid: "3B241101-E2BB-4255-8CAF-4136C566A962" } });
+});
+
 test("parseMongoFindCommand accepts single-quoted string values and unquoted sort keys", () => {
   const command = parseMongoFindCommand("db.products.find({category: 'Electronics'}).sort({price: -1}).limit(2)");
   assert.ok(command);
@@ -536,6 +669,45 @@ test("parseMongoWriteCommand accepts unquoted insert and update commands", () =>
     filter: '{"_id": {"$oid":"507f1f77bcf86cd799439011"}}',
     update: '{"$set": {"stock": 3}}',
     many: false,
+  });
+});
+
+test("parseMongoWriteCommand reads replaceOne as a filtered replace", () => {
+  assert.deepEqual(parseMongoWriteCommand('db.orders.replaceOne({_id: ObjectId("507f1f77bcf86cd799439011")}, {name: "new", tags: []}, {upsert: true})'), {
+    kind: "replace",
+    collection: "orders",
+    filter: '{"_id": {"$oid":"507f1f77bcf86cd799439011"}}',
+    replacement: '{"name": "new", "tags": []}',
+    options: '{"upsert": true}',
+  });
+  assert.deepEqual(parseMongoWriteCommand('db["my-coll"].replaceOne({a: 1}, {b: 2});'), {
+    kind: "replace",
+    collection: "my-coll",
+    filter: '{"a": 1}',
+    replacement: '{"b": 2}',
+  });
+
+  for (const source of ["db.orders.replaceOne({a: 1})", "db.orders.replaceOne({a: 1}, {b: 2}, {upsert: true}, 4)", "db.orders.replaceOne({a: 1}, [{b: 2}])", "db.orders.replaceOne({a: 1}, {$set: {b: 2}})"]) {
+    assert.equal(parseMongoWriteCommand(source), null, source);
+  }
+  assert.match(describeMongoCommandParseFailure("db.orders.replaceOne({a: 1}, {$set: {b: 2}})"), /must not contain update operators such as \$set; use updateOne\(\)/);
+});
+
+test("evaluateMongoWriteSafety guards an unbounded replaceOne like an update", () => {
+  const bounded = parseMongoWriteCommand("db.orders.replaceOne({a: 1}, {b: 2})")!;
+  const unbounded = parseMongoWriteCommand("db.orders.replaceOne({}, {b: 2})")!;
+  const policy = { allowWrites: true, allowDangerous: false } as Parameters<typeof evaluateMongoWriteSafety>[1];
+  assert.equal(evaluateMongoWriteSafety(bounded, policy).allowed, true);
+  assert.equal(evaluateMongoWriteSafety(unbounded, policy).allowed, false);
+  assert.equal(evaluateMongoWriteSafety(bounded, { ...policy, allowWrites: false }).allowed, false);
+});
+
+test("normalizeRustMongoCommand passes a replace command through unchanged", () => {
+  assert.deepEqual(normalizeRustMongoCommand({ kind: "replace", collection: "orders", filter: '{"a":1}', replacement: '{"b":2}', options: null }), {
+    kind: "replace",
+    collection: "orders",
+    filter: '{"a":1}',
+    replacement: '{"b":2}',
   });
 });
 
@@ -803,6 +975,31 @@ test("parseMongoAggregateCommand parses db collection aggregate", () => {
   });
 });
 
+test("parseMongoAggregateCommand drops the no-op cursor methods mongosh and Compass append", () => {
+  const expected = { collection: "orders", pipeline: '[{"$match": {"a": 1}}]' };
+  for (const source of [
+    "db.orders.aggregate([{$match: {a: 1}}]).toArray()",
+    "db.orders.aggregate([{$match: {a: 1}}]).pretty()",
+    "db.orders.aggregate([{$match: {a: 1}}]).toArray().pretty()",
+    "db.orders.aggregate([{$match: {a: 1}}])\n  .toArray()",
+    "db.orders.aggregate([{$match: {a: 1}}]).toArray();",
+  ]) {
+    assert.deepEqual(parseMongoAggregateCommand(source), expected, source);
+  }
+  assert.deepEqual(parseMongoAggregateCommand("db.orders.aggregate([], {allowDiskUse: true}).toArray()"), {
+    collection: "orders",
+    pipeline: "[]",
+    options: '{"allowDiskUse": true}',
+  });
+});
+
+test("parseMongoAggregateCommand still rejects cursor methods that would change the result", () => {
+  for (const source of ["db.orders.aggregate([]).limit(5)", "db.orders.aggregate([]).sort({a: 1})", "db.orders.aggregate([]).toArray().limit(5)", "db.orders.aggregate([]).toArray(1)"]) {
+    assert.equal(parseMongoAggregateCommand(source), null, source);
+    assert.match(describeMongoCommandParseFailure(source), /Chaining .* is not supported/, source);
+  }
+});
+
 test("parseMongoAggregateCommand accepts an empty pipeline", () => {
   assert.deepEqual(parseMongoAggregateCommand("db.products.aggregate([])"), {
     collection: "products",
@@ -1001,6 +1198,70 @@ test("parseMongoAggregateCommand rejects non-array pipelines and invalid options
   assert.equal(parseMongoAggregateCommand("db.products.aggregate([], {explain: true"), null);
   assert.equal(parseMongoAggregateCommand("db.products.aggregate([]).limit(10)"), null);
   assert.equal(parseMongoAggregateCommand("db.products.aggregate([], {}, true)"), null);
+});
+
+test("parseMongoCountDocumentsCommand reads estimatedDocumentCount as a metadata-backed count", () => {
+  // The driver already takes the metadata fast path for a filterless legacy count().
+  const expected = { collection: "orders", filter: "{}", mode: "legacy" };
+  for (const source of ["db.orders.estimatedDocumentCount()", 'db["orders"].estimatedDocumentCount()', "db.getCollection('orders').estimatedDocumentCount();"]) {
+    assert.deepEqual(parseMongoCountDocumentsCommand(source), expected, source);
+  }
+
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.estimatedDocumentCount({a: 1})"), null);
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.estimatedDocumentCount().limit(5)"), null);
+  // count() and countDocuments() keep their own modes.
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.countDocuments({})")?.mode, "accurate");
+  assert.equal(parseMongoCountDocumentsCommand("db.orders.count()")?.mode, "legacy");
+});
+
+test("parseMongoRunCommand reads db.stats() and db.serverStatus() as run commands", () => {
+  assert.deepEqual(parseMongoRunCommand("db.stats()"), { commandJson: '{"dbStats":1}' });
+  assert.deepEqual(parseMongoRunCommand("db . serverStatus ( ) ;"), { commandJson: '{"serverStatus":1}' });
+  assert.deepEqual(parseMongoRunCommand("DB.STATS()"), { commandJson: '{"dbStats":1}' });
+
+  for (const source of ["db.stats(1)", "db.serverStatus({})"]) {
+    assert.equal(parseMongoRunCommand(source), null, source);
+    assert.match(describeMongoCommandParseFailure(source), /takes no arguments|expects no arguments/, source);
+  }
+
+  // db.collection.stats() is still collection stats, not a run command.
+  assert.equal(parseMongoRunCommand("db.orders.stats()"), null);
+  assert.equal(parseMongoCommand("db.orders.stats()")?.command.kind, "collectionStats");
+});
+
+test("describeMongoCommandParseFailure names an unsupported value constructor and where it is", () => {
+  const message = describeMongoCommandParseFailure('db.reports.updateOne({a: 1}, {$set: {t: Foo("x")}}, {upsert: true})');
+  assert.match(message, /Unsupported value Foo\(\.\.\.\) in the update argument of updateOne\(\)/);
+  assert.match(message, /ObjectId, ISODate, new Date, NumberLong/);
+
+  assert.match(describeMongoCommandParseFailure("db.c.find({a: new Bar()})"), /Unsupported value new Bar\(\.\.\.\) in the filter argument of find\(\)/);
+  // Text inside a string is not a constructor call.
+  assert.match(describeMongoCommandParseFailure('db.c.find({a: "Foo(1)", b: })'), /filter argument of find\(\) is not a valid document/);
+});
+
+test("describeMongoCommandParseFailure explains the argument shape a known method expects", () => {
+  assert.equal(describeMongoCommandParseFailure("db.c.insertOne({a: 1}, {writeConcern: {w: 1}})"), "insertOne() expects one document.");
+  assert.equal(describeMongoCommandParseFailure("db.c.deleteOne({a: 1}, {collation: {locale: 'en'}})"), "deleteOne() expects a filter.");
+  assert.equal(describeMongoCommandParseFailure("db.c.updateOne({a: 1})"), "updateOne() expects a filter, an update, and optional options.");
+  assert.equal(describeMongoCommandParseFailure("db.runCommand()"), "runCommand() expects one command document.");
+  assert.equal(describeMongoCommandParseFailure("db.version(1)"), "version() expects no arguments.");
+  assert.equal(describeMongoCommandParseFailure("db.c.find({a: 1}).count"), 'Unexpected text after find(...): ".count".');
+});
+
+test("describeMongoCommandParseFailure names unsupported methods and points at alternatives", () => {
+  const bulkWrite = describeMongoCommandParseFailure("db.c.bulkWrite([{insertOne: {document: {a: 1}}}])");
+  assert.match(bulkWrite, /^Collection method bulkWrite\(\) is not supported\. Supported collection methods: find, findOne/);
+  // Bracket and getCollection targets are recognised too.
+  assert.match(describeMongoCommandParseFailure('db["my-coll"].renameCollection("x")'), /renameCollection\(\) is not supported/);
+  assert.match(describeMongoCommandParseFailure('db.getCollection("my-coll").watch()'), /watch\(\) is not supported/);
+
+  assert.match(describeMongoCommandParseFailure('db.createCollection("c")'), /db\.createCollection\(\) is not supported; collections are created on first insert/);
+  assert.match(describeMongoCommandParseFailure('db.getSiblingDB("other").c.find({})'), /use <database>/);
+  assert.match(describeMongoCommandParseFailure("db.adminCommand({ping: 1})"), /use db\.runCommand/);
+  assert.match(describeMongoCommandParseFailure("show collections"), /listed in the sidebar/);
+
+  // Leading comments do not hide the command shape.
+  assert.match(describeMongoCommandParseFailure("// note\ndb.c.bulkWrite([])"), /bulkWrite\(\) is not supported/);
 });
 
 test("describeMongoCommandParseFailure reports unclosed delimiters and shell hints", () => {

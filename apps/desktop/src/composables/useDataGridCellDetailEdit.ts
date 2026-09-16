@@ -1,5 +1,5 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from "vue";
-import { cellDetailEditorText, canFormatCellDetailJson, compactJsonText, formatJsonText, looksLikeJsonContainerText, valueEditorActions, type CellDetailTab } from "@/lib/dataGrid/cellDetailPresentation";
+import { canFormatCellDetailJson, compactJsonText, formatJsonText, looksLikeJsonContainerText, valueEditorActions, type CellDetailTab } from "@/lib/dataGrid/cellDetailPresentation";
 import type { DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 import { dataGridCellEditorText } from "@/lib/dataGrid/dataGridCellCoercion";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
@@ -19,6 +19,9 @@ export interface UseDataGridCellDetailEditOptions {
   databaseType: ComputedRef<DatabaseType | undefined>;
   resultRows: ComputedRef<readonly (readonly CellValue[])[]>;
   getColumnInfo: (columnIndex: number) => ColumnInfo | Pick<ColumnInfo, "data_type"> | undefined;
+  cellEditorText?: (value: CellValue, columnIndex: number) => string;
+  normalizeEditorInput?: (value: string, columnIndex: number) => string;
+  nullValue?: (columnIndex: number) => string | null;
   getRowItem: (rowId: number) => DetailEditRowItem | undefined;
   hydrateLargeValueCell: (rowId: number, columnIndex: number) => Promise<boolean>;
   applyCellValue: (rowId: number, columnIndex: number, value: string | null) => void;
@@ -36,6 +39,7 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
   const detailValueDiffSnapshot = ref<Readonly<JsonValueDiffSnapshot> | null>(null);
   let allowActiveCellDetailResync = false;
   let lastSyncedDetailCellKey: string | null = null;
+  let detailEditGeneration = 0;
 
   const hasPendingDetailEditorDraft = computed(() => isEditingDetail.value && detailEditValue.value !== detailEditOriginalValue.value);
   const detailJsonDiffContext = computed<JsonValueDiffContext | null>(() => {
@@ -63,6 +67,7 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
   });
 
   function editorText(value: CellValue, columnIndex: number): string {
+    if (options.cellEditorText) return options.cellEditorText(value, columnIndex);
     return dataGridCellEditorText({
       value,
       databaseType: options.databaseType.value,
@@ -76,6 +81,7 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
   }
 
   function resetDetailEdit() {
+    detailEditGeneration += 1;
     isEditingDetail.value = false;
     detailEditValue.value = "";
     detailEditOriginalValue.value = "";
@@ -112,16 +118,19 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     isEditingDetail.value = true;
   });
 
-  async function startDetailEdit() {
+  async function startDetailEdit(generation = detailEditGeneration) {
     const initialDetail = options.activeDetail.value;
     if (!initialDetail || !initialDetail.isEditable) return;
+    const initialCellKey = `${initialDetail.rowId}:${initialDetail.colIndex}`;
     if (!(await options.hydrateLargeValueCell(initialDetail.rowId, initialDetail.colIndex))) return;
+    if (generation !== detailEditGeneration) return;
     const detail = options.activeDetail.value;
-    if (!detail || !detail.isEditable) return;
+    if (!detail || !detail.isEditable || `${detail.rowId}:${detail.colIndex}` !== initialCellKey) return;
     options.warnFormattedJsonEdit(detail);
     const value = activeDetailEditorText(detail);
     detailEditValue.value = value;
     detailEditOriginalValue.value = value;
+    syncEditorFromDetailEdit();
     isEditingDetail.value = true;
   }
 
@@ -131,7 +140,8 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     isEditingDetail.value = false;
     const item = options.getRowItem(detail.rowId);
     if (!item || item.isDeleted) return;
-    options.applyCellValue(detail.rowId, detail.colIndex, detailEditValue.value);
+    const value = detailEditValue.value === detailEditOriginalValue.value && (typeof detail.value === "string" || detail.value === null) ? detail.value : (options.normalizeEditorInput?.(detailEditValue.value, detail.colIndex) ?? detailEditValue.value);
+    options.applyCellValue(detail.rowId, detail.colIndex, value);
     detailEditOriginalValue.value = detailEditValue.value;
     allowActiveCellDetailResync = true;
     options.refreshDetail();
@@ -175,8 +185,11 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
   }
 
   function setValueEditorNull() {
+    const detail = options.activeDetail.value;
+    if (!detail || !detail.isEditable) return;
+    const value = options.nullValue?.(detail.colIndex) ?? null;
     setDetailNull();
-    detailEditValue.value = cellDetailEditorText(null);
+    detailEditValue.value = editorText(value, detail.colIndex);
     detailEditOriginalValue.value = detailEditValue.value;
     syncEditorFromDetailEdit();
     isEditingDetail.value = options.activeTab.value === "valueEditor";
@@ -211,7 +224,7 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     if (!detail || !detail.isEditable) return;
     const item = options.getRowItem(detail.rowId);
     if (!item || item.isDeleted) return;
-    options.applyCellValue(detail.rowId, detail.colIndex, null);
+    options.applyCellValue(detail.rowId, detail.colIndex, options.nullValue?.(detail.colIndex) ?? null);
     resetDetailEdit();
     options.refreshDetail();
   }

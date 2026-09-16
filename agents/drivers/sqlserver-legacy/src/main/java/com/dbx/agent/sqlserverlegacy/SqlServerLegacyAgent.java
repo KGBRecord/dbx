@@ -72,6 +72,15 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
     }
 
     @Override
+    public boolean supportsConnectionPooling() {
+        // The mssql-jdbc -> jTDS fallback is session state on this Agent
+        // instance. A shared JDBC pool could hand a jTDS connection to another
+        // session that still believes it is using mssql-jdbc, and SQL Server
+        // 2000 is particularly prone to resetting those reused connections.
+        return false;
+    }
+
+    @Override
     protected String buildJdbcUrl(ConnectParams params) {
         return sqlServer2000Mode ? jtdsUrl(params) : legacyTlsUrl(params);
     }
@@ -320,12 +329,138 @@ public final class SqlServerLegacyAgent extends ConfiguredJdbcAgent {
 
     @Override
     public List<ColumnInfo> getColumns(String schema, String table) {
-        return super.getColumns(metadataSchema(schema, table), table);
+        String resolvedSchema = metadataSchema(schema, table);
+        List<ColumnInfo> columns = super.getColumns(resolvedSchema, table);
+        if (!sqlServer2000Mode || columns.isEmpty()) {
+            return columns;
+        }
+        try {
+            return mergeSqlServer2000ColumnComments(
+                columns,
+                readSqlServer2000ColumnComments(resolvedSchema, table)
+            );
+        } catch (SQLException | RuntimeException error) {
+            // Comments are optional metadata. Keep the table usable when the
+            // legacy catalog is unavailable or the account cannot read it.
+            // Legacy drivers can also throw runtime errors from their catalog
+            // code, mirroring the RuntimeException guards in getTableDdl.
+            System.err.println(
+                "[sqlserver-legacy] SQL Server 2000 column comments unavailable: "
+                    + error.getClass().getName()
+                    + ": "
+                    + error.getMessage()
+            );
+            return columns;
+        }
+    }
+
+    private Map<String, String> readSqlServer2000ColumnComments(String schema, String table) throws SQLException {
+        try {
+            return readColumnCommentsFromQuery(sqlServer2000ColumnCommentsSql(), schema, table);
+        } catch (SQLException error) {
+            System.err.println(
+                "[sqlserver-legacy] SQL Server 2000 direct column comments query failed; trying compatibility function: "
+                    + error.getMessage()
+            );
+            return readColumnCommentsFromQuery(sqlServer2000ColumnCommentsFunctionSql(), schema, table);
+        }
+    }
+
+    private Map<String, String> readColumnCommentsFromQuery(String sql, String schema, String table) throws SQLException {
+        Map<String, String> comments = new LinkedHashMap<>();
+        try (PreparedStatement statement = requireConnection().prepareStatement(sql)) {
+            statement.setString(1, schema);
+            statement.setString(2, table);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    String column = resultSet.getString("column_name");
+                    String comment = resultSet.getString("column_comment");
+                    if (column != null && comment != null && !comment.trim().isEmpty()) {
+                        String key = column.trim().toLowerCase(Locale.ROOT);
+                        String property = resultSet.getString("property_name");
+                        if (!comments.containsKey(key) || "MS_Description".equalsIgnoreCase(property)) {
+                            comments.put(key, comment);
+                        }
+                    }
+                }
+            }
+        }
+        return comments;
+    }
+
+    static List<ColumnInfo> mergeSqlServer2000ColumnComments(
+        List<ColumnInfo> columns,
+        Map<String, String> comments
+    ) {
+        if (comments.isEmpty()) {
+            return columns;
+        }
+        Map<String, String> normalizedComments = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : comments.entrySet()) {
+            if (entry.getKey() != null) {
+                normalizedComments.put(entry.getKey().trim().toLowerCase(Locale.ROOT), entry.getValue());
+            }
+        }
+        for (ColumnInfo column : columns) {
+            String comment = normalizedComments.get(column.getName().trim().toLowerCase(Locale.ROOT));
+            if (comment != null) {
+                column.setComment(comment);
+            }
+        }
+        return columns;
+    }
+
+    static String sqlServer2000ColumnCommentsSql() {
+        return "SELECT c.name AS column_name, p.value AS column_comment, p.name AS property_name "
+            + "FROM sysobjects o JOIN sysusers u ON o.uid = u.uid "
+            + "JOIN syscolumns c ON c.id = o.id "
+            + "LEFT OUTER JOIN sysproperties p ON p.id = o.id AND p.smallid = c.colid "
+            + "WHERE u.name = ? AND o.name = ? AND o.xtype IN ('U', 'V') "
+            + "AND p.value IS NOT NULL "
+            + "ORDER BY c.colid, CASE WHEN p.name = 'MS_Description' THEN 0 ELSE 1 END";
+    }
+
+    static String sqlServer2000ColumnCommentsFunctionSql() {
+        return "SELECT objname AS column_name, CONVERT(nvarchar(4000), value) AS column_comment, "
+            + "'MS_Description' AS property_name "
+            + "FROM ::fn_listextendedproperty('MS_Description', 'user', ?, 'table', ?, 'column', default)";
     }
 
     @Override
     public List<IndexInfo> listIndexes(String schema, String table) {
-        return super.listIndexes(metadataSchema(schema, table), table);
+        String resolvedSchema = metadataSchema(schema, table);
+        List<IndexInfo> indexes = super.listIndexes(resolvedSchema, table);
+        return markPrimaryKeyIndex(indexes, resolvedSchema, table);
+    }
+
+    // SQL Server names a primary-key index after its constraint (PK__<table>__<hex>
+    // or a user-chosen name), so the shared JDBC metadata layer's "PRIMARY"
+    // index-name convention never matches and is_primary stayed false. Resolve
+    // the flag from DatabaseMetaData.getPrimaryKeys() PK_NAME instead, so table
+    // cloning, the index tree badge, and DDL output see the real primary key.
+    private List<IndexInfo> markPrimaryKeyIndex(List<IndexInfo> indexes, String schema, String table) {
+        if (indexes.isEmpty()) {
+            return indexes;
+        }
+        try {
+            String primaryKeyName = null;
+            try (java.sql.ResultSet rs = requireConnection().getMetaData().getPrimaryKeys(null, schema, table)) {
+                if (rs.next()) {
+                    primaryKeyName = rs.getString("PK_NAME");
+                }
+            }
+            if (primaryKeyName == null || primaryKeyName.trim().isEmpty()) {
+                return indexes;
+            }
+            for (IndexInfo index : indexes) {
+                if (primaryKeyName.equals(index.getName())) {
+                    index.setIs_primary(true);
+                }
+            }
+        } catch (Exception ignored) {
+            // Fail soft: keep the metadata-layer flags when primary-key lookup is unavailable.
+        }
+        return indexes;
     }
 
     @Override

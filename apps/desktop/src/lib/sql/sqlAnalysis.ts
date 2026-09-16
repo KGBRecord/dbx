@@ -232,7 +232,7 @@ export function analyzeEditableQueryEditability(sql: string): QueryEditability {
   if (hasTopLevelKeyword(normalized, ["UNION", "INTERSECT", "EXCEPT", "MINUS"])) {
     return { editable: false, reason: "set-operation" };
   }
-  if (normalized.includes(";")) return { editable: false, reason: "complex-source" };
+  if (hasTopLevelSemicolon(normalized)) return { editable: false, reason: "complex-source" };
 
   const fromIndex = findTopLevelKeyword(normalized, "FROM", 0);
   if (fromIndex < 0) return { editable: false, reason: "no-table" };
@@ -313,7 +313,7 @@ export function analyzeSelectStructureForDisplay(sql: string): EditableQueryInfo
   if (/^\s*WITH\b/i.test(normalized)) return null;
   if (!/^SELECT\b/i.test(normalized)) return null;
   if (hasTopLevelKeyword(normalized, ["UNION", "INTERSECT", "EXCEPT", "MINUS"])) return null;
-  if (normalized.includes(";")) return null;
+  if (hasTopLevelSemicolon(normalized)) return null;
 
   const fromIndex = findTopLevelKeyword(normalized, "FROM", 0);
   if (fromIndex < 0) return null;
@@ -761,6 +761,36 @@ function hasTopLevelKeyword(sql: string, keywords: string[]): boolean {
   return keywords.some((keyword) => findTopLevelKeyword(sql, keyword, 0) >= 0);
 }
 
+function hasTopLevelSemicolon(sql: string): boolean {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (quote) {
+      if (ch === quote || (quote === "]" && ch === "]")) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "[") {
+      quote = "]";
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth === 0 && ch === ";") return true;
+  }
+  return false;
+}
+
 function firstTopLevelKeywordIndex(sql: string, keywords: string[], start: number): number {
   const indexes = keywords.map((keyword) => findTopLevelKeyword(sql, keyword, start)).filter((index) => index >= 0);
   return indexes.length ? Math.min(...indexes) : -1;
@@ -831,10 +861,32 @@ export function allPrimaryKeysPresent(primaryKeys: string[], resultColumns: stri
   return primaryKeys.every((pk) => colSet.has(pk));
 }
 
-function matchColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[]): EditableQueryColumn[] | undefined {
+const SYNTHETIC_RESULT_ROW_NUMBER_LABELS = new Set(["__dbx_row_num", "dbx_rn"]);
+
+function isOracleFamilyDatabase(databaseType?: DatabaseType | string): boolean {
+  return !!databaseType && ORACLE_FOLDED_IDENTIFIER_TYPES.has(databaseType);
+}
+
+function isTrailingPaginationResultLabel(label: string, analysisResultNames: Set<string>): boolean {
+  const normalized = label.toLowerCase();
+  if (SYNTHETIC_RESULT_ROW_NUMBER_LABELS.has(normalized)) return true;
+  return normalized === "rownum" && !analysisResultNames.has("rownum");
+}
+
+function resultPrefixLengthForEditMatching(analysis: EditableQueryInfo, resultColumns: string[]): number {
+  const analysisNames = new Set(analysis.columns.map((column) => column.resultName.toLowerCase()));
+  let end = resultColumns.length;
+  while (end > analysis.columns.length) {
+    if (!isTrailingPaginationResultLabel(resultColumns[end - 1]!, analysisNames)) break;
+    end -= 1;
+  }
+  return end;
+}
+
+function matchResultPrefixByLabel(analysis: EditableQueryInfo, prefix: string[]): EditableQueryColumn[] | undefined {
   const matches: EditableQueryColumn[] = [];
   let searchFrom = 0;
-  for (const resultColumn of resultColumns) {
+  for (const resultColumn of prefix) {
     let matchIndex = analysis.columns.findIndex((column, index) => index >= searchFrom && column.resultName === resultColumn);
     if (matchIndex < 0) {
       const normalized = resultColumn.toLowerCase();
@@ -848,17 +900,40 @@ function matchColumnsForResult(analysis: EditableQueryInfo, resultColumns: strin
   return matches;
 }
 
-export function allEditableColumnsWriteable(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string): boolean {
+function isRownumLabelSubstitution(resultLabel: string, column: EditableQueryColumn): boolean {
+  if (resultLabel.toLowerCase() !== "rownum") return false;
+  return column.resultName.toLowerCase() !== "rownum" && column.sourceName?.toLowerCase() !== "rownum";
+}
+
+function padMatchedColumnsToResultLength(matches: Array<EditableQueryColumn | undefined>, resultColumnCount: number): Array<EditableQueryColumn | undefined> {
+  if (matches.length === resultColumnCount) return matches;
+  return [...matches, ...Array.from({ length: resultColumnCount - matches.length }, () => undefined)];
+}
+
+function matchColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[], databaseType?: DatabaseType | string): Array<EditableQueryColumn | undefined> | undefined {
+  const prefixLength = resultPrefixLengthForEditMatching(analysis, resultColumns);
+  const prefix = resultColumns.slice(0, prefixLength);
+  const labeled = matchResultPrefixByLabel(analysis, prefix);
+  if (labeled) return padMatchedColumnsToResultLength(labeled, resultColumns.length);
+
+  if (prefix.length !== analysis.columns.length || !isOracleFamilyDatabase(databaseType)) return undefined;
+
+  const ordinal = analysis.columns.map((column, index) => (isRownumLabelSubstitution(prefix[index]!, column) ? undefined : column));
+  return padMatchedColumnsToResultLength(ordinal, resultColumns.length);
+}
+
+export function allEditableColumnsWriteable(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string, databaseType?: DatabaseType | string): boolean {
   if (analysis.selectStar) return true;
-  const matchedColumns = matchColumnsForResult(analysis, resultColumns);
-  return !!matchedColumns && matchedColumns.every((source) => !sourceKey || !source.sourceName || source.sourceKey === sourceKey);
+  const matchedColumns = matchColumnsForResult(analysis, resultColumns, databaseType);
+  return !!matchedColumns && matchedColumns.every((source) => !source || !sourceKey || !source.sourceName || source.sourceKey === sourceKey);
 }
 
 export function sourceColumnsForResult(analysis: EditableQueryInfo, resultColumns: string[], sourceKey?: string, databaseType?: DatabaseType, primaryKeys?: readonly string[]): Array<string | undefined> | undefined {
   if (analysis.selectStar) return undefined;
-  const matchedColumns = matchColumnsForResult(analysis, resultColumns);
+  const matchedColumns = matchColumnsForResult(analysis, resultColumns, databaseType);
   if (!matchedColumns) return undefined;
   return matchedColumns.map((column) => {
+    if (!column) return undefined;
     if (sourceKey && column.sourceKey !== sourceKey) return undefined;
     if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID" && column.sourceKey === sourceKey) {
       return primaryKeys?.length === 1 && primaryKeys[0] === DBX_ROWID_COLUMN ? DBX_ROWID_COLUMN : undefined;

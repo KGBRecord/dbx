@@ -515,7 +515,9 @@ test("hydrating saved SQL content preserves its restored runtime target", async 
     store.createTab("current-connection", "runtime_database", "current.sql", "query", "runtime_schema");
     const tabId = store.openSavedSql(file);
     const tab = store.tabs.find((item) => item.id === tabId)!;
+    // Clean restored tabs omit both fields until their saved file is hydrated.
     tab.sql = "";
+    tab.originalSql = undefined;
 
     await store.hydrateSavedSqlTabs();
 
@@ -1684,7 +1686,10 @@ test("result run pin and close state persist across a restart", async () => {
     store = useQueryStore();
     await store.initOpenTabs();
     const restored = store.tabs.find((item) => item.id === tabId);
-    assert.deepEqual(restored?.resultRuns?.map((run) => run.id), ["run-1"]);
+    assert.deepEqual(
+      restored?.resultRuns?.map((run) => run.id),
+      ["run-1"],
+    );
     assert.equal(restored?.resultRuns?.[0]?.pinned, true);
   } finally {
     restoreStorage();
@@ -1730,7 +1735,10 @@ test("bulk result-run close leaves all runs untouched when the selected run is u
   assert.equal(await store.closeOtherResultRuns(tabId, "run-2"), false);
   assert.equal(await store.closeResultRunsToLeft(tabId, "run-2"), false);
   assert.equal(await store.closeResultRunsToRight(tabId, "run-2"), false);
-  assert.deepEqual(tab.resultRuns?.map((run) => run.id), ["run-1", "run-2", "run-3"]);
+  assert.deepEqual(
+    tab.resultRuns?.map((run) => run.id),
+    ["run-1", "run-2", "run-3"],
+  );
   assert.equal(tab.activeResultRunId, "run-1");
   assert.deepEqual(tab.result?.rows, [[1]]);
 });
@@ -1785,10 +1793,7 @@ test("bulk result-run close does not rewrite a deleted session-backed snapshot",
       resultSessionId: "session-1",
       resultCacheKey: "tab:tab-1:run:run-1",
     };
-    tab.resultRuns = [
-      removedRun,
-      { id: "run-2", title: "Run 2", sequence: 2, sql: "select 2", createdAt: 2, result: { columns: ["two"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 } },
-    ];
+    tab.resultRuns = [removedRun, { id: "run-2", title: "Run 2", sequence: 2, sql: "select 2", createdAt: 2, result: { columns: ["two"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 } }];
     tab.activeResultRunId = removedRun.id;
     tab.result = removedRun.result;
     tab.resultSessionId = removedRun.resultSessionId;
@@ -1887,7 +1892,10 @@ test("closing a tab releases result payloads retained by deactivated grids", () 
 
   store.closeTab(tabId, { force: true });
 
-  assert.equal(store.tabs.some((item) => item.id === tabId), false);
+  assert.equal(
+    store.tabs.some((item) => item.id === tabId),
+    false,
+  );
   assert.deepEqual(retainedResult.columns, []);
   assert.deepEqual(retainedResult.rows, []);
   assert.equal(retainedResult.mongo_documents, undefined);
@@ -2179,10 +2187,12 @@ test("auto-saved result stays visible until the next run is ready", async () => 
     assert.deepEqual(tab.result?.columns, ["run_1"]);
     assert.deepEqual(tab.resultRuns?.[0]?.result?.rows, [[1]]);
 
-    resolveSecondExecution?.(new Response(JSON.stringify([{ columns: ["run_2"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    resolveSecondExecution?.(
+      new Response(JSON.stringify([{ columns: ["run_2"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
     await execution;
 
     assert.equal(tab.resultRuns?.length, 2);
@@ -7563,15 +7573,19 @@ test("Spark query execution applies the selected database as schema context", as
   }
 });
 
-test("Kingbase query execution sends the selected schema context", async () => {
+test.each([
+  { label: "PostgreSQL", connection: conn("postgres-1"), connectionId: "postgres-1" },
+  { label: "GaussDB", connection: clearableQuerySchemaConn("gaussdb-1", "gaussdb"), connectionId: "gaussdb-1" },
+  { label: "Kingbase", connection: kingbaseConn("kingbase-1"), connectionId: "kingbase-1" },
+])("$label query execution sends the selected schema context", async ({ connection, connectionId }) => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
 
-  connectionStore.addEphemeralConnection(kingbaseConn("kingbase-1"));
-  const tabId = store.createTab("kingbase-1", "qinzhou", "Query", "query", "sdy_smartsite");
+  connectionStore.addEphemeralConnection(connection);
+  const tabId = store.createTab(connectionId, "qinzhou", "Query", "query", "sdy_smartsite");
   let executeBody: any;
 
   globalThis.fetch = withConnectionHealthMock(async (input, init) => {
@@ -8572,7 +8586,16 @@ for (const paginationMode of [
     const tab = store.tabs.find((item) => item.id === tabId);
     assert.ok(tab);
 
-    globalThis.fetch = withConnectionHealthMock(async (input) => {
+    let executeMultiCalls = 0;
+    const sessionPageBodies: Array<string | undefined> = [];
+    const agentSessionPages = paginationMode.useAgentResultSession
+      ? [
+          { rows: Array.from({ length: 100 }, (_, index) => [index + 1]), has_more: true, session_id: "sess-1" },
+          { rows: Array.from({ length: 100 }, (_, index) => [index + 101]), has_more: true, session_id: "sess-1" },
+          { rows: Array.from({ length: 37 }, (_, index) => [index + 201]), has_more: false, session_id: "sess-1" },
+        ]
+      : [];
+    globalThis.fetch = withConnectionHealthMock(async (input, init) => {
       const url = String(input);
       if (url === "/api/query/prepare-pagination-plan") {
         return new Response(
@@ -8587,14 +8610,26 @@ for (const paginationMode of [
         );
       }
       if (url === "/api/query/execute-multi") {
+        const pageIndex = executeMultiCalls;
+        let resultSessionId: string | undefined;
+        try {
+          const rawBody = input instanceof Request ? await input.clone().text() : init?.body;
+          resultSessionId = typeof rawBody === "string" ? JSON.parse(rawBody)?.resultSessionId : undefined;
+        } catch {
+          resultSessionId = undefined;
+        }
+        sessionPageBodies.push(resultSessionId);
+        executeMultiCalls += 1;
+        const page = paginationMode.useAgentResultSession ? agentSessionPages[pageIndex] : undefined;
         return new Response(
           JSON.stringify([
             {
               columns: ["id"],
-              rows: Array.from({ length: 37 }, (_, index) => [index + 201]),
+              rows: page ? page.rows : Array.from({ length: 37 }, (_, index) => [index + 201]),
               affected_rows: 0,
               execution_time_ms: 1,
               ...paginationMode.result,
+              ...(page ? { has_more: page.has_more, session_id: page.session_id } : {}),
             },
           ]),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -8619,6 +8654,18 @@ for (const paginationMode of [
       assert.equal(tab.resultTotalRowCount, 237);
       assert.equal(tab.resultTotalRowCountLoading, false);
       assert.equal(countRequests, 0);
+      assert.equal(tab.result?.rows.length, 37);
+      assert.equal(tab.result?.rows[0]?.[0], 201);
+      assert.equal(tab.result?.rows[36]?.[0], 237);
+      if (paginationMode.useAgentResultSession) {
+        // The offset jump consumed the cursor session page by page (#8993).
+        assert.equal(executeMultiCalls, 3);
+        assert.equal(sessionPageBodies[0], undefined);
+        assert.equal(sessionPageBodies[1], "sess-1");
+        assert.equal(sessionPageBodies[2], "sess-1");
+      } else {
+        assert.equal(executeMultiCalls, 1);
+      }
     } finally {
       globalThis.fetch = originalFetch;
       restoreStorage();

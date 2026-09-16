@@ -129,7 +129,15 @@ pub fn build_query_pagination_execution_plan(
     // standard LIMIT/OFFSET dialects (MySQL, Postgres, etc.) since they use
     // different clause syntax.
     let exact_query_row_bound = match pagination_strategy(options.database_type, PaginationContext::UserQuery) {
-        TablePaginationStrategy::SqlServerTop => top_level_top_row_count(&options.query_base_sql),
+        TablePaginationStrategy::SqlServerTop => {
+            // TOP bounds input rows, while FOR JSON/XML emit chunked output
+            // rows — a TOP bound would misreport the result total.
+            if has_top_level_for_output_clause(&options.query_base_sql) {
+                None
+            } else {
+                top_level_top_row_count(&options.query_base_sql)
+            }
+        }
         TablePaginationStrategy::LimitOffset => top_level_limit_row_count(&options.query_base_sql),
         _ => None,
     };
@@ -201,6 +209,19 @@ pub fn build_query_pagination_execution_plan(
         plan.page_sql = paginated.sql;
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
+        if options.use_agent_cursor
+            && matches!(
+                pagination_strategy(options.database_type, PaginationContext::UserQuery),
+                TablePaginationStrategy::AgentMaxRows | TablePaginationStrategy::Unbounded
+            )
+        {
+            // The dialect cannot rewrite the statement with server-side
+            // pagination (Oracle user queries, generic JDBC), so the page
+            // metadata alone cannot reach a non-zero offset. Keep the Agent
+            // result session enabled and let the client consume through to
+            // the requested offset (#8993).
+            plan.use_agent_result_session = true;
+        }
     } else if can_use_first_page_cursor && options.database_type != Some(DatabaseType::Highgo) {
         // Kingbase JDBC may buffer an entire result in auto-commit mode, so use
         // LIMIT/OFFSET whenever the statement can be rewritten safely. Keep the
@@ -345,6 +366,19 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
     } else {
         quote_table_identifier(options.database_type, "dbx_count")
     };
+    if options.database_type == Some(DatabaseType::Hive) && starts_with_cte(&statement) {
+        if let Some(main_query_start) = top_level_sql_tokens(&statement)
+            .into_iter()
+            .find(|token| matches!(token.text.as_str(), "SELECT" | "FROM"))
+            .map(|token| token.start)
+        {
+            let (with_clause, main_query) = statement.split_at(main_query_start);
+            return ok(format!(
+                "{execution_hint}{with_clause}{}",
+                derived_table_sql("SELECT COUNT(*) AS dbx_total_rows FROM", main_query, &format!("{alias};"))
+            ));
+        }
+    }
     let wrapped_sql = match options.database_type {
         Some(DatabaseType::Iris) => iris_statement_for_derived_table(&statement),
         _ => statement,
@@ -620,6 +654,11 @@ fn has_top_level_select_into(sql: &str) -> bool {
 }
 
 fn add_sql_server_offset_fetch(statement: &str, limit: usize, offset: usize) -> Option<String> {
+    // FOR JSON/XML produces an unnamed result value and cannot be projected
+    // from a derived table used by DBX pagination.
+    if has_top_level_for_output_clause(statement) {
+        return None;
+    }
     // 用户已写 OFFSET/FETCH 时必须原样保留，不能再注入 TOP（两者同块会被 SQL Server 拒绝）。
     // 词法检测与 AST 检测任一命中即视为已有分页：词法扫描器在 # 临时表、
     // 反斜杠字符串等场景会漏检，AST 检测负责把这些情况补上。
@@ -1432,6 +1471,11 @@ fn mysql_projection_item_is_row_preserving(item: &SelectItem) -> bool {
 }
 
 fn sql_server_count_sql(statement: &str) -> Option<String> {
+    // FOR JSON/XML produces an unnamed result value that cannot be projected
+    // from the derived table used by the count wrapper.
+    if has_top_level_for_output_clause(statement) {
+        return None;
+    }
     let dialect = MsSqlDialect {};
     let mut statements = Parser::parse_sql(&dialect, statement).ok()?;
     let derived_table_projection_safe = {
@@ -1541,7 +1585,7 @@ fn strip_sql_server_select_modifier<'a>(rest: &'a str, modifier: &str) -> Option
 }
 
 fn sql_server_statement_for_derived_table(statement: &str) -> String {
-    if has_top_level_select_top(statement) || has_top_level_for_xml(statement) {
+    if has_top_level_select_top(statement) || has_top_level_for_output_clause(statement) {
         return statement.to_string();
     }
     statement_for_order_insensitive_derived_table(statement)
@@ -2136,12 +2180,11 @@ fn top_level_select_tokens_before_from(sql: &str) -> Vec<SqlToken> {
     tokens[select_index + 1..from_index].to_vec()
 }
 
-fn has_top_level_for_xml(sql: &str) -> bool {
+fn has_top_level_for_output_clause(sql: &str) -> bool {
     let tokens = top_level_sql_tokens(sql);
-    tokens
-        .iter()
-        .enumerate()
-        .any(|(index, token)| token.text == "FOR" && tokens.get(index + 1).is_some_and(|next| next.text == "XML"))
+    tokens.iter().enumerate().any(|(index, token)| {
+        token.text == "FOR" && tokens.get(index + 1).is_some_and(|next| next.text == "XML" || next.text == "JSON")
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2940,6 +2983,79 @@ mod tests {
         assert_eq!(plan.page_sql, Some(plan.sql_to_execute.clone()));
         assert_eq!(plan.page_limit, Some(100));
         assert_eq!(plan.page_offset, Some(100));
+        assert!(plan.count_sql.is_some());
+    }
+
+    #[test]
+    fn sqlserver_json_output_executes_original_sql_without_wrappers() {
+        let sql = "SELECT TOP 10 * FROM [sales].[orders_10k] FOR JSON AUTO".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql.clone(),
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.count_sql.is_none());
+        assert_eq!(plan.page_limit, None);
+        assert_eq!(plan.page_offset, None);
+        assert_eq!(plan.exact_query_row_bound, None);
+        assert!(!plan.single_execution);
+        assert_eq!(
+            build_paginated_query_sql(PaginatedQuerySqlOptions {
+                original_sql: "SELECT TOP 10 * FROM [sales].[orders_10k] FOR JSON AUTO".to_string(),
+                database_type: Some(DatabaseType::SqlServer),
+                limit: 100,
+                offset: 0,
+            }),
+            err("unsupported")
+        );
+        assert_eq!(
+            build_count_query_sql(CountQuerySqlOptions {
+                original_sql: sql,
+                database_type: Some(DatabaseType::SqlServer),
+            }),
+            err("unsupported")
+        );
+    }
+
+    #[test]
+    fn sqlserver_json_output_without_top_also_skips_wrappers() {
+        let sql = "SELECT id, name FROM users FOR JSON PATH".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql.clone(),
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert!(plan.count_sql.is_none());
+        assert_eq!(plan.exact_query_row_bound, None);
+    }
+
+    #[test]
+    fn sqlserver_nested_json_output_in_subquery_still_paginates() {
+        // FOR JSON nested inside a scalar subquery is not a top-level output
+        // clause; the outer query is a normal projection and paginates.
+        let sql = "SELECT id, (SELECT name FROM tags FOR JSON PATH) AS tags FROM users".to_string();
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.clone(),
+            query_base_sql: sql,
+            database_type: Some(DatabaseType::SqlServer),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert!(plan.page_sql.is_some());
         assert!(plan.count_sql.is_some());
     }
 
@@ -4101,6 +4217,32 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn hive_count_keeps_cte_outside_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH cte AS (SELECT 1 AS id) SELECT * FROM cte".to_string(),
+            database_type: Some(DatabaseType::Hive),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH cte AS (SELECT 1 AS id) SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM cte) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn hive_count_keeps_from_style_query_inside_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH cte AS (SELECT 1 AS id) FROM cte SELECT *".to_string(),
+            database_type: Some(DatabaseType::Hive),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH cte AS (SELECT 1 AS id) SELECT COUNT(*) AS dbx_total_rows FROM (FROM cte SELECT *) `dbx_count`;"
+        );
+    }
+
+    #[test]
     fn mysql_count_rewrites_ambiguous_join_projection() {
         for sql in [
             "SELECT a.*, b.* FROM a JOIN b ON b.a_id = a.id ORDER BY b.id",
@@ -4475,6 +4617,55 @@ WHERE u.id = picked.id;
         assert_eq!(plan.page_offset, Some(0));
         assert!(plan.page_sql.is_none());
         assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn oracle_offset_jump_keeps_agent_result_session() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Oracle),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        // Oracle user queries are Unbounded: the SQL stays unchanged, so the
+        // client must consume the agent result session through to the offset.
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM events;");
+        assert_eq!(plan.page_limit, Some(100));
+        assert_eq!(plan.page_offset, Some(200));
+        assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn jdbc_offset_jump_keeps_agent_result_session() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Jdbc),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert!(plan.use_agent_result_session);
+        assert_eq!(plan.page_offset, Some(200));
+    }
+
+    #[test]
+    fn rewritten_offset_jump_does_not_use_agent_result_session() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Postgres),
+            pagination: QueryPagination { limit: 100, offset: 200, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert!(plan.sql_to_execute.contains("LIMIT"));
+        assert!(!plan.use_agent_result_session);
     }
 
     #[test]

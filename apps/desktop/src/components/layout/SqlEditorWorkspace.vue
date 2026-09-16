@@ -26,13 +26,15 @@ const props = defineProps<
     tabBarCollapsed?: boolean;
     canDetachTabs?: boolean;
     detachedDropTarget?: boolean;
+    /** Render only the groups' tab strips (a plugin workbench tab owns the layout). */
+    contentSuppressed?: boolean;
   }
 >();
 const emit = defineEmits<
   ContentAreaSurfaceEmits & {
     "locate-tab": [tab: QueryTab];
     "toggle-zen-mode": [];
-    "start-resize": [event: MouseEvent];
+    "start-resize": [event: PointerEvent];
     "toggle-collapse": [];
     "detach-tab": [tab: QueryTab];
   }
@@ -64,10 +66,10 @@ defineExpose({
     // A data-mode cell-detail dialog is portaled to body too but belongs to
     // the group's grid — indistinguishable in the DOM, hence the gate.
     if (element?.closest("[data-shared-result-surface]") || (showSharedResult.value && element?.closest("[data-cell-detail-editor-root]"))) {
-      return resultSurfaceRef.value?.focusSearch() ?? false;
+      return resultSurfaceRef.value?.focusSearch(element) ?? false;
     }
     const group = groupForElement(element) ?? activeEditorGroup();
-    return group?.focusSearch() ?? false;
+    return group?.focusSearch(element) ?? false;
   },
   openGoToColumn: () => activeEditorGroup()?.openGoToColumn() ?? false,
   refreshData: (target: Element | null = null) => {
@@ -92,9 +94,9 @@ defineExpose({
     const group = groupForElement(target) ?? activeEditorGroup();
     return group?.handleModRTarget(target) ?? false;
   },
-  requestQueryEditorExecute: () => activeEditorGroup()?.requestQueryEditorExecute() ?? false,
-  captureQueryEditorExecutionSnapshot: () => activeEditorGroup()?.captureQueryEditorExecutionSnapshot(),
-  requestQueryEditorExecuteInNewResultTab: () => activeEditorGroup()?.requestQueryEditorExecuteInNewResultTab() ?? false,
+  requestQueryEditorExecute: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecute() ?? false,
+  captureQueryEditorExecutionSnapshot: (tabId?: string) => editorGroupForTab(tabId)?.captureQueryEditorExecutionSnapshot(),
+  requestQueryEditorExecuteInNewResultTab: (tabId?: string) => editorGroupForTab(tabId)?.requestQueryEditorExecuteInNewResultTab() ?? false,
   requestQueryEditorPreviewChanges: (stackSql?: string) => activeEditorGroup()?.requestQueryEditorPreviewChanges(stackSql) ?? false,
   shouldBlockQueryEditorExecutionShortcut: (event: KeyboardEvent) => activeEditorGroup()?.shouldBlockQueryEditorExecutionShortcut(event) ?? false,
   cancelQueryEditorExecutionViewport: (requestId: number) => activeEditorGroup()?.cancelQueryEditorExecutionViewport(requestId) ?? false,
@@ -112,18 +114,20 @@ const { t } = useI18n();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const isVerticalTabLayout = computed(() => settingsStore.editorSettings.tabPlacement === "left" || settingsStore.editorSettings.tabPlacement === "right");
+const verticalTabsWithSuppressedContent = computed(() => props.contentSuppressed && isVerticalTabLayout.value);
 const globalTabBarPortal = inject(GROUP_TAB_BAR_PORTAL, null);
 const workspaceTabBarPortal = createGroupTabBarPortal(isVerticalTabLayout);
 // A special page owns navigation while active. Otherwise side tabs stay
 // outside the editor/result split, and horizontal tabs return to their group.
-provide(GROUP_TAB_BAR_PORTAL, {
+const providedPortal = {
   active: computed(() => !!globalTabBarPortal?.active.value || isVerticalTabLayout.value),
   get targets() {
     return globalTabBarPortal?.active.value ? globalTabBarPortal.targets : workspaceTabBarPortal.targets;
   },
-});
+};
+provide(GROUP_TAB_BAR_PORTAL, providedPortal);
 const tabNavigationStyle = computed(() => {
-  const width = props.tabBarCollapsed ? "3.5rem" : `${props.tabBarWidth ?? 240}px`;
+  const width = props.tabBarCollapsed ? "var(--collapsed-tab-rail-width)" : `${props.tabBarWidth ?? 240}px`;
   return { width, flex: `0 0 ${width}` };
 });
 function setTabBarTarget(groupId: string, element: unknown) {
@@ -140,7 +144,13 @@ const SHARED_RESULT_PANE_DEFAULT_SIZE = 32;
 const SHARED_RESULT_PANE_STORAGE_KEY = "dbx-shared-results-pane-size";
 const storedResultPaneSize = Number(safeLocalStorageGet(SHARED_RESULT_PANE_STORAGE_KEY));
 const resultPaneSize = ref(Number.isFinite(storedResultPaneSize) && storedResultPaneSize >= SHARED_RESULT_PANE_MIN_SIZE && storedResultPaneSize <= SHARED_RESULT_PANE_MAX_SIZE ? storedResultPaneSize : SHARED_RESULT_PANE_DEFAULT_SIZE);
-const showResultPane = ref(true);
+const showResultPane = computed({
+  get: () => activeTab.value?.uiState?.resultPaneOpen ?? true,
+  set: (open: boolean) => {
+    const tab = activeTab.value;
+    if (tab?.mode === "query") queryStore.updateTabUiState(tab.id, { resultPaneOpen: open });
+  },
+});
 const isResultPaneVisible = computed(() => hasSharedOutput.value && showResultPane.value);
 // Keep the pane mounted, but apply its target size immediately so available
 // results never wait for an expansion animation before becoming visible.
@@ -208,6 +218,11 @@ function activeEditorGroup() {
   const group = queryStore.groups.find((item) => item.id === queryStore.focusedGroupId) ?? queryStore.groups[0];
   return group ? (groupRefs.get(group.id) ?? null) : null;
 }
+function editorGroupForTab(tabId?: string): InstanceType<typeof EditorGroup> | null {
+  if (!tabId) return activeEditorGroup();
+  const group = queryStore.groups.find((item) => item.activeTabId === tabId);
+  return group ? (groupRefs.get(group.id) ?? null) : null;
+}
 function groupForElement(element: Element | null): InstanceType<typeof EditorGroup> | null {
   const groupElement = element?.closest<HTMLElement>("[data-group-id]");
   const groupId = groupElement?.dataset.groupId;
@@ -240,15 +255,54 @@ function handleFocusStatement(tabId: string, range: StatementRange | null): bool
   }
   return false;
 }
+function handleFocusErrorOffset(tabId: string, offset: number): boolean {
+  for (const group of groupRefs.values()) {
+    if (group.focusErrorPosition(tabId, offset)) {
+      return true;
+    }
+  }
+  return false;
+}
 </script>
 
 <template>
-  <div class="sql-editor-workspace relative flex h-full min-h-0 min-w-0 flex-1 overflow-hidden" :class="[workspaceClass, settingsStore.editorSettings.tabPlacement === 'right' ? 'flex-row-reverse' : 'flex-row']">
+  <div
+    class="sql-editor-workspace relative flex min-h-0 min-w-0 overflow-hidden"
+    :class="[verticalTabsWithSuppressedContent ? 'h-full flex-none' : contentSuppressed ? 'h-auto' : 'h-full flex-1', workspaceClass, settingsStore.editorSettings.tabPlacement === 'right' ? 'flex-row-reverse' : 'flex-row']"
+  >
     <div v-show="isVerticalTabLayout && showTabNavigation !== false" data-workspace-tab-navigation class="flex min-h-0 shrink-0 flex-col overflow-hidden" :style="tabNavigationStyle">
       <div v-for="group in queryStore.groups" :key="group.id" :ref="(element) => setTabBarTarget(group.id, element)" :data-workspace-tab-target="group.id" class="flex min-h-0 min-w-0 flex-1" @pointerdown.capture="queryStore.focusGroup(group.id)" @focusin="queryStore.focusGroup(group.id)" />
     </div>
-    <div data-workspace-content class="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <Splitpanes horizontal class="sql-editor-workspace-split flex-1 min-h-0" :class="{ 'result-pane-collapsed': resultPaneTargetSize === 0 }" @resized="onSharedResultResized">
+    <div data-workspace-content class="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" :class="{ hidden: verticalTabsWithSuppressedContent }">
+      <!-- Suppressed mode: a plugin workbench tab owns the layout. Render the
+           groups' tab strips directly (no Splitpanes, no shared result pane) so
+           App.vue's always-mounted plugin layer can fill the remaining column
+           while the strips stay visible and switchable. -->
+      <template v-if="contentSuppressed">
+        <EditorGroup
+          v-for="group in queryStore.groups"
+          :key="group.id"
+          :ref="(el: unknown) => setGroupRef(group.id, el)"
+          :group-id="group.id"
+          :tab-ids="group.tabIds"
+          :active-tab-id="group.activeTabId"
+          :tab-bar-width="tabBarWidth"
+          :tab-bar-collapsed="tabBarCollapsed"
+          :can-detach-tabs="canDetachTabs"
+          :detached-drop-target="detachedDropTarget"
+          :content-suppressed="true"
+          :show-tab-navigation="showTabNavigation"
+          v-bind="editorGroupBindings"
+          @focus-group="queryStore.focusGroup($event)"
+          @activate-tab="queryStore.activateTabInGroup(group.id, $event)"
+          @locate-tab="emit('locate-tab', $event)"
+          @toggle-zen-mode="emit('toggle-zen-mode')"
+          @start-resize="emit('start-resize', $event)"
+          @toggle-collapse="emit('toggle-collapse')"
+          @detach-tab="emit('detach-tab', $event)"
+        />
+      </template>
+      <Splitpanes v-else horizontal class="sql-editor-workspace-split flex-1 min-h-0" :class="{ 'result-pane-collapsed': resultPaneTargetSize === 0 }" @resized="onSharedResultResized">
         <Pane class="min-h-0 min-w-0" :size="editorPaneSize" :min-size="100 - SHARED_RESULT_PANE_MAX_SIZE">
           <Splitpanes
             :horizontal="queryStore.orientation === 'horizontal'"
@@ -300,6 +354,11 @@ function handleFocusStatement(tabId: string, range: StatementRange | null): bool
               @focus-statement="
                 (tabId: string, range: { from: number; to: number } | null) => {
                   handleFocusStatement(tabId, range);
+                }
+              "
+              @focus-error-offset="
+                (tabId: string, offset: number) => {
+                  handleFocusErrorOffset(tabId, offset);
                 }
               "
             />

@@ -76,6 +76,7 @@ pub struct AgentLoopContext {
     pub state: Arc<AppState>,
     pub connection_id: String,
     pub database: String,
+    pub selected_databases: Vec<String>,
     /// Selected schema that scopes Agent metadata and SQL execution.
     pub schema: Option<String>,
     pub db_type: DatabaseType,
@@ -151,6 +152,7 @@ pub async fn run_agent_loop(
             connection_id: agent_ctx.connection_id.clone(),
             connection_name,
             database: agent_ctx.database.clone(),
+            selected_databases: agent_ctx.selected_databases.clone(),
             schema: agent_ctx.schema.clone(),
             agent_mode: is_agent_mode,
             allow_writes: agent_ctx.sql_permissions.allow_writes,
@@ -608,6 +610,19 @@ pub async fn run_agent_loop(
             final_text.push_str(&message);
         }
         LoopExit::Interrupted(error) => {
+            // The retry layer records the HTTP-level cause; this records the
+            // agent-level exit so a failure still leaves a trace even after the
+            // user dismisses the on-screen message. Cancellation has its own arm
+            // above and never reaches here. The error is re-scrubbed here so a
+            // credential cannot reach the log file even if a provider echo slipped
+            // past the source-side redaction.
+            let error = ai::redact_secrets(&error, &ai::sensitive_values(config));
+            log::warn!(
+                "[agent] stream interrupted; provider={:?} model={} agent_mode={} error={error}",
+                config.provider,
+                config.model,
+                is_agent_mode
+            );
             let message = if final_text.trim().is_empty() {
                 format!("Agent stream stopped before completion: {error}.")
             } else {

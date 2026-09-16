@@ -27,6 +27,7 @@ import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect
 import { useToast } from "@/composables/useToast";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sql/sqlHighlighter";
 import { joinSqlStatementsForScript } from "@/lib/sql/sqlBatchScript";
+import { formatGeneratedDdlIdentifierQuotes, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
@@ -75,6 +76,11 @@ import {
   generateUniqueIndexName,
   getColumnEditorControls,
   getDataTypeOptions,
+  POSTGRES_GEOMETRY_TYPES,
+  combinePostgresGeometryType,
+  isPostgresGeometryDataType,
+  postgresGeometrySridValue,
+  postgresGeometryTypeValue,
   getDataTypeLengthUnitOptions,
   getDefaultLengthForType,
   hasExistingColumnTypeChange,
@@ -340,7 +346,9 @@ async function fetchDdl(force = false) {
   ddlLoading.value = true;
   try {
     const { ddl } = await loadObjectDdl(ddlRequest(), { force });
-    ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+    const dialect = sqlFormatDialectForDbType(databaseType.value);
+    const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
+    ddlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
     ddlFetched.value = true;
   } catch (e: any) {
     ddlContent.value = `-- Error: ${e?.message || e}`;
@@ -397,6 +405,35 @@ const constraintsLoaded = ref(false);
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
 const triggers = ref<EditableStructureTrigger[]>([]);
 const triggersLoaded = ref(false);
+// Master-detail layout: the list shows one compact row per trigger and the
+// selected trigger's editors render in the detail pane below (#8822).
+const selectedTriggerId = ref<string | null>(null);
+const selectedTrigger = computed(() => triggers.value.find((trigger) => trigger.id === selectedTriggerId.value) ?? null);
+// Inline rename state: the list row itself stays a click-to-select target;
+// the pencil button flips the name cell into an input (#8822 feedback).
+const renamingTriggerId = ref<string | null>(null);
+
+function startRenameTrigger(trigger: EditableStructureTrigger) {
+  selectedTriggerId.value = trigger.id;
+  renamingTriggerId.value = trigger.id;
+}
+watch(
+  [triggers, selectedTriggerId],
+  () => {
+    if (triggers.value.length === 0) {
+      if (selectedTriggerId.value !== null) selectedTriggerId.value = null;
+      return;
+    }
+    if (!triggers.value.some((trigger) => trigger.id === selectedTriggerId.value)) {
+      selectedTriggerId.value = triggers.value[0].id;
+    }
+  },
+  { immediate: true },
+);
+
+function selectTrigger(trigger: EditableStructureTrigger) {
+  selectedTriggerId.value = trigger.id;
+}
 const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value);
 
 function sameList(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
@@ -1118,6 +1155,18 @@ function setMysqlAutoIncrement(column: EditableStructureColumn, checked: boolean
     void loadMysqlAutoIncrementCounter(true);
   }
 }
+function isSqliteAutoIncrement(column: EditableStructureColumn): boolean {
+  return structureDialect.value === "sqlite" && column.isPrimaryKey && isSqliteIntegerType(column.dataType) && column.extra.autoIncrement === true;
+}
+function canEditSqliteAutoIncrement(column: EditableStructureColumn): boolean {
+  return structureDialect.value === "sqlite" && column.isPrimaryKey && isSqliteIntegerType(column.dataType) && !columns.value.some((candidate) => candidate !== column && candidate.isPrimaryKey && candidate.extra.autoIncrement);
+}
+function setSqliteAutoIncrement(column: EditableStructureColumn, checked: boolean) {
+  column.extra.autoIncrement = checked;
+}
+function isSqliteIntegerType(dataType: string): boolean {
+  return /^(integer|int|tinyint|smallint|mediumint|bigint)$/i.test(dataType.trim().split("(")[0]);
+}
 function onMysqlAutoIncrementInput(event: Event) {
   const input = event.target as HTMLInputElement;
   if (/^\d*$/.test(input.value)) {
@@ -1146,6 +1195,7 @@ function isManticoreJsonColumn(column: EditableStructureColumn): boolean {
 
 let sqlPreviewRequestId = 0;
 let structureLoadRequestId = 0;
+let structureMetadataRevalidationId = 0;
 let tableCommentLoadRequestId = 0;
 let tableCommentLoadPromise: Promise<void> | null = null;
 let tableOwnerLoadRequestId = 0;
@@ -1452,7 +1502,9 @@ async function hydrateRestoredDraftFromDatabase() {
     if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
       try {
         const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog });
-        ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+        const dialect = sqlFormatDialectForDbType(databaseType.value);
+        const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
+        ddlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
         ddlFetched.value = true;
         nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
       } catch {
@@ -1717,7 +1769,9 @@ async function refreshSqlPreview() {
       }),
     ]);
     if (requestId !== sqlPreviewRequestId) return;
-    pendingStatements.value = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    // SQLite type-change apply regenerates this revision-checked plan, so its preview must stay byte-for-byte aligned.
+    pendingStatements.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers !== false || hasSqliteTypeChange.value ? statements : statements.map((statement) => formatGeneratedDdlIdentifierQuotes(statement, sqlFormatDialectForDbType(databaseType.value), false));
     warnings.value = [...result.warnings, ...ownerResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
@@ -2048,6 +2102,9 @@ async function loadStructure(
   secondaryMetadataErrors.value = {};
   let secondaryMetadataScheduled = false;
   let loadedSuccessfully = false;
+  let columnsServedFromCache = false;
+  let commentServedFromCache = false;
+  let appliedColumnsSignature: string | undefined;
   try {
     await store.ensureConnected(connectionId);
 
@@ -2065,7 +2122,13 @@ async function loadStructure(
             .then((status) => ({ known: true, status }))
             .catch(() => ({ known: false, status: { isPartitionedParent: false, isPartition: false } }))
         : Promise.resolve({ known: true, status: { isPartitionedParent: false, isPartition: false } });
-    const columnsPromise = effectiveScope.columns ? loadObjectMetadataFacet(metadataRequest, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value) : Promise.resolve(undefined);
+    const columnsLoad = effectiveScope.columns ? loadObjectMetadataFacet(metadataRequest, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog), { force: forceMetadata }) : undefined;
+    const columnsPromise = columnsLoad
+      ? columnsLoad.then((result) => {
+          columnsServedFromCache = result.cacheStatus !== "remote";
+          return result.value;
+        })
+      : Promise.resolve(undefined);
     const indexesPromise = effectiveScope.indexes
       ? tableMetadataCapabilities.value.indexes
         ? loadObjectMetadataFacet(metadataRequest, "indexes", () => api.listIndexes(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
@@ -2086,14 +2149,22 @@ async function loadStructure(
         ? loadObjectMetadataFacet(metadataRequest, "triggers", () => api.listTriggers(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
-    const tableCommentPromise = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata).then((result) => result.value) : Promise.resolve(undefined);
+    const tableCommentLoad = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata) : undefined;
+    const tableCommentPromise = tableCommentLoad
+      ? tableCommentLoad.then((result) => {
+          commentServedFromCache = result.cacheStatus !== "remote";
+          return result.value;
+        })
+      : Promise.resolve(undefined);
 
     let nextColumns = await columnsPromise;
     if (nextColumns) {
       if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
         try {
           const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog }, { force: options.forceDdl });
-          ddlContent.value = await formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseType.value), settingsStore.editorSettings.sqlFormatter);
+          const dialect = sqlFormatDialectForDbType(databaseType.value);
+          const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
+          ddlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
           ddlFetched.value = true;
           nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
         } catch {
@@ -2107,6 +2178,7 @@ async function loadStructure(
       const nextColumnDrafts = createColumnDrafts(nextColumns, databaseType.value);
       const hydratedColumnDrafts = supportsCharacterLengthUnits.value && options.characterLengthUnitsAfterSave ? restoreCharacterLengthUnitsAfterSave(databaseType.value, nextColumnDrafts, options.characterLengthUnitsAfterSave) : nextColumnDrafts;
       columns.value = applyStoredLocalColumnOrder(hydratedColumnDrafts);
+      appliedColumnsSignature = JSON.stringify(nextColumns);
       loadedMetadataFacets.add("columns");
       if (!options.preserveDraft) clearColumnSelection();
     }
@@ -2190,6 +2262,14 @@ async function loadStructure(
       await secondaryMetadataPromise;
     }
     loadedSuccessfully = true;
+    // Cache-served structure metadata can be stale when another session rebuilt
+    // the table (#8816): the cache is only invalidated by in-app mutations.
+    // Revalidate in the background. Manticore columns are re-derived from the
+    // DDL locally, so leave those to the explicit refresh.
+    const manticoreDerivesColumnsFromDdl = databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl;
+    if (!forceMetadata && !manticoreDerivesColumnsFromDdl && (columnsServedFromCache || commentServedFromCache)) {
+      void revalidateCachedStructureMetadata(requestId, { columns: columnsServedFromCache, tableComment: commentServedFromCache }, appliedColumnsSignature);
+    }
   } catch (e: any) {
     if (showErrors) {
       errorMessage.value = e?.message || String(e);
@@ -2204,6 +2284,55 @@ async function loadStructure(
     if (!options.preserveDraft && loadedSuccessfully && requestId === structureLoadRequestId) {
       markDraftHydratedAndSync();
     }
+  }
+}
+
+/** Re-fetch structure facets that were served from the metadata cache and apply
+ * them while the drafts they feed are still clean: reopening the editor after
+ * another session rebuilt the table must not keep showing the old columns
+ * (#8816). User edits stay untouched and remain refreshable from the toolbar. */
+async function revalidateCachedStructureMetadata(loadRequestId: number, scope: { columns: boolean; tableComment: boolean }, appliedColumnsSignature: string | undefined) {
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const catalog = props.catalog;
+  const schema = metadataSchema.value;
+  const tableName = props.tableName;
+  if (!connectionId || !database || !tableName) return;
+  const revalidationId = ++structureMetadataRevalidationId;
+  const metadataRequest = { connectionId, database, schema, tableName, catalog };
+  try {
+    await store.ensureConnected(connectionId);
+    // Force alone only clears this facet's own key; the web backend keeps its
+    // own backend-columns/backend-comment entries under the same table prefix
+    // and would serve them to the forced re-fetch. Drop the whole table scope
+    // first, the same thing an explicit "Refresh Structure" does.
+    await invalidateObjectMetadataCache({ connectionId, database, schema, tableName });
+    const columnsPromise = scope.columns ? loadObjectMetadataFacet(metadataRequest, "columns", () => api.getColumns(connectionId, database, schema, tableName, catalog), { force: true }) : Promise.resolve(undefined);
+    const commentPromise = scope.tableComment ? loadCachedTableComment(metadataRequest, true) : Promise.resolve(undefined);
+    // allSettled so a failing comment re-fetch cannot swallow a valid columns
+    // fix (and vice versa); each failure is logged on its own.
+    const [columnsResult, commentResult] = await Promise.allSettled([columnsPromise, commentPromise] as const);
+    // A newer load or revalidation supersedes this one.
+    if (revalidationId !== structureMetadataRevalidationId || loadRequestId !== structureLoadRequestId) return;
+    if (columnsResult.status === "rejected") console.warn("[DBX][structure-editor:columns-metadata-revalidation-failed]", columnsResult.reason);
+    if (commentResult.status === "rejected") console.warn("[DBX][structure-editor:comment-metadata-revalidation-failed]", commentResult.reason);
+
+    let applied = false;
+    const nextColumns = columnsResult.status === "fulfilled" ? columnsResult.value?.value : undefined;
+    if (nextColumns && !captureStructureRefreshScope().columns && JSON.stringify(nextColumns) !== appliedColumnsSignature) {
+      columns.value = applyStoredLocalColumnOrder(createColumnDrafts(nextColumns, databaseType.value));
+      scheduleSqlPreviewRefresh();
+      applied = true;
+    }
+    const nextComment = commentResult.status === "fulfilled" ? commentResult.value?.value : undefined;
+    if (nextComment !== undefined && tableComment.value === originalTableComment.value && nextComment !== originalTableComment.value) {
+      originalTableComment.value = nextComment;
+      tableComment.value = nextComment;
+      applied = true;
+    }
+    if (applied) syncDraftToParent();
+  } catch (e) {
+    console.warn("[DBX][structure-editor:metadata-revalidation-failed]", e);
   }
 }
 
@@ -2764,6 +2893,11 @@ function updateColumnDataTypeLength(column: EditableStructureColumn, value: stri
   syncDamengIdentityForDataType(column);
 }
 
+function updatePostgresGeometryColumn(column: EditableStructureColumn, geomType: string, srid: string) {
+  const baseType = dataTypeBaseInputValue(databaseType.value, column.dataType);
+  column.dataType = combinePostgresGeometryType(baseType, geomType, srid);
+}
+
 function updateColumnDataTypeLengthUnit(column: EditableStructureColumn, value: unknown) {
   const baseType = dataTypeBaseInputValue(databaseType.value, column.dataType);
   const unit = value === "__default" ? "" : String(value ?? "");
@@ -3020,6 +3154,22 @@ function focusIndexSearch() {
     input?.focus();
     input?.select();
   });
+}
+
+function focusSearch(): boolean {
+  if (activeTab.value === "columns") {
+    focusColumnSearch();
+    return true;
+  }
+  if (activeTab.value === "indexes") {
+    focusIndexSearch();
+    return true;
+  }
+  if (activeTab.value === "ddl") {
+    ddlSearchPanelRef.value?.openSearch();
+    return true;
+  }
+  return false;
 }
 
 function scrollToIndexSearchMatch(direction: 1 | -1 = 1) {
@@ -3455,14 +3605,16 @@ function canEditForeignKeyDraft(foreignKey: EditableStructureForeignKey): boolea
 function addTrigger() {
   if (!canEditTriggers.value || triggersLoading.value) return;
   activeTab.value = "triggers";
-  triggers.value.push({
+  const draft: EditableStructureTrigger = {
     id: `new:${uuid()}`,
     name: "",
     timing: isOracleTriggerEditor.value ? "BEFORE EACH ROW" : isSqlServerTriggerEditor.value ? "AFTER" : "BEFORE",
     event: "INSERT",
     statement: isOracleTriggerEditor.value ? "BEGIN\n  NULL;\nEND" : isSqlServerTriggerEditor.value ? "BEGIN\n  SET NOCOUNT ON;\nEND" : "BEGIN\n  \nEND",
     markedForDrop: false,
-  });
+  };
+  triggers.value.push(draft);
+  selectedTriggerId.value = draft.id;
 }
 
 function removeNewTrigger(trigger: EditableStructureTrigger) {
@@ -3650,7 +3802,7 @@ async function applyChanges() {
   }
 }
 
-defineExpose({ applyChanges });
+defineExpose({ applyChanges, focusSearch });
 
 function addItemForActiveTab(): boolean {
   if (activeTab.value === "columns" && canAddColumn.value) {
@@ -3716,10 +3868,10 @@ function onStructureEditorKeydown(event: KeyboardEvent) {
     return;
   }
   if (isPlainModShortcut(event, "f")) {
-    event.preventDefault();
-    event.stopPropagation();
-    if (activeTab.value === "columns") focusColumnSearch();
-    else if (activeTab.value === "ddl") ddlSearchPanelRef.value?.openSearch();
+    if (focusSearch()) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
     return;
   }
   if (isPlainModShortcut(event, "s")) {
@@ -3772,10 +3924,18 @@ onMounted(() => {
   void loadTableOwnerRoles();
   void loadMysqlTableEngine(props.draft?.mysqlTableEngine !== undefined);
   if (props.draft?.initialized) {
-    void hydrateRestoredDraftFromDatabase().then(() => {
+    // A clean persisted editor snapshot is not a live schema cache. After an
+    // MCP DDL, restoring its loaded-facet flags would otherwise bypass the
+    // invalidated backend cache entirely. Legacy/dirty drafts remain intact.
+    const revalidateRestoredColumns = props.draft.dirty === false && !isCreateMode.value && loadedMetadataFacets.has("columns") && !(databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl);
+    void hydrateRestoredDraftFromDatabase().then(async () => {
       applyInitialStructureTarget();
       void loadMysqlAutoIncrementCounter(true);
-      void loadActiveTableStructureMetadataIfNeeded();
+      await loadActiveTableStructureMetadataIfNeeded();
+      if (revalidateRestoredColumns) {
+        // The existing revalidation checks again for edits made while loading.
+        void revalidateCachedStructureMetadata(structureLoadRequestId, { columns: true, tableComment: false }, undefined);
+      }
     });
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
@@ -4403,6 +4563,35 @@ watch(
                           </div>
                         </PopoverContent>
                       </Popover>
+                      <div v-else-if="isPostgresGeometryDataType(databaseType, column.dataType)" class="flex min-w-0 flex-col gap-0.5">
+                        <div class="flex min-w-0 items-center gap-1" :title="t('structureEditor.geometrySridHint')">
+                          <SearchableSelect
+                            :model-value="postgresGeometryTypeValue(column.dataType)"
+                            :options="[...POSTGRES_GEOMETRY_TYPES]"
+                            :allow-custom="true"
+                            :clearable="true"
+                            :placeholder="t('structureEditor.geometryTypePlaceholder')"
+                            :search-placeholder="t('structureEditor.geometryTypePlaceholder')"
+                            :empty-text="t('structureEditor.noMatchingType')"
+                            :trigger-class="[structureMonoControlClass, 'min-w-0 flex-1']"
+                            :disabled="isColumnTypeDisabled(column)"
+                            @update:model-value="(v: string) => updatePostgresGeometryColumn(column, v, postgresGeometrySridValue(column.dataType))"
+                          />
+                          <Input
+                            :model-value="postgresGeometrySridValue(column.dataType)"
+                            :class="[structureMonoControlClass, 'w-20 shrink-0']"
+                            type="number"
+                            min="0"
+                            max="999999"
+                            :placeholder="t('structureEditor.sridPlaceholder')"
+                            :disabled="isColumnTypeDisabled(column)"
+                            @update:model-value="(v: string | number) => updatePostgresGeometryColumn(column, postgresGeometryTypeValue(column.dataType), String(v))"
+                          />
+                        </div>
+                        <p v-if="!postgresGeometryTypeValue(column.dataType) && postgresGeometrySridValue(column.dataType)" class="text-[length:var(--structure-font-size)] text-muted-foreground leading-tight">
+                          {{ t("structureEditor.geometryEmptyTypeHint") }}
+                        </p>
+                      </div>
                       <div v-else class="flex min-w-0 items-center gap-1">
                         <Input :model-value="dataTypeLengthInputValue(databaseType, column.dataType)" :class="[structureMonoControlClass, 'min-w-0 flex-1']" :disabled="isColumnLengthDisabled(column)" @update:model-value="updateColumnDataTypeLength(column, $event)" />
                         <Select v-if="columnLengthUnitOptions(column).length" :model-value="dataTypeLengthUnitValue(databaseType, column.dataType) || '__default'" :disabled="isColumnLengthUnitDisabled(column)" @update:model-value="updateColumnDataTypeLengthUnit(column, $event)">
@@ -4536,6 +4725,12 @@ watch(
                           </template>
                         </template>
                         <!-- MySQL: AUTO_INCREMENT + ON UPDATE CURRENT_TIMESTAMP -->
+                        <template v-else-if="structureDialect === 'sqlite'">
+                          <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.autoIncrement')">
+                            <input :checked="isSqliteAutoIncrement(column)" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" :disabled="!canEditSqliteAutoIncrement(column)" @change="setSqliteAutoIncrement(column, ($event.target as HTMLInputElement).checked)" />
+                            <span>{{ t("structureEditor.autoIncrement") }}</span>
+                          </label>
+                        </template>
                         <template v-else-if="structureDialect === 'mysql'">
                           <label :class="[structurePropertyLabelClass, 'shrink-0 pr-1']" :title="t('structureEditor.autoIncrement')">
                             <input :checked="column.extra.autoIncrement" type="checkbox" :class="[structureCheckboxClass, 'shrink-0']" @change="setMysqlAutoIncrement(column, ($event.target as HTMLInputElement).checked)" />
@@ -4902,47 +5097,76 @@ watch(
             <div v-else-if="triggers.length === 0" class="py-10 text-center text-muted-foreground">
               {{ t("structureEditor.emptyReadonly") }}
             </div>
-            <div v-else class="space-y-1.5">
-              <div v-for="trigger in triggers" :key="trigger.id" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="trigger.markedForDrop ? 'bg-destructive/5 opacity-60' : ''">
-                <div class="grid grid-cols-[minmax(140px,1fr)_minmax(130px,180px)_minmax(140px,1fr)_auto] gap-1.5">
-                  <Input v-model="trigger.name" :class="structureControlClass" :placeholder="t('structureEditor.triggerName')" :disabled="!canEditTriggerDraft(trigger)" />
-                  <Input v-if="isOracleTriggerEditor" v-model="trigger.timing" :class="structureControlClass" :disabled="!canEditTriggerDraft(trigger)" />
+            <div v-else class="flex h-full min-h-0 flex-col gap-1.5">
+              <!-- Trigger list (master): compact rows with inline timing/event editors -->
+              <div class="min-h-24 shrink-0 overflow-auto rounded-md border" :class="selectedTrigger ? 'max-h-[45%]' : 'max-h-full'">
+                <div
+                  v-for="trigger in triggers"
+                  :key="trigger.id"
+                  class="flex w-full cursor-pointer items-center gap-1.5 border-b px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-left text-[length:var(--structure-font-size)] last:border-b-0 hover:bg-accent/40"
+                  :class="[trigger.id === selectedTriggerId ? 'bg-accent text-accent-foreground' : '', trigger.markedForDrop ? 'bg-destructive/5 opacity-60' : '']"
+                  @click="selectTrigger(trigger)"
+                >
+                  <template v-if="renamingTriggerId === trigger.id">
+                    <Input
+                      v-model="trigger.name"
+                      class="h-[var(--structure-control-height)] min-w-0 flex-1 rounded-[6px] px-[var(--structure-control-px)] font-mono"
+                      :placeholder="t('structureEditor.triggerName')"
+                      :disabled="!canEditTriggerDraft(trigger)"
+                      @click.stop
+                      @keydown.enter.prevent="renamingTriggerId = null"
+                      @keydown.escape.prevent="renamingTriggerId = null"
+                      @blur="renamingTriggerId = null"
+                    />
+                  </template>
+                  <span v-else class="min-w-0 flex-1 truncate font-mono" :class="trigger.name ? '' : 'italic text-muted-foreground'" :title="trigger.name || t('structureEditor.triggerName')">{{ trigger.name || t("structureEditor.triggerName") }}</span>
+                  <Button v-if="renamingTriggerId === trigger.id" variant="ghost" size="sm" :class="structureToolbarButtonClass" :title="t('structureEditor.triggerName')" @click.stop="renamingTriggerId = null">
+                    <Check :class="structureIconClass" />
+                  </Button>
+                  <Button v-else variant="ghost" size="sm" :class="structureToolbarButtonClass" :disabled="!canEditTriggerDraft(trigger)" :title="t('structureEditor.triggerName')" @click.stop="startRenameTrigger(trigger)">
+                    <Pencil :class="structureIconClass" />
+                  </Button>
+                  <Input v-if="isOracleTriggerEditor" v-model="trigger.timing" class="h-[var(--structure-control-height)] w-28 shrink-0 rounded-[6px] px-[var(--structure-control-px)]" :disabled="!canEditTriggerDraft(trigger)" @click.stop />
                   <Select v-else v-model="trigger.timing" :disabled="!canEditTriggerDraft(trigger)">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
+                    <SelectTrigger class="w-28 shrink-0" @click.stop>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem v-for="timing in triggerTimingOptions" :key="timing" :value="timing">{{ timing }}</SelectItem>
                     </SelectContent>
                   </Select>
-                  <Input v-if="isOracleTriggerEditor || isSqlServerTriggerEditor" v-model="trigger.event" :class="structureControlClass" :disabled="!canEditTriggerDraft(trigger)" />
+                  <Input v-if="isOracleTriggerEditor || isSqlServerTriggerEditor" v-model="trigger.event" class="h-[var(--structure-control-height)] w-28 shrink-0 rounded-[6px] px-[var(--structure-control-px)]" :disabled="!canEditTriggerDraft(trigger)" @click.stop />
                   <Select v-else v-model="trigger.event" :disabled="!canEditTriggerDraft(trigger)">
-                    <SelectTrigger class="h-[var(--structure-control-height)] rounded-[6px] px-[var(--structure-control-px)] text-[length:var(--structure-font-size)] focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25">
+                    <SelectTrigger class="w-24 shrink-0" @click.stop>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem v-for="event in triggerEventOptions" :key="event" :value="event">{{ event }}</SelectItem>
                     </SelectContent>
                   </Select>
-                  <div class="flex items-center justify-end gap-1">
-                    <Badge v-if="trigger.original && trigger.original.enabled !== undefined && trigger.original.enabled !== null" variant="outline" class="shrink-0 text-[length:var(--structure-font-size)]">
-                      {{ trigger.original.enabled ? t("damengJobAdmin.enabled") : t("damengJobAdmin.disabled") }}
-                    </Badge>
-                    <Button v-if="trigger.original" variant="ghost" size="sm" :class="structureToolbarButtonClass" @click="toggleDropTrigger(trigger)">
-                      <Trash2 :class="structureIconClass" />
-                      {{ trigger.markedForDrop ? t("structureEditor.restore") : t("structureEditor.drop") }}
-                    </Button>
-                    <Button v-else variant="ghost" size="sm" :class="structureToolbarButtonClass" @click="removeNewTrigger(trigger)">
-                      <X :class="structureIconClass" />
-                      {{ t("structureEditor.remove") }}
-                    </Button>
-                  </div>
+                  <Badge v-if="trigger.original && trigger.original.enabled !== undefined && trigger.original.enabled !== null" variant="outline" class="shrink-0 text-[length:var(--structure-font-size)]">
+                    {{ trigger.original.enabled ? t("damengJobAdmin.enabled") : t("damengJobAdmin.disabled") }}
+                  </Badge>
+                  <Button v-if="trigger.original" variant="ghost" size="sm" :class="structureToolbarButtonClass" @click.stop="toggleDropTrigger(trigger)">
+                    <Trash2 :class="structureIconClass" />
+                    {{ trigger.markedForDrop ? t("structureEditor.restore") : t("structureEditor.drop") }}
+                  </Button>
+                  <Button v-else variant="ghost" size="sm" :class="structureToolbarButtonClass" @click.stop="removeNewTrigger(trigger)">
+                    <X :class="structureIconClass" />
+                    {{ t("structureEditor.remove") }}
+                  </Button>
+                </div>
+              </div>
+              <!-- Statement editor (detail): title + SQL sized to its content -->
+              <div v-if="selectedTrigger" class="flex min-h-0 flex-1 flex-col rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]" :class="selectedTrigger.markedForDrop ? 'bg-destructive/5 opacity-60' : ''">
+                <div class="flex min-w-0 items-center gap-1.5 font-mono font-medium" :title="selectedTrigger.name">
+                  <span class="truncate">{{ selectedTrigger.name || t("structureEditor.triggerName") }}</span>
                 </div>
                 <textarea
-                  v-model="trigger.statement"
-                  class="mt-1.5 min-h-28 w-full resize-y rounded-[6px] border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
+                  v-model="selectedTrigger.statement"
+                  class="mt-1.5 min-h-0 w-full flex-1 resize-none overflow-auto rounded-[6px] border bg-background px-[var(--structure-control-px)] py-[var(--structure-cell-py)] font-mono text-[length:var(--structure-font-size)] leading-5 outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-50"
                   :placeholder="t('structureEditor.triggerStatement')"
-                  :disabled="!canEditTriggerDraft(trigger)"
+                  :disabled="!canEditTriggerDraft(selectedTrigger)"
                 />
               </div>
             </div>

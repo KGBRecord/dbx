@@ -271,10 +271,15 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
             external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
@@ -1149,6 +1154,13 @@ async fn test_connection_with_info_inner(
     let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
     let gaussdb_m_jdbc_config = gaussdb_m_jdbc_command_config(&config, &host, port);
     log::info!("[test_connection] db_type={:?} target={}", config.db_type, target);
+    if config.db_type == DatabaseType::Plugin {
+        let result = state.plugin_host.test_connection(&config, &host, port).await;
+        if has_transport_layers {
+            state.reset_connection_transport_for_config(&tunnel_id, &config).await;
+        }
+        return result;
+    }
     let mut database_info = None;
     let result = match probe_result {
         Err(e) => Err(e),
@@ -1397,7 +1409,10 @@ async fn test_connection_with_info_inner(
                     config.url_params.as_deref(),
                     config.external_config.as_ref(),
                     connect_timeout,
-                );
+                    Some(config.ca_cert_path.as_str()),
+                    Some(config.client_cert_path.as_str()),
+                    Some(config.client_key_path.as_str()),
+                )?;
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
@@ -1411,7 +1426,10 @@ async fn test_connection_with_info_inner(
                     config.url_params.as_deref(),
                     config.external_config.as_ref(),
                     connect_timeout,
-                );
+                    Some(config.ca_cert_path.as_str()),
+                    Some(config.client_cert_path.as_str()),
+                    Some(config.client_key_path.as_str()),
+                )?;
                 db::easysearch_driver::test_connection(&mut client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
@@ -1678,7 +1696,9 @@ pub async fn connect_db(
         state.reset_connection_transport_for_config(&id, &db_config).await;
         return Err(err);
     }
-    probe_connection_endpoint(&db_config, &host, port).await?;
+    if db_config.db_type != DatabaseType::Plugin {
+        probe_connection_endpoint(&db_config, &host, port).await?;
+    }
     if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
         state.reset_connection_transport_for_config(&id, &db_config).await;
         return Err(err);
@@ -1840,7 +1860,10 @@ pub async fn connect_db(
                 db_config.url_params.as_deref(),
                 db_config.external_config.as_ref(),
                 connect_timeout,
-            );
+                Some(db_config.ca_cert_path.as_str()),
+                Some(db_config.client_cert_path.as_str()),
+                Some(db_config.client_key_path.as_str()),
+            )?;
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
         }
@@ -1853,7 +1876,10 @@ pub async fn connect_db(
                 db_config.url_params.as_deref(),
                 db_config.external_config.as_ref(),
                 connect_timeout,
-            );
+                Some(db_config.ca_cert_path.as_str()),
+                Some(db_config.client_cert_path.as_str()),
+                Some(db_config.client_key_path.as_str()),
+            )?;
             db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Easysearch(client)
         }
@@ -2024,6 +2050,9 @@ pub async fn connect_db(
         #[cfg(not(feature = "mq-admin"))]
         DatabaseType::Mqtt => {
             return Err("MQTT support is not compiled in this build. Rebuild with the 'mq-admin' feature.".to_string());
+        }
+        DatabaseType::Plugin => {
+            PoolKind::PluginConnection(state.plugin_host.connect_connection(&db_config, &host, port).await?)
         }
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };

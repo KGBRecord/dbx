@@ -329,9 +329,11 @@ async fn live_postgres_backup_snapshot_exports_wide_jsonb_then_next_table_inner(
         drop_table_if_exists: false,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
         output_compression: Default::default(),
         snapshot_session_id: Some(snapshot.session_id.clone()),
         batch_size: 1000,
+        split_max_mb: None,
     };
     let terminal_rows = AtomicU64::new(u64::MAX);
     let export_result = export_database_sql_core(&state, &request, |progress| {
@@ -442,9 +444,11 @@ async fn live_postgres_backup_snapshot_cancel_interrupts_pending_row_inner() {
         drop_table_if_exists: false,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
         output_compression: Default::default(),
         snapshot_session_id: Some(snapshot.session_id.clone()),
         batch_size: 1,
+        split_max_mb: None,
     };
     let rows_seen = Arc::new(AtomicU64::new(0));
     let terminal_status = Arc::new(AtomicU64::new(0));
@@ -557,9 +561,11 @@ async fn live_mysql_database_backup_refreshes_an_idle_snapshot_before_export() {
         drop_table_if_exists: false,
         omit_auto_increment: false,
         fail_on_error: true,
+        prevent_overwrite: false,
         output_compression: Default::default(),
         snapshot_session_id: Some(snapshot.session_id.clone()),
         batch_size: 100,
+        split_max_mb: None,
     };
     let export_result = export_database_sql_core(&state, &request, |_| {}).await;
     let rollback_result = rollback_manual_transaction(&state, &snapshot.session_id).await;

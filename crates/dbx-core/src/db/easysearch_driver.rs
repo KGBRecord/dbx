@@ -20,10 +20,24 @@ impl EasysearchClient {
         url_params: Option<&str>,
         external_config: Option<&Value>,
         timeout: Duration,
-    ) -> Self {
-        Self {
-            inner: EsClient::from_config(url, username, password, tls_enabled, url_params, external_config, timeout),
-        }
+        ca_cert_path: Option<&str>,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            inner: EsClient::from_config(
+                url,
+                username,
+                password,
+                tls_enabled,
+                url_params,
+                external_config,
+                timeout,
+                ca_cert_path,
+                client_cert_path,
+                client_key_path,
+            )?,
+        })
     }
 }
 
@@ -42,6 +56,12 @@ pub async fn test_connection(client: &mut EasysearchClient, timeout: Duration) -
 
 pub async fn list_indices(client: &EasysearchClient) -> Result<Vec<String>, String> {
     elasticsearch_driver::list_indices(&client.inner).await.map_err(easysearch_error)
+}
+
+pub async fn list_indices_with_aliases(
+    client: &EasysearchClient,
+) -> Result<Vec<elasticsearch_driver::ElasticsearchIndexEntry>, String> {
+    elasticsearch_driver::list_indices_with_aliases(&client.inner).await.map_err(easysearch_error)
 }
 
 pub async fn get_columns(client: &EasysearchClient, index: &str) -> Result<Vec<ColumnInfo>, String> {

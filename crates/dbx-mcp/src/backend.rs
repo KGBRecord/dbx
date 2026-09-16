@@ -215,6 +215,17 @@ pub trait DbxBackend: Send + Sync {
         let _ = (connection, request);
         Err("Message queue sending is not supported by this backend.".to_string())
     }
+    #[cfg(feature = "mq-admin")]
+    async fn peek_messages(
+        &self,
+        connection: &ConnectionConfig,
+        topic: dbx_core::mq::TopicRef,
+        count: u32,
+        options: dbx_core::mq::PeekMessagesOptions,
+    ) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+        let _ = (connection, topic, count, options);
+        Err("Message queue reading is not supported by this backend.".to_string())
+    }
     async fn execute_query(
         &self,
         connection: &ConnectionConfig,
@@ -571,6 +582,12 @@ impl LocalBackend {
     }
 
     pub async fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_app_version(path, env!("CARGO_PKG_VERSION")).await
+    }
+
+    /// Same as [`open`], but lets tests and embedded callers pin the app version
+    /// used for plugin compatibility checks instead of the compile-time version.
+    pub async fn open_with_app_version(path: &Path, app_version: &str) -> Result<Self, String> {
         let storage = Storage::open(path).await?;
         let configs = storage.load_connections().await?;
         let desktop_settings = storage.load_desktop_settings().await.unwrap_or_default();
@@ -581,7 +598,7 @@ impl LocalBackend {
             storage,
             plugin_dir,
             agent_dir,
-            env!("CARGO_PKG_VERSION"),
+            app_version,
         ));
         let config_map: HashMap<String, ConnectionConfig> =
             configs.into_iter().map(|config| (config.id.clone(), config)).collect();
@@ -591,6 +608,65 @@ impl LocalBackend {
 
     pub fn state(&self) -> &Arc<AppState> {
         &self.state
+    }
+
+    /// List the MCP tools exposed by every installed plugin.
+    ///
+    /// Plugin MCP surfaces are discovered through the same `mcp/tools`
+    /// protocol used by the desktop bridge. Keep the response grouped by
+    /// plugin so callers can select the correct sidecar for a tool call.
+    pub async fn list_plugin_tools(&self) -> Result<Vec<Value>, String> {
+        let plugins = self.state.plugins.list_installed()?;
+        let mut providers = Vec::new();
+        for plugin in plugins {
+            if !plugin.compatibility.compatible || plugin.manifest.backend_entrypoint().is_none() {
+                continue;
+            }
+            let tools: Value = self
+                .state
+                .plugin_host
+                .invoke(&plugin.manifest.id, "mcp/tools", json!({}), None, Some(std::time::Duration::from_secs(30)))
+                .await?;
+            let tool_list = tools
+                .get("tools")
+                .cloned()
+                .or_else(|| tools.is_array().then_some(tools.clone()))
+                .unwrap_or_else(|| json!([]));
+            providers.push(json!({
+                "pluginId": plugin.manifest.id,
+                "tools": tool_list,
+            }));
+        }
+        Ok(providers)
+    }
+
+    /// Call one plugin MCP tool through the host-managed sidecar session.
+    /// When a saved connection is supplied, only its host-generated lifecycle
+    /// payload is sent to the plugin; credentials remain host-managed.
+    pub async fn call_plugin_tool(
+        &self,
+        plugin_id: &str,
+        tool: &str,
+        connection_id: Option<&str>,
+        arguments: &Value,
+    ) -> Result<Value, String> {
+        let mut params = json!({ "tool": tool, "arguments": arguments });
+        if let Some(connection_id) = connection_id {
+            let config = self
+                .state
+                .configs
+                .read()
+                .await
+                .get(connection_id)
+                .cloned()
+                .ok_or_else(|| format!("Connection not found: {connection_id}"))?;
+            let lifecycle = self.state.plugin_host.connection_params_standalone(&config)?;
+            params["lifecycle"] = lifecycle;
+        }
+        self.state
+            .plugin_host
+            .invoke(plugin_id, "mcp/call", params, None, Some(std::time::Duration::from_secs(300)))
+            .await
     }
 
     /// Sync the latest connection list from storage into the `AppState.configs` in-memory cache:
@@ -694,6 +770,17 @@ impl DbxBackend for LocalBackend {
     }
 
     async fn list_databases(&self, connection: &ConnectionConfig) -> Result<Vec<String>, String> {
+        if connection.db_type == DatabaseType::MongoDb {
+            if self.state.pool_handle(&connection.id).await.is_none() {
+                self.state.get_or_create_pool(&connection.id, None).await?;
+            }
+            if matches!(self.state.pool_handle(&connection.id).await, Some(dbx_core::connection::PoolKind::MongoDb(_)))
+            {
+                return dbx_core::mongo_ops::mongo_list_databases_core(&self.state, &connection.id).await;
+            }
+            // Keep the existing metadata retry path for MongoDB agent pools.
+        }
+
         // `list_databases_core` supports many database engines and therefore
         // produces a very large future. Boxing it here keeps the async-trait
         // implementation below Rust's type-layout recursion limit in desktop
@@ -753,6 +840,25 @@ impl DbxBackend for LocalBackend {
         request: dbx_core::mq::SendMessageRequest,
     ) -> Result<dbx_core::mq::SendMessageResponse, String> {
         dbx_core::mq::service::mq_send_message_core(&self.state, &connection.id, request).await
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn peek_messages(
+        &self,
+        connection: &ConnectionConfig,
+        topic: dbx_core::mq::TopicRef,
+        count: u32,
+        options: dbx_core::mq::PeekMessagesOptions,
+    ) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+        dbx_core::mq::service::mq_peek_messages_core(
+            &self.state,
+            &connection.id,
+            topic,
+            "__dbx_kafka_viewer__".into(),
+            count,
+            Some(options),
+        )
+        .await
     }
 
     async fn execute_query(
@@ -1161,6 +1267,21 @@ impl DbxBackend for WebBackend {
         .json()
         .await
         .map_err(|error| format!("Invalid message send response: {error}"))
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn peek_messages(
+        &self,
+        connection: &ConnectionConfig,
+        topic: dbx_core::mq::TopicRef,
+        count: u32,
+        options: dbx_core::mq::PeekMessagesOptions,
+    ) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/api/mq/subscriptions/peek-messages",
+            Some(json!({ "connectionId": connection.id, "topic": topic, "sub": "__dbx_kafka_viewer__", "count": count, "options": options })),
+        ).await?.json().await.map_err(|error| format!("Invalid message peek response: {error}"))
     }
 
     async fn execute_query(
@@ -1737,6 +1858,26 @@ impl DbxBackend for WebBackend {
                     .json()
                     .await
                     .map_err(|error| format!("Invalid MongoDB insert response: {error}"))?;
+                Ok(affected_query_result(affected_rows_from_value(&value)))
+            }
+            MongoCommand::Replace { collection, filter, replacement, options } => {
+                let value: Value = self
+                    .request(
+                        reqwest::Method::POST,
+                        "/api/mongo/replace-document",
+                        Some(json!({
+                            "connectionId": connection_id,
+                            "database": database,
+                            "collection": collection,
+                            "filterJson": filter,
+                            "replacementJson": replacement,
+                            "optionsJson": options,
+                        })),
+                    )
+                    .await?
+                    .json()
+                    .await
+                    .map_err(|error| format!("Invalid MongoDB replace response: {error}"))?;
                 Ok(affected_query_result(affected_rows_from_value(&value)))
             }
             MongoCommand::Update { collection, filter, update, options, many } => {
@@ -2525,6 +2666,81 @@ mod tests {
         let (_request_line, second_body) = request_receiver.recv().unwrap();
         let second_request: Value = serde_json::from_str(&second_body).unwrap();
         assert_eq!(second_request["timeoutSecs"], 300);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn web_peek_messages_forwards_kafka_options_and_preserves_partial_results() {
+        use dbx_core::mq::{PeekMessagesOptions, PeekStartPosition, TopicRef};
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "POST /api/mq/subscriptions/peek-messages HTTP/1.1");
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["connectionId"], "kafka-peek");
+            assert_eq!(body["topic"]["topic"], "events");
+            assert_eq!(body["sub"], "__dbx_kafka_viewer__");
+            assert_eq!(body["count"], 7);
+            assert_eq!(body["options"], json!({"startPosition":"offset", "partition":2, "offset":17}));
+            let response = r#"{"messages":[{"position":1,"messageId":"2:17","payloadBase64":"/w==","headers":{"type":"binary"}}],"incomplete":true}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let backend =
+            WebBackend::new_with_config(format!("http://{address}"), String::new(), None, None, None, false, None)
+                .unwrap();
+        backend.auth.lock().await.checked = true;
+        let connection = new_connection_config(
+            "kafka-peek".into(),
+            "Kafka".into(),
+            DatabaseType::MessageQueue,
+            "localhost".into(),
+            9092,
+            String::new(),
+            String::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let result = backend
+            .peek_messages(
+                &connection,
+                TopicRef { topic: "events".into(), ..Default::default() },
+                7,
+                PeekMessagesOptions {
+                    start_position: Some(PeekStartPosition::Offset),
+                    partition: Some(2),
+                    offset: Some(17),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.incomplete);
+        assert_eq!(result.messages[0].payload_base64, "/w==");
+        assert_eq!(result.messages[0].message_id.as_deref(), Some("2:17"));
+        assert_eq!(result.messages[0].headers.get("type").map(String::as_str), Some("binary"));
+        server.join().unwrap();
     }
 
     #[tokio::test]

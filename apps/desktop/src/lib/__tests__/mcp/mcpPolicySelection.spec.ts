@@ -97,6 +97,13 @@ describe("MCP tool permission selection", () => {
     expect(next).not.toContain("dbx_send_message");
   });
 
+  it("keeps Kafka reading independent from message sending", () => {
+    const next = toggleMcpAllowedToolName(null, "dbx_send_message", false);
+    expect(next).toContain("dbx_peek_messages");
+    expect(toggleMcpAllowedToolName(next, "dbx_peek_messages", false)).not.toContain("dbx_peek_messages");
+    expect(toggleMcpAllowedToolName([], "dbx_peek_messages", true)).toEqual(["dbx_peek_messages"]);
+  });
+
   it("lets batch execution be enabled and disabled independently", () => {
     expect(toggleMcpAllowedToolName(["dbx_execute_query"], "dbx_execute_batch", true)).toEqual(["dbx_execute_query", "dbx_execute_batch"]);
     expect(toggleMcpAllowedToolName(["dbx_execute_query", "dbx_execute_batch"], "dbx_execute_batch", false)).toEqual(["dbx_execute_query"]);
@@ -158,11 +165,12 @@ describe("MCP policy settings state", () => {
     expect(tabsSource).toContain("overscroll-x-contain");
     expect(tabsSource).not.toContain("flex-wrap");
     expect(tabsSource).not.toContain("grid-cols-");
-    expect(tabsSource.match(/flex-none shrink-0/g)).toHaveLength(13);
+    expect(tabsSource.match(/flex-none shrink-0/g)).toHaveLength(14);
     expect(tabsSource).toContain('<TabsTrigger value="deepseek-harness"');
     expect(tabsSource).toContain('<TabsTrigger value="codebuddy"');
     expect(tabsSource).toContain('<TabsTrigger value="zcode"');
     expect(tabsSource).toContain('<TabsTrigger value="qoder"');
+    expect(tabsSource).toContain('<TabsTrigger value="workbuddy"');
     expect(tabsSource).not.toContain("min-w-0 px-");
 
     const codeBuddyStart = settingsDialogSource.indexOf('<TabsContent value="codebuddy"', tabsEnd);

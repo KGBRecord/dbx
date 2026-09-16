@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DataGridValueTransform from "@/components/grid/DataGridValueTransform.vue";
 import { computed, toRef } from "vue";
 import { Code2, Copy, Download, Eye, FileDiff, FileUp, Pencil, X } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
@@ -8,7 +9,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { TabsContent } from "@/components/ui/tabs";
 import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import { useDataGridCellDetail } from "@/composables/useDataGridCellDetail";
-import { BINARY_CELL_DOWNLOAD_MODES, binaryCellUtf8Text, isBlobCellColumnType, type BinaryCellDownloadMode } from "@/lib/dataGrid/binaryCellDownload";
+import { BINARY_CELL_DOWNLOAD_MODES, isBinaryCellColumnType, binaryCellUtf8Text, isBlobCellColumnType, type BinaryCellDownloadMode } from "@/lib/dataGrid/binaryCellDownload";
 import { isGeometryColumnType } from "@/lib/dataGrid/cellDetailPresentation";
 import { isHexGeometry } from "@/lib/dataGrid/geometryPreview";
 import type { DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
@@ -97,7 +98,7 @@ defineExpose({ openSearch });
         </div>
         <div class="space-y-1">
           <div class="text-muted-foreground">{{ t("grid.nullValue") }}</div>
-          <div>{{ detail.value === null ? "true" : "false" }}</div>
+          <div>{{ (detail.isNull ?? detail.value === null) ? "true" : "false" }}</div>
         </div>
         <div class="space-y-1">
           <div class="text-muted-foreground">{{ t("grid.valueLength") }}</div>
@@ -124,7 +125,7 @@ defineExpose({ openSearch });
           </div>
           <div class="space-y-1">
             <div class="text-muted-foreground">{{ t("grid.nullValue") }}</div>
-            <div>{{ detail.value === null ? "true" : "false" }}</div>
+            <div>{{ (detail.isNull ?? detail.value === null) ? "true" : "false" }}</div>
           </div>
           <div class="space-y-1">
             <div class="text-muted-foreground">{{ t("grid.valueLength") }}</div>
@@ -141,6 +142,13 @@ defineExpose({ openSearch });
         <div class="flex min-h-5 min-w-0 flex-wrap items-center justify-between gap-2">
           <div class="shrink-0 text-muted-foreground">{{ t("grid.cellValue") }}</div>
           <div class="min-w-0 flex flex-1 flex-wrap items-center justify-end gap-1">
+            <DataGridValueTransform
+              v-if="!isBinaryCellColumnType(detail.type)"
+              :source="(detail.isNull ?? detail.value === null) && (!editing || !detailEditValue || detailEditValue === detail.rawValue) ? null : editing ? detailEditValue : detail.rawValue"
+              :identity="`${detail.rowId}:${detail.colIndex}:${editing}`"
+              :incomplete="detail.isSourceTruncated"
+              :unsafe-number="typeof detail.value === 'number' && Number.isInteger(detail.value) && !Number.isSafeInteger(detail.value) && (!editing || detailEditValue === detail.rawValue)"
+            />
             <Button v-if="editing && showCompareJson" variant="ghost" size="sm" class="h-5 gap-1 px-1.5 text-xs" :disabled="!canCompareJson" :title="t('grid.compareJson')" @mousedown.prevent @click="emit('compareJson')"><FileDiff class="h-3 w-3" />{{ t("grid.compareJson") }}</Button>
             <Button v-if="showCompactJson" variant="ghost" size="sm" class="h-5 gap-1 px-1.5 text-xs" :disabled="!canCompactJson" :title="t('grid.compactJson')" @click="emit('compactJson')"><Code2 class="h-3 w-3" />{{ t("grid.compactJson") }}</Button>
             <Button v-if="!editing && detail.formattedJson" :variant="sideJsonView ? 'secondary' : 'ghost'" size="sm" class="h-5 gap-1 px-1.5 text-xs" :title="t('grid.formattedJson')" @click="emit('toggleFormatted')"><Code2 class="h-3 w-3" />{{ t("grid.formattedJson") }}</Button>
@@ -202,7 +210,7 @@ defineExpose({ openSearch });
         ><Button variant="outline" size="sm" class="h-6 text-xs" @click="emit('cancel')">{{ t("dangerDialog.cancel") }}</Button>
       </div>
       <div class="min-w-0 flex flex-wrap gap-1" :class="panelIsBottom ? 'ml-auto justify-end' : 'flex-col'">
-        <Button v-if="detail.isEditable && detail.value !== null" variant="ghost" size="sm" class="h-6 justify-start text-xs" @click="emit('setNull')"><X class="w-3 h-3 mr-2" />{{ t("grid.setNull") }}</Button
+        <Button v-if="detail.isEditable && !(detail.isNull ?? detail.value === null)" variant="ghost" size="sm" class="h-6 justify-start text-xs" @click="emit('setNull')"><X class="w-3 h-3 mr-2" />{{ t("grid.setNull") }}</Button
         ><Button variant="ghost" size="sm" class="h-6 justify-start text-xs" @click="emit('copyColumnName')"><Copy class="w-3 h-3 mr-2" />{{ t("grid.copyColumnName") }}</Button
         ><Button variant="ghost" size="sm" class="h-6 justify-start text-xs" :disabled="!canCopySqlCondition()" @click="emit('copySqlCondition')"><Code2 class="w-3 h-3 mr-2" />{{ t("grid.copySqlCondition") }}</Button>
       </div>

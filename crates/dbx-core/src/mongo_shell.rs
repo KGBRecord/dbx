@@ -1,5 +1,8 @@
+use chrono::{SecondsFormat, Utc};
+use mongodb::bson::oid::ObjectId;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind")]
@@ -63,6 +66,8 @@ pub enum MongoCommand {
     },
     #[serde(rename = "update")]
     Update { collection: String, filter: String, update: String, options: Option<String>, many: bool },
+    #[serde(rename = "replace")]
+    Replace { collection: String, filter: String, replacement: String, options: Option<String> },
     #[serde(rename = "delete")]
     Delete { collection: String, filter: String, many: bool },
     #[serde(rename = "createIndex")]
@@ -95,6 +100,7 @@ impl MongoCommand {
                 | Self::CreateUser { .. }
                 | Self::Insert { .. }
                 | Self::Update { .. }
+                | Self::Replace { .. }
                 | Self::Delete { .. }
                 | Self::CreateIndex { .. }
                 | Self::DropIndexes { .. }
@@ -114,6 +120,7 @@ impl MongoCommand {
     pub fn has_empty_filter(&self) -> bool {
         match self {
             Self::Update { filter, .. }
+            | Self::Replace { filter, .. }
             | Self::Delete { filter, .. }
             | Self::FindOneAndUpdate { filter, .. }
             | Self::FindOneAndReplace { filter, .. }
@@ -125,6 +132,7 @@ impl MongoCommand {
     pub fn has_effectively_unbounded_filter(&self) -> bool {
         match self {
             Self::Update { filter, .. }
+            | Self::Replace { filter, .. }
             | Self::Delete { filter, .. }
             | Self::FindOneAndUpdate { filter, .. }
             | Self::FindOneAndReplace { filter, .. }
@@ -368,6 +376,16 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
     if let Some(database) = parse_use_database(source) {
         return Ok(MongoCommand::Use { database });
     }
+    // `db.stats()` and `db.serverStatus()` are the shell's shorthand for the
+    // matching runCommand, so they execute through the same supported path.
+    for (method, command) in [("stats", "dbStats"), ("serverStatus", "serverStatus")] {
+        if let Some((args, tail)) = database_method_call(source, method) {
+            if !tail.is_empty() || !args.iter().all(|arg| arg.trim().is_empty()) {
+                return Err(format!("MongoDB db.{method}() takes no arguments."));
+            }
+            return Ok(MongoCommand::RunCommand { command_json: format!(r#"{{"{command}":1}}"#) });
+        }
+    }
     if let Some((args, tail)) = database_method_call(source, "runCommand") {
         if !tail.is_empty() || args.len() != 1 {
             return Err("MongoDB runCommand() requires exactly one command document.".to_string());
@@ -442,6 +460,7 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
                         verbosity: parse_explain_verbosity(&call_args)?,
                     });
                 }
+                _ if is_noop_cursor_call(&name, &call_args) => {}
                 _ => return Err(format!("Unsupported MongoDB find() chain: {name}()")),
             }
         }
@@ -486,6 +505,18 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
         });
     }
 
+    // estimatedDocumentCount() takes no filter and is metadata-backed, which is
+    // exactly the legacy count() fast path the driver already uses.
+    if let Some((args, tail)) = method_call(source, prefix_end, "estimatedDocumentCount") {
+        if !args.iter().all(|arg| arg.trim().is_empty()) {
+            return Err("MongoDB estimatedDocumentCount() takes no filter.".to_string());
+        }
+        if !tail.is_empty() {
+            return Err("MongoDB estimatedDocumentCount() does not support chained methods.".to_string());
+        }
+        return Ok(MongoCommand::Count { collection, filter: "{}".to_string(), accurate: false });
+    }
+
     for (method, accurate) in [("countDocuments", true), ("count", false)] {
         if let Some((args, tail)) = method_call(source, prefix_end, method) {
             if !tail.is_empty() || args.len() > 1 {
@@ -500,8 +531,15 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
     }
 
     if let Some((args, tail)) = method_call(source, prefix_end, "aggregate") {
-        if !tail.is_empty() || !(1..=2).contains(&args.len()) {
+        if !(1..=2).contains(&args.len()) {
             return Err("Invalid MongoDB aggregate() command.".to_string());
+        }
+        for (name, call_args) in chained_calls(&tail)? {
+            if !is_noop_cursor_call(&name, &call_args) {
+                return Err(format!(
+                    "Unsupported MongoDB aggregate() chain: {name}(). Use pipeline stages such as $sort and $limit instead."
+                ));
+            }
         }
         let pipeline = normalized_json(&args[0])?;
         if !parse_json_value(&pipeline).is_some_and(|value| value.is_array()) {
@@ -574,6 +612,22 @@ pub fn parse(input: &str) -> Result<MongoCommand, String> {
             return Err("MongoDB insert() requires a document or document array.".to_string());
         }
         return Ok(MongoCommand::Insert { collection, documents });
+    }
+
+    if let Some((args, tail)) = method_call(source, prefix_end, "replaceOne") {
+        if !tail.is_empty() || !(2..=3).contains(&args.len()) {
+            return Err(
+                "MongoDB replaceOne() requires a filter, a replacement document, and optional options.".to_string()
+            );
+        }
+        let replacement = normalized_json(&args[1])?;
+        require_replacement_document(&replacement)?;
+        return Ok(MongoCommand::Replace {
+            collection,
+            filter: normalized_json(&args[0])?,
+            replacement,
+            options: args.get(2).filter(|arg| !arg.trim().is_empty()).map(|arg| normalized_json(arg)).transpose()?,
+        });
     }
 
     for (method, many) in [("updateOne", false), ("updateMany", true)] {
@@ -732,6 +786,21 @@ fn trim_mongo_outer_comments(mut source: &str) -> &str {
 }
 
 fn parse_collection_prefix(source: &str) -> Result<(String, usize), String> {
+    // db["orders-2024"] reaches names that are not valid identifiers, the same way the shell does.
+    if source.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db[")) {
+        let close = matching_bracket(source, 2).ok_or("Invalid db[\"collection\"] accessor.")?;
+        let collection = parse_string_arg(source[3..close].trim())?;
+        if collection.is_empty() {
+            return Err("Invalid MongoDB collection name.".to_string());
+        }
+        let end = close + 1;
+        let suffix = &source[end..];
+        let trimmed = suffix.trim_start();
+        if !trimmed.starts_with('.') {
+            return Err("MongoDB collection method is required.".to_string());
+        }
+        return Ok((collection, end + suffix.len() - trimmed.len()));
+    }
     if !source.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("db.")) {
         return Err("MongoDB command must start with db.<collection>.".to_string());
     }
@@ -797,6 +866,12 @@ fn database_method_call(source: &str, method: &str) -> Option<(Vec<String>, Stri
     let open = source.len() - after_method.len();
     let close = matching_paren(source, open)?;
     Some((split_top_level(&source[open + 1..close]), source[close + 1..].trim().to_string()))
+}
+
+/// Cursor methods that change nothing here: results are always materialised, so
+/// the `.toArray()` that mongosh and Compass append can simply be dropped.
+fn is_noop_cursor_call(name: &str, args: &[String]) -> bool {
+    matches!(name, "toArray" | "pretty") && args.is_empty()
 }
 
 fn chained_calls(chain: &str) -> Result<Vec<(String, Vec<String>)>, String> {
@@ -1045,6 +1120,23 @@ fn is_shell_regex_value_prefix(previous_significant: Option<char>) -> bool {
     previous_significant.is_none_or(|character| matches!(character, ':' | '[' | ',' | '('))
 }
 
+/// Shell value constructors rewritten to extended JSON before json5 parsing.
+/// `Date` is only recognised after `new`, matching the shell where a bare `Date()`
+/// returns a string rather than a date.
+const SHELL_CONSTRUCTORS: [&str; 11] = [
+    "ObjectId",
+    "ISODate",
+    "Date",
+    "NumberLong",
+    "NumberInt",
+    "NumberDecimal",
+    "UUID",
+    "BinData",
+    "Timestamp",
+    "MinKey",
+    "MaxKey",
+];
+
 fn transform_shell_constructors(input: &str) -> Result<String, String> {
     let mut output = String::with_capacity(input.len());
     let mut index = 0;
@@ -1069,27 +1161,167 @@ fn transform_shell_constructors(input: &str) -> Result<String, String> {
             output.push_str(&input[start..index]);
             continue;
         }
-        let constructor = if rest.starts_with("ObjectId(") {
-            Some("ObjectId(")
-        } else if rest.starts_with("ISODate(") {
-            Some("ISODate(")
-        } else {
-            None
-        };
-        let Some(constructor) = constructor else {
-            output.push(ch);
-            index += ch.len_utf8();
+        if let Some((json, end)) = shell_constructor_call(input, index)? {
+            output.push_str(&json);
+            index = end;
             continue;
-        };
-        let open = index + constructor.len() - 1;
-        let close = matching_paren(input, open).ok_or("Unclosed MongoDB value constructor.")?;
-        let inner = input[open + 1..close].trim();
-        let value = parse_string_arg(inner)?;
-        let key = if constructor.starts_with("ObjectId") { "$oid" } else { "$date" };
-        output.push_str(&format!("{{\"{key}\":{}}}", serde_json::to_string(&value).unwrap()));
-        index = close + 1;
+        }
+        if let Some((json, end)) = shell_bare_constant(input, index) {
+            output.push_str(&json);
+            index = end;
+            continue;
+        }
+        output.push(ch);
+        index += ch.len_utf8();
     }
     Ok(output)
+}
+
+/// Rewrite a bare `MinKey` / `MaxKey` at `index`, as in `{ $lt: MaxKey }`.
+/// A following `:` means it is an object key, not a value.
+fn shell_bare_constant(input: &str, index: usize) -> Option<(String, usize)> {
+    if input[..index].ends_with(|ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$' | '.')) {
+        return None;
+    }
+    let rest = &input[index..];
+    let name = ["MinKey", "MaxKey"].into_iter().find(|name| rest.starts_with(name))?;
+    let after = &rest[name.len()..];
+    if after.starts_with(|ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$')) {
+        return None;
+    }
+    if after.trim_start().starts_with([':', '(']) {
+        return None;
+    }
+    Some((key_constant_json(name), index + name.len()))
+}
+
+fn key_constant_json(name: &str) -> String {
+    if name == "MinKey" {
+        r#"{"$minKey":1}"#.to_string()
+    } else {
+        r#"{"$maxKey":1}"#.to_string()
+    }
+}
+
+/// Rewrite one `Name(...)` / `new Name(...)` call at `index`, or None when it is not a known constructor.
+fn shell_constructor_call(input: &str, index: usize) -> Result<Option<(String, usize)>, String> {
+    let rest = &input[index..];
+    let (name_start, is_new) = match rest.strip_prefix("new") {
+        Some(after) if after.starts_with(|ch: char| ch.is_whitespace()) => {
+            (index + 3 + after.len() - after.trim_start().len(), true)
+        }
+        _ => (index, false),
+    };
+    let name_len = input[name_start..]
+        .find(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '$')
+        .unwrap_or(input.len() - name_start);
+    let name = &input[name_start..name_start + name_len];
+    if !SHELL_CONSTRUCTORS.contains(&name) {
+        return Ok(None);
+    }
+    if name == "Date" && !is_new {
+        return Ok(None);
+    }
+    let after_name = &input[name_start + name_len..];
+    let paren_offset = after_name.len() - after_name.trim_start().len();
+    if !after_name[paren_offset..].starts_with('(') {
+        return Ok(None);
+    }
+    let open = name_start + name_len + paren_offset;
+    let close = matching_paren(input, open).ok_or("Unclosed MongoDB value constructor.")?;
+    let inner = input[open + 1..close].trim();
+    Ok(Some((shell_constructor_to_extended_json(name, inner)?, close + 1)))
+}
+
+fn shell_constructor_to_extended_json(name: &str, inner: &str) -> Result<String, String> {
+    if matches!(name, "BinData" | "Timestamp") {
+        return two_argument_constructor_to_extended_json(name, inner);
+    }
+    let integer = inner.parse::<i64>().ok();
+    match name {
+        "MinKey" | "MaxKey" if inner.is_empty() => Ok(key_constant_json(name)),
+        "MinKey" | "MaxKey" => Err(format!("MongoDB {name}() takes no arguments.")),
+        "UUID" if inner.is_empty() => Ok(extended_json("$uuid", &Uuid::new_v4().to_string())),
+        "UUID" => Ok(extended_json("$uuid", &parse_uuid_arg(inner)?)),
+        "ObjectId" if inner.is_empty() => Ok(extended_json("$oid", &ObjectId::new().to_hex())),
+        "ObjectId" => Ok(extended_json("$oid", &parse_string_arg(inner)?)),
+        "ISODate" | "Date" if inner.is_empty() => {
+            Ok(extended_json("$date", &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)))
+        }
+        // `new Date(1735689600000)` takes epoch milliseconds, which extended JSON
+        // carries as a nested $numberLong rather than a bare number.
+        "ISODate" | "Date" => match integer {
+            Some(millis) => Ok(format!(r#"{{"$date":{{"$numberLong":"{millis}"}}}}"#)),
+            None => Ok(extended_json("$date", &parse_string_arg(inner)?)),
+        },
+        "NumberLong" | "NumberInt" => {
+            let key = if name == "NumberLong" { "$numberLong" } else { "$numberInt" };
+            let value = match integer {
+                Some(value) => value.to_string(),
+                None => parse_string_arg(inner)?,
+            };
+            value.parse::<i64>().map_err(|_| format!("MongoDB {name}() requires an integer argument."))?;
+            Ok(extended_json(key, &value))
+        }
+        "NumberDecimal" => {
+            let value = match parse_json_value(inner) {
+                Some(Value::Number(number)) => number.to_string(),
+                _ => parse_string_arg(inner)?,
+            };
+            value.parse::<f64>().map_err(|_| "MongoDB NumberDecimal() requires a numeric argument.".to_string())?;
+            Ok(extended_json("$numberDecimal", &value))
+        }
+        _ => Err(format!("Unsupported MongoDB value constructor {name}().")),
+    }
+}
+
+/// `UUID("...")` takes the canonical 8-4-4-4-12 hex form, matching mongosh
+/// (hex digits only, dashes required, upper or lower case).
+fn parse_uuid_arg(arg: &str) -> Result<String, String> {
+    let value = parse_string_arg(arg)?;
+    if is_canonical_uuid(&value) {
+        Ok(value)
+    } else {
+        Err("MongoDB UUID() requires a canonical 8-4-4-4-12 hex string.".to_string())
+    }
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn two_argument_constructor_to_extended_json(name: &str, inner: &str) -> Result<String, String> {
+    let args = split_top_level(inner);
+    if args.len() != 2 {
+        return Err(format!("MongoDB {name}() requires exactly two arguments."));
+    }
+    if name == "Timestamp" {
+        // Timestamp(t, i): two unsigned 32-bit integers, seconds and ordinal.
+        let parse = |value: &str| value.trim().parse::<u32>();
+        return match (parse(&args[0]), parse(&args[1])) {
+            (Ok(seconds), Ok(ordinal)) => Ok(format!(r#"{{"$timestamp":{{"t":{seconds},"i":{ordinal}}}}}"#)),
+            _ => Err("MongoDB Timestamp() requires two unsigned 32-bit integers.".to_string()),
+        };
+    }
+    // BinData(subType, base64): extended JSON carries the subtype as two hex digits.
+    let sub_type = args[0]
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| "MongoDB BinData() subtype must be an integer from 0 to 255.".to_string())?;
+    let base64 = parse_string_arg(&args[1])?;
+    Ok(format!(
+        r#"{{"$binary":{{"base64":{},"subType":"{sub_type:02x}"}}}}"#,
+        serde_json::to_string(&base64).unwrap_or_else(|_| "null".to_string())
+    ))
+}
+
+fn extended_json(key: &str, value: &str) -> String {
+    format!("{{\"{key}\":{}}}", serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
 }
 
 fn parse_json_value(value: &str) -> Option<Value> {
@@ -1135,6 +1367,19 @@ fn parse_use_database(source: &str) -> Option<String> {
         return None;
     }
     Some(database.to_string())
+}
+
+/// A replacement is a whole document; `{$set: ...}` here almost always means updateOne() was intended.
+fn require_replacement_document(replacement: &str) -> Result<(), String> {
+    let Some(Value::Object(document)) = parse_json_value(replacement) else {
+        return Err("MongoDB replaceOne() replacement must be a document.".to_string());
+    };
+    match document.keys().find(|key| key.starts_with('$')) {
+        Some(operator) => Err(format!(
+            "MongoDB replaceOne() replacement must not contain update operators such as {operator}; use updateOne() to modify fields."
+        )),
+        None => Ok(()),
+    }
 }
 
 fn is_empty_object(value: &str) -> bool {
@@ -1184,6 +1429,43 @@ fn matching_paren(source: &str, open: usize) -> Option<usize> {
         } else if ch == '(' {
             depth += 1;
         } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// Offset of the `]` closing the bracket at `open`, ignoring brackets inside strings.
+fn matching_bracket(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut quote = None;
+    let mut escape = false;
+    let mut index = open;
+    while index < source.len() {
+        let ch = source[index..].chars().next()?;
+        if escape {
+            escape = false;
+            index += ch.len_utf8();
+            continue;
+        }
+        if quote.is_some() {
+            if ch == '\\' {
+                escape = true;
+            } else if Some(ch) == quote {
+                quote = None;
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '[' {
+            depth += 1;
+        } else if ch == ']' {
             depth -= 1;
             if depth == 0 {
                 return Some(index);
@@ -1313,6 +1595,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_bracket_collection_accessor() {
+        assert_eq!(
+            parse(r#"db["orders-2024"].find({a: 1})"#).unwrap(),
+            MongoCommand::Find {
+                collection: "orders-2024".to_string(),
+                filter: r#"{"a":1}"#.to_string(),
+                projection: None,
+                sort: None,
+                collation: None,
+                skip: 0,
+                limit: 100,
+            }
+        );
+
+        // Single quotes, a dotted name, and a chained method all behave like db.<name>.
+        assert_eq!(
+            parse("db['audit.logs'].count()").unwrap(),
+            MongoCommand::Count { collection: "audit.logs".to_string(), filter: "{}".to_string(), accurate: false }
+        );
+        assert!(matches!(
+            parse(r#"db["orders-2024"].updateOne({a: 1}, {$set: {b: 2}}, {upsert: true})"#).unwrap(),
+            MongoCommand::Update { many: false, .. }
+        ));
+
+        for source in [r#"db[].find({})"#, r#"db[""].find({})"#, r#"db["x"]find({})"#, r#"db["x"]"#] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn parses_get_collection_and_count() {
         assert_eq!(
             parse("db.getCollection('audit.logs').count()").unwrap(),
@@ -1375,6 +1687,261 @@ mod tests {
         assert_eq!(validate_safety(&command, false, false, false), Err(MongoSafetyError::WritesDisabled));
         assert_eq!(validate_safety(&command, true, false, false), Err(MongoSafetyError::Dangerous));
         assert_eq!(validate_safety(&command, true, true, false), Ok(()));
+    }
+
+    #[test]
+    fn fills_in_zero_argument_value_constructors() {
+        let MongoCommand::Update { update, filter, options, .. } = parse(
+            r#"db.reports.updateOne(
+                {phone_number: "+84905421172", code: "VN"},
+                {$set: {type: ObjectId("5bbc28701f3fd80f00e0211c"), created_at: new Date(), updated_at: ISODate()}},
+                {upsert: true}
+            )"#,
+        )
+        .unwrap() else {
+            panic!("expected an update command");
+        };
+        assert_eq!(filter, r#"{"phone_number":"+84905421172","code":"VN"}"#);
+        assert_eq!(options.as_deref(), Some(r#"{"upsert":true}"#));
+
+        let set = &parse_json_value(&update).unwrap()["$set"];
+        assert_eq!(set["type"]["$oid"], "5bbc28701f3fd80f00e0211c");
+        for field in ["created_at", "updated_at"] {
+            let filled = set[field]["$date"].as_str().expect("filled-in date");
+            let filled = chrono::DateTime::parse_from_rfc3339(filled).expect("rfc3339 date");
+            assert!(
+                (Utc::now() - filled.with_timezone(&Utc)).num_seconds().abs() < 60,
+                "{field} is not the current time"
+            );
+        }
+
+        let MongoCommand::Find { filter, .. } = parse("db.reports.find({_id: ObjectId()})").unwrap() else {
+            panic!("expected a find command");
+        };
+        let oid = parse_json_value(&filter).unwrap()["_id"]["$oid"].as_str().unwrap().to_string();
+        assert!(oid.len() == 24 && oid.chars().all(|ch| ch.is_ascii_hexdigit()), "{oid}");
+    }
+
+    #[test]
+    fn rewrites_epoch_millisecond_and_numeric_value_constructors() {
+        let MongoCommand::Find { filter, .. } =
+            parse(r#"db.orders.find({at: new Date(1735689600000), qty: NumberInt(3), sequence: NumberLong("9223372036854775807"), total: NumberDecimal("12.34")})"#)
+                .unwrap()
+        else {
+            panic!("expected a find command");
+        };
+        assert_eq!(
+            filter,
+            r#"{"at":{"$date":{"$numberLong":"1735689600000"}},"qty":{"$numberInt":"3"},"sequence":{"$numberLong":"9223372036854775807"},"total":{"$numberDecimal":"12.34"}}"#
+        );
+    }
+
+    #[test]
+    fn rewrites_uuid_binary_timestamp_and_key_constants() {
+        let MongoCommand::Find { filter, .. } = parse(
+            r#"db.c.find({
+                u: UUID("3b241101-e2bb-4255-8caf-4136c566a962"),
+                b: BinData(128, "AQID"),
+                t: Timestamp(1735689600, 7),
+                lo: MinKey,
+                hi: MaxKey(),
+                range: {$gt: MinKey(), $lt: MaxKey},
+                list: [MinKey, MaxKey]
+            })"#,
+        )
+        .unwrap() else {
+            panic!("expected a find command");
+        };
+        assert_eq!(
+            parse_json_value(&filter).unwrap(),
+            serde_json::json!({
+                "u": {"$uuid": "3b241101-e2bb-4255-8caf-4136c566a962"},
+                "b": {"$binary": {"base64": "AQID", "subType": "80"}},
+                "t": {"$timestamp": {"t": 1735689600, "i": 7}},
+                "lo": {"$minKey": 1},
+                "hi": {"$maxKey": 1},
+                "range": {"$gt": {"$minKey": 1}, "$lt": {"$maxKey": 1}},
+                "list": [{"$minKey": 1}, {"$maxKey": 1}],
+            })
+        );
+
+        let MongoCommand::Find { filter, .. } = parse("db.c.find({u: UUID()})").unwrap() else {
+            panic!("expected a find command");
+        };
+        let generated = parse_json_value(&filter).unwrap()["u"]["$uuid"].as_str().unwrap().to_string();
+        assert!(Uuid::parse_str(&generated).is_ok(), "{generated}");
+    }
+
+    #[test]
+    fn leaves_key_constant_names_alone_outside_value_positions() {
+        let MongoCommand::Find { filter, .. } =
+            parse(r#"db.c.find({MinKey: 1, MaxKey: 2, label: "MinKey", nested: {MaxKey: true}})"#).unwrap()
+        else {
+            panic!("expected a find command");
+        };
+        assert_eq!(filter, r#"{"MinKey":1,"MaxKey":2,"label":"MinKey","nested":{"MaxKey":true}}"#);
+    }
+
+    #[test]
+    fn rejects_malformed_uuid_binary_timestamp_and_key_constants() {
+        for (source, expected) in [
+            (r#"db.c.find({b: BinData(256, "x")})"#, "BinData"),
+            (r#"db.c.find({b: BinData(0)})"#, "BinData"),
+            (r#"db.c.find({b: BinData("00", "x")})"#, "BinData"),
+            (r#"db.c.find({t: Timestamp(1)})"#, "Timestamp"),
+            (r#"db.c.find({t: Timestamp(-1, 0)})"#, "Timestamp"),
+            (r#"db.c.find({t: Timestamp(4294967296, 0)})"#, "Timestamp"),
+            (r#"db.c.find({u: UUID(1)})"#, "string"),
+            (r#"db.c.find({a: MinKey(1)})"#, "MinKey"),
+            (r#"db.c.find({a: MaxKey("x")})"#, "MaxKey"),
+        ] {
+            let error = parse(source).unwrap_err();
+            assert!(error.contains(expected), "{source} => {error}");
+        }
+    }
+
+    #[test]
+    fn validates_uuid_strings_at_parse_time() {
+        // mongosh requires the canonical 8-4-4-4-12 hex form: dashes at fixed
+        // positions, hex digits elsewhere, upper or lower case.
+        for source in [
+            r#"db.c.find({u: UUID("3b241101e2bb42558caf4136c566a962")})"#,
+            r#"db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a96")})"#,
+            r#"db.c.find({u: UUID("3b241101-e2bb-4255-8caf-4136c566a9620")})"#,
+            r#"db.c.find({u: UUID("zb241101-e2bb-4255-8caf-4136c566a962")})"#,
+            r#"db.c.find({u: UUID("3b241101_e2bb_4255_8caf_4136c566a962")})"#,
+        ] {
+            let error = parse(source).unwrap_err();
+            assert!(error.contains("UUID() requires"), "{source} => {error}");
+        }
+
+        // Upper-case hex is accepted and preserved verbatim.
+        let MongoCommand::Find { filter, .. } =
+            parse(r#"db.c.find({u: UUID("3B241101-E2BB-4255-8CAF-4136C566A962")})"#).unwrap()
+        else {
+            panic!("expected a find command");
+        };
+        assert_eq!(filter, r#"{"u":{"$uuid":"3B241101-E2BB-4255-8CAF-4136C566A962"}}"#);
+    }
+
+    #[test]
+    fn drops_noop_cursor_methods_after_find_and_aggregate() {
+        // mongosh and Compass append .toArray(); results are always materialised
+        // here, so it changes nothing and must not be an error.
+        let expected = MongoCommand::Aggregate {
+            collection: "orders".to_string(),
+            pipeline: r#"[{"$match":{"a":1}}]"#.to_string(),
+            options: None,
+        };
+        for source in [
+            "db.orders.aggregate([{$match: {a: 1}}]).toArray()",
+            "db.orders.aggregate([{$match: {a: 1}}]).pretty()",
+            "db.orders.aggregate([{$match: {a: 1}}]).toArray().pretty()",
+            "db.orders.aggregate([{$match: {a: 1}}])\n  .toArray()",
+        ] {
+            assert_eq!(parse(source).unwrap(), expected, "{source}");
+        }
+
+        let with_chain = parse("db.orders.find({a: 1}).sort({b: 1}).limit(5).toArray()").unwrap();
+        assert!(matches!(with_chain, MongoCommand::Find { limit: 5, sort: Some(_), .. }), "{with_chain:?}");
+        assert!(matches!(parse("db.orders.find({a: 1}).pretty()").unwrap(), MongoCommand::Find { .. }));
+    }
+
+    #[test]
+    fn still_rejects_real_cursor_methods_after_aggregate() {
+        for source in [
+            "db.orders.aggregate([]).limit(5)",
+            "db.orders.aggregate([]).sort({a: 1})",
+            "db.orders.aggregate([]).toArray().limit(5)",
+            "db.orders.aggregate([]).toArray(1)",
+        ] {
+            let error = parse(source).unwrap_err();
+            assert!(error.contains("aggregate() chain"), "{source} => {error}");
+        }
+        assert!(parse("db.orders.find({}).toArray(1)").unwrap_err().contains("find() chain"));
+    }
+
+    #[test]
+    fn parses_estimated_document_count_as_a_metadata_backed_count() {
+        // The driver already takes the metadata fast path for a filterless legacy
+        // count(), which is exactly what estimatedDocumentCount() asks for.
+        let expected =
+            MongoCommand::Count { collection: "orders".to_string(), filter: "{}".to_string(), accurate: false };
+        for source in [
+            "db.orders.estimatedDocumentCount()",
+            r#"db["orders"].estimatedDocumentCount()"#,
+            "db.getCollection('orders').estimatedDocumentCount();",
+        ] {
+            assert_eq!(parse(source).unwrap(), expected, "{source}");
+        }
+        assert!(!parse("db.orders.estimatedDocumentCount()").unwrap().is_mutating());
+
+        assert!(parse("db.orders.estimatedDocumentCount({a: 1})").unwrap_err().contains("no filter"));
+        assert!(parse("db.orders.estimatedDocumentCount().limit(5)").unwrap_err().contains("chained"));
+    }
+
+    #[test]
+    fn parses_db_stats_and_server_status_as_run_commands() {
+        assert_eq!(
+            parse("db.stats()").unwrap(),
+            MongoCommand::RunCommand { command_json: r#"{"dbStats":1}"#.to_string() }
+        );
+        assert_eq!(
+            parse("db . serverStatus ( ) ;").unwrap(),
+            MongoCommand::RunCommand { command_json: r#"{"serverStatus":1}"#.to_string() }
+        );
+
+        for source in ["db.stats(1)", "db.serverStatus({})"] {
+            assert!(parse(source).unwrap_err().contains("takes no arguments"), "{source}");
+        }
+
+        // db.collection.stats() still parses as collection stats, not a run command.
+        assert!(matches!(parse("db.orders.stats()").unwrap(), MongoCommand::CollectionStats { .. }));
+    }
+
+    #[test]
+    fn parses_replace_one_as_a_filtered_write() {
+        let command = parse(
+            r#"db.orders.replaceOne({_id: ObjectId("507f1f77bcf86cd799439011")}, {name: "new", tags: []}, {upsert: true})"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            MongoCommand::Replace {
+                collection: "orders".to_string(),
+                filter: r#"{"_id":{"$oid":"507f1f77bcf86cd799439011"}}"#.to_string(),
+                replacement: r#"{"name":"new","tags":[]}"#.to_string(),
+                options: Some(r#"{"upsert":true}"#.to_string()),
+            }
+        );
+        assert!(command.is_mutating());
+        assert!(!command.is_dangerous());
+        assert!(!command.has_empty_filter());
+        assert_eq!(validate_safety(&command, true, false, false), Ok(()));
+        assert_eq!(validate_safety(&command, false, false, false), Err(MongoSafetyError::WritesDisabled));
+
+        let without_options = parse("db.orders.replaceOne({a: 1}, {b: 2})").unwrap();
+        assert!(matches!(without_options, MongoCommand::Replace { options: None, .. }));
+
+        // An empty filter replaces an arbitrary document, so it is guarded like an update.
+        let unbounded = parse("db.orders.replaceOne({}, {b: 2})").unwrap();
+        assert!(unbounded.has_empty_filter());
+        assert_eq!(validate_safety(&unbounded, true, false, false), Err(MongoSafetyError::EmptyFilter));
+    }
+
+    #[test]
+    fn rejects_replace_one_with_operators_or_the_wrong_shape() {
+        let error = parse("db.orders.replaceOne({a: 1}, {$set: {b: 2}})").unwrap_err();
+        assert!(error.contains("$set") && error.contains("updateOne"), "{error}");
+
+        for source in [
+            "db.orders.replaceOne({a: 1})",
+            "db.orders.replaceOne({a: 1}, {b: 2}, {upsert: true}, 4)",
+            "db.orders.replaceOne({a: 1}, [{b: 2}])",
+            "db.orders.replaceOne({a: 1}, {b: 2}).limit(1)",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
     }
 
     #[test]

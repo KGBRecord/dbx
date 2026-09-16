@@ -38,13 +38,14 @@ const JDBC_DIALECT_MATCHERS: Array<{ type: DatabaseType; patterns: RegExp[] }> =
   { type: "sqlserver", patterns: [/jdbc:sqlserver:/i, /sqlserver/i, /mssql/i] },
   { type: "oracle", patterns: [/jdbc:oracle:/i, /oracle/i] },
   { type: "clickhouse", patterns: [/jdbc:clickhouse:/i, /clickhouse/i] },
+  { type: "tdengine", patterns: [/jdbc:taos(?:-rs|-ws)?:/i, /taosdata/i, /tdengine/i] },
   { type: "h2", patterns: [/jdbc:h2:/i, /\bh2\b/i] },
   { type: "sqlite", patterns: [/jdbc:sqlite:/i, /sqlite/i] },
   { type: "db2", patterns: [/jdbc:db2:/i, /\bdb2\b/i] },
   { type: "informix", patterns: [/jdbc:informix/i, /informix/i] },
   // CacheDB.jar (legacy Caché driver) carries none of the intersystems URL or
   // class-name markers, so match the jar file name / driver label directly.
-  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i, /cachedb/i] },
+  { type: "iris", patterns: [/jdbc:(?:iris|cache):/i, /com\.intersystems\.jdbc\.(?:IRIS|Cache)Driver/i, /intersystems-jdbc/i, /\bcache(?:db)?\b/i] },
 ];
 
 // ASE uses Transact-SQL, but treating it as SQL Server globally would also
@@ -214,6 +215,8 @@ export function connectionUsesDatabaseObjectTreeMode(connection?: JdbcDialectCon
   const dialect = inferJdbcDialect(connection);
   if (!dialect) return true;
   if (dialect === "hive" || dialect === "trino") return false;
+  // TDengine exposes databases as the top-level namespace, without schemas.
+  if (dialect === "tdengine") return false;
   if (dialect === "databend") return true;
   return !usesTreeSchemaMode(dialect);
 }
@@ -307,6 +310,12 @@ export function connectionObjectTreeNodeSchema(connection: JdbcDialectConnection
   if (!type) return schema;
   if (!schema && databaseNameIsNotASchema(type)) return undefined;
   return isSchemaAware(type) ? schema || database : undefined;
+}
+
+/** GBase 8s reports the table owner as a schema, but does not accept it in table DML/DDL names. */
+export function connectionTableSqlSchema(connection: JdbcDialectConnection | undefined, schema?: string): string | undefined {
+  if (connection?.db_type === "gbase" && isGbase8sProfile(connection.driver_profile)) return undefined;
+  return schema;
 }
 
 /** Maps a database type to the corresponding CodeMirror SQL dialect name used by QueryEditor and DdlViewDialog. */

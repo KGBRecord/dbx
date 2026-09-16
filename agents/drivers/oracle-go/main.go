@@ -30,7 +30,11 @@ import (
 const protocolVersion = 1
 const multiSessionProtocolVersion = 2
 const defaultMaxRows = 1000
-const oracleDefaultPrefetchRows = "100"
+
+// A normal data-grid page contains 100 rows. Prefetching a little more than
+// one page reduces round trips while reading subsequent pages without
+// buffering the much larger export limit.
+const oracleDefaultPrefetchRows = "256"
 const oracleCharsetZHS32GB18030 = 854
 const legacyAgentSessionID = "__legacy__"
 const maxAgentSessions = 256
@@ -3397,6 +3401,15 @@ func (s *server) getViewSource(schema, name string) (string, error) {
 		return "", err
 	}
 	viewName := strings.TrimSpace(name)
+	var source string
+	viewsErr := db.QueryRow(
+		"SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :1 AND VIEW_NAME = :2",
+		schema, viewName,
+	).Scan(&source)
+	if viewsErr == nil && strings.TrimSpace(source) != "" {
+		return strings.TrimSpace(source), nil
+	}
+
 	var ddl string
 	metadataErr := db.QueryRow(
 		"SELECT DBMS_METADATA.GET_DDL('VIEW', :1, :2) FROM DUAL",
@@ -3406,22 +3419,11 @@ func (s *server) getViewSource(schema, name string) (string, error) {
 		return strings.TrimSpace(ddl), nil
 	}
 
-	var source string
-	fallbackErr := db.QueryRow(
-		"SELECT TEXT FROM ALL_VIEWS WHERE OWNER = :1 AND VIEW_NAME = :2",
-		schema, viewName,
-	).Scan(&source)
-	if fallbackErr == nil && strings.TrimSpace(source) != "" {
-		return strings.TrimSpace(source), nil
-	}
-	if fallbackErr != nil && !errors.Is(fallbackErr, sql.ErrNoRows) {
-		if metadataErr != nil {
-			return "", fmt.Errorf(
-				"failed to load view source for %s.%s: DBMS_METADATA: %v; ALL_VIEWS: %w",
-				schema, viewName, metadataErr, fallbackErr,
-			)
-		}
-		return "", fmt.Errorf("failed to load view source for %s.%s from ALL_VIEWS: %w", schema, viewName, fallbackErr)
+	if viewsErr != nil && !errors.Is(viewsErr, sql.ErrNoRows) && metadataErr != nil {
+		return "", fmt.Errorf(
+			"failed to load view source for %s.%s: ALL_VIEWS: %v; DBMS_METADATA: %w",
+			schema, viewName, viewsErr, metadataErr,
+		)
 	}
 	return "", fmt.Errorf("view source not found: %s.%s", schema, viewName)
 }
@@ -3972,6 +3974,13 @@ func readQuerySessionPage(session *querySession, pageSize int) (result queryPage
 	}
 	if session.remaining <= 0 {
 		result.Truncated = true
+		return result, nil
+	}
+	// A full page is enough evidence that another page may exist. Do not read
+	// one extra row just to decide has_more: with a prefetch boundary this
+	// forces another Oracle round trip before the first page can be displayed.
+	if len(result.Rows) >= pageSize {
+		result.HasMore = true
 		return result, nil
 	}
 	if session.rows.Next() {

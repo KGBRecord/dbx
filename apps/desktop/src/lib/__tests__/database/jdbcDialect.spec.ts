@@ -9,6 +9,7 @@ import {
   connectionQueryExecutionSchema,
   connectionShouldDiscoverJdbcSchemas,
   connectionShouldLoadIdentifierQuote,
+  connectionTableSqlSchema,
   connectionUsesConnectionRootSchemaMode,
   connectionUsesDatabaseObjectTreeMode,
   effectiveDatabaseTypeForConnection,
@@ -71,6 +72,7 @@ describe("jdbc dialect inference", () => {
         driver_label: "CacheDB",
       }),
     ).toBe("iris");
+    expect(inferJdbcDialect({ db_type: "jdbc", driver_profile: "cache" })).toBe("iris");
   });
 
   it("uses IRIS table preview dialect for generic JDBC IRIS connections", () => {
@@ -89,6 +91,19 @@ describe("jdbc dialect inference", () => {
         driver_profile: "sqlserver",
       }),
     ).toBe("sqlserver");
+  });
+
+  it("detects TDengine JDBC connections and keeps the selected database in the object tree", () => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: "jdbc:TAOS-RS://tdengine.example:6041/",
+      jdbc_driver_class: "com.taosdata.jdbc.rs.RestfulDriver",
+    };
+
+    expect(inferJdbcDialect(connection)).toBe("tdengine");
+    expect(effectiveDatabaseTypeForConnection(connection)).toBe("tdengine");
+    expect(connectionUsesDatabaseObjectTreeMode(connection)).toBe(false);
+    expect(connectionObjectTreeQuerySchema(connection, "dbx_test")).toBe("dbx_test");
   });
 
   it("keeps Phoenix as generic JDBC while preserving its schema tree", () => {
@@ -160,6 +175,12 @@ describe("jdbc dialect inference", () => {
   it("falls back to a flat table tree when GBase 8s reports no schemas", () => {
     expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8s" })).toBe(true);
     expect(connectionShouldDiscoverJdbcSchemas({ db_type: "gbase", driver_profile: "gbase8a" })).toBe(false);
+  });
+
+  it("omits the metadata owner from GBase 8s table SQL", () => {
+    expect(connectionTableSqlSchema({ db_type: "gbase", driver_profile: "gbase8s" }, "gbasedbt")).toBeUndefined();
+    expect(connectionTableSqlSchema({ db_type: "gbase", driver_profile: "gbase8a" }, "analytics")).toBe("analytics");
+    expect(connectionTableSqlSchema({ db_type: "informix", driver_profile: "informix" }, "informix")).toBe("informix");
   });
 
   it("recognizes GaussDB reached through PostgreSQL-compatible JDBC drivers", () => {
@@ -363,8 +384,8 @@ describe("query execution schema", () => {
     expect(connectionQueryExecutionSchema({ db_type: dbType }, "ai_test", undefined, false)).toBe("ai_test");
   });
 
-  it("prefers an explicit schema for PostgreSQL", () => {
-    expect(connectionQueryExecutionSchema({ db_type: "postgres" }, "app", "reporting", false)).toBe("reporting");
+  it.each(["postgres", "gaussdb", "opengauss"] as const)("prefers an explicit schema for %s", (dbType) => {
+    expect(connectionQueryExecutionSchema({ db_type: dbType }, "app", "reporting", false)).toBe("reporting");
   });
 
   it("prefers an explicit schema for Kingbase query execution", () => {
