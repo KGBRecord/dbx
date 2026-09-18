@@ -437,6 +437,140 @@ impl MySqlSqlFileExecutor {
     }
 }
 
+/// Which database-family mechanism `skip_relational_constraints` uses. Unlike
+/// MySQL's session-scoped `FOREIGN_KEY_CHECKS`, the PostgreSQL and SQL Server
+/// mechanisms below are catalog-level (`ALTER TABLE ... DISABLE TRIGGER ALL` /
+/// `NOCHECK CONSTRAINT ALL`): the effect is visible to every connection in the
+/// pool immediately, so neither needs [`MySqlSqlFileExecutor`]'s pinned-connection
+/// bookkeeping. Both are applied to every table in the database, not just the
+/// tables referenced by the imported file, matching "temporarily disable
+/// relational constraints" at the database scope the option describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationalConstraintBypassKind {
+    Mysql,
+    Postgres,
+    SqlServer,
+}
+
+fn relational_constraint_bypass_kind(target: &SqlFileImportTarget) -> Option<RelationalConstraintBypassKind> {
+    if crate::sql::supports_connection_level_database_bootstrap_target(
+        &target.db_type,
+        target.driver_profile.as_deref(),
+    ) {
+        return Some(RelationalConstraintBypassKind::Mysql);
+    }
+    match target.db_type {
+        DatabaseType::Postgres | DatabaseType::Gaussdb | DatabaseType::OpenGauss => {
+            Some(RelationalConstraintBypassKind::Postgres)
+        }
+        DatabaseType::SqlServer => Some(RelationalConstraintBypassKind::SqlServer),
+        _ => None,
+    }
+}
+
+// `pg_tables` lists every table the connection can see, including system
+// catalog tables owned by `pg_catalog`/`information_schema` (unlike
+// `information_schema.tables`, it has no built-in system-schema filter). Those
+// must be excluded explicitly or the loop fails trying to alter tables the
+// user cannot own, aborting the whole bypass. Temp schemas are excluded for
+// the same reason `POSTGRES_SCHEMA_INFOS_HIDE_SYSTEM_SQL` (schema.rs) does.
+// Foreign tables and empty partitioned parents are intentionally out of
+// scope: `DISABLE TRIGGER ALL` only matters for plain tables that can carry
+// FK/RI triggers.
+// Altering a table's triggers requires table ownership (or superuser). A
+// multi-schema database can easily contain tables the importing role does not
+// own; wrapping each ALTER in its own sub-transaction (BEGIN/EXCEPTION) means
+// one inaccessible table is skipped instead of aborting the bypass — and the
+// import it gates — for every table the role *can* alter.
+const POSTGRES_DISABLE_ALL_RELATIONAL_TRIGGERS_SQL: &str = "\
+    DO $dbx_disable_constraints$ \
+    DECLARE dbx_rel record; \
+    BEGIN \
+        FOR dbx_rel IN SELECT schemaname, tablename FROM pg_tables \
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+              AND schemaname NOT LIKE 'pg\\_temp\\_%' AND schemaname NOT LIKE 'pg\\_toast\\_temp\\_%' \
+        LOOP \
+            BEGIN \
+                EXECUTE format('ALTER TABLE %I.%I DISABLE TRIGGER ALL', dbx_rel.schemaname, dbx_rel.tablename); \
+            EXCEPTION WHEN insufficient_privilege THEN NULL; \
+            END; \
+        END LOOP; \
+    END $dbx_disable_constraints$;";
+
+const POSTGRES_ENABLE_ALL_RELATIONAL_TRIGGERS_SQL: &str = "\
+    DO $dbx_enable_constraints$ \
+    DECLARE dbx_rel record; \
+    BEGIN \
+        FOR dbx_rel IN SELECT schemaname, tablename FROM pg_tables \
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+              AND schemaname NOT LIKE 'pg\\_temp\\_%' AND schemaname NOT LIKE 'pg\\_toast\\_temp\\_%' \
+        LOOP \
+            BEGIN \
+                EXECUTE format('ALTER TABLE %I.%I ENABLE TRIGGER ALL', dbx_rel.schemaname, dbx_rel.tablename); \
+            EXCEPTION WHEN insufficient_privilege THEN NULL; \
+            END; \
+        END LOOP; \
+    END $dbx_enable_constraints$;";
+
+// `sys.tables`/`sys.schemas` (rather than the undocumented `sp_msforeachtable`)
+// keeps this portable across on-prem SQL Server and Azure SQL Database.
+// `is_ms_shipped = 0` excludes system tables that cannot carry FK constraints.
+// `HAS_PERMS_BY_NAME(..., 'ALTER')` filters out tables the importing login
+// cannot alter (e.g. a multi-schema database where it does not own every
+// table) before building the batch, so one inaccessible table cannot abort
+// a single `ALTER TABLE ... NOCHECK CONSTRAINT ALL` statement covering every
+// table the login *can* alter.
+const SQLSERVER_DISABLE_ALL_FOREIGN_KEYS_SQL: &str = "\
+    DECLARE @dbx_fk_sql nvarchar(max) = N''; \
+    SELECT @dbx_fk_sql = @dbx_fk_sql + N'ALTER TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) \
+        + N' NOCHECK CONSTRAINT ALL;' \
+    FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id \
+    WHERE t.is_ms_shipped = 0 \
+      AND HAS_PERMS_BY_NAME(QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), N'OBJECT', N'ALTER') = 1; \
+    IF @dbx_fk_sql <> N'' EXEC sys.sp_executesql @dbx_fk_sql;";
+
+// Restores enforcement for future writes with `WITH NOCHECK` (skips re-validating
+// rows written while constraints were disabled) so re-enabling never fails or
+// stalls on data an in-progress, possibly partial (continue-on-error) import left
+// behind; that mirrors how `mysqldump`/`pg_restore`-style tools re-enable checks.
+const SQLSERVER_ENABLE_ALL_FOREIGN_KEYS_SQL: &str = "\
+    DECLARE @dbx_fk_sql nvarchar(max) = N''; \
+    SELECT @dbx_fk_sql = @dbx_fk_sql + N'ALTER TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) \
+        + N' WITH NOCHECK CHECK CONSTRAINT ALL;' \
+    FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id \
+    WHERE t.is_ms_shipped = 0 \
+      AND HAS_PERMS_BY_NAME(QUOTENAME(s.name) + N'.' + QUOTENAME(t.name), N'OBJECT', N'ALTER') = 1; \
+    IF @dbx_fk_sql <> N'' EXEC sys.sp_executesql @dbx_fk_sql;";
+
+async fn set_relational_constraints_enabled(
+    state: &AppState,
+    request: &SqlFileRequest,
+    kind: RelationalConstraintBypassKind,
+    token: &CancellationToken,
+    enabled: bool,
+) -> Result<(), String> {
+    let sql = match (kind, enabled) {
+        (RelationalConstraintBypassKind::Postgres, false) => POSTGRES_DISABLE_ALL_RELATIONAL_TRIGGERS_SQL,
+        (RelationalConstraintBypassKind::Postgres, true) => POSTGRES_ENABLE_ALL_RELATIONAL_TRIGGERS_SQL,
+        (RelationalConstraintBypassKind::SqlServer, false) => SQLSERVER_DISABLE_ALL_FOREIGN_KEYS_SQL,
+        (RelationalConstraintBypassKind::SqlServer, true) => SQLSERVER_ENABLE_ALL_FOREIGN_KEYS_SQL,
+        (RelationalConstraintBypassKind::Mysql, _) => {
+            unreachable!("MySQL constraint bypass is handled by MySqlSqlFileExecutor, not this helper")
+        }
+    };
+    execute_sql_statement_with_options(
+        state,
+        &request.connection_id,
+        &request.database,
+        sql,
+        None,
+        Some(token.clone()),
+        QueryExecutionOptions::default(),
+    )
+    .await
+    .map(|_| ())
+}
+
 pub async fn execute_sql_file_content(
     state: &AppState,
     request: &SqlFileRequest,
@@ -471,8 +605,19 @@ pub async fn execute_sql_file_content(
     // MySQL-family imports need one pinned connection so `USE` and session
     // state survive across the whole file.
     let mut mysql_executor = MySqlSqlFileExecutor::build(state, request, import_target.as_ref()).await?;
+    let bypass_kind = import_target.as_ref().and_then(relational_constraint_bypass_kind);
+    let non_mysql_bypass = request.skip_relational_constraints
+        && mysql_executor.is_none()
+        && matches!(
+            bypass_kind,
+            Some(RelationalConstraintBypassKind::Postgres | RelationalConstraintBypassKind::SqlServer)
+        );
+    if non_mysql_bypass {
+        let kind = bypass_kind.expect("non_mysql_bypass implies bypass_kind is set");
+        set_relational_constraints_enabled(state, request, kind, &token, false).await?;
+    }
     let mut progress = SqlFileExecutionProgress::new();
-    execute_planned_statements_with_progress(
+    let import_result = execute_planned_statements_with_progress(
         state,
         request,
         &token,
@@ -482,7 +627,12 @@ pub async fn execute_sql_file_content(
         &mut progress,
         &mut emit,
     )
-    .await?;
+    .await;
+    if non_mysql_bypass {
+        let kind = bypass_kind.expect("non_mysql_bypass implies bypass_kind is set");
+        let _ = set_relational_constraints_enabled(state, request, kind, &token, true).await;
+    }
+    import_result?;
     emit_sql_file_terminal_progress(request, &token, started_at, &progress, &mut emit);
     Ok(())
 }
@@ -570,6 +720,20 @@ pub async fn execute_sql_file_paths(
             return Err(error);
         }
         executor.constraints_disabled = true;
+    }
+    let bypass_kind = import_target.as_ref().and_then(relational_constraint_bypass_kind);
+    let non_mysql_bypass = request.skip_relational_constraints
+        && mysql_executor.is_none()
+        && matches!(
+            bypass_kind,
+            Some(RelationalConstraintBypassKind::Postgres | RelationalConstraintBypassKind::SqlServer)
+        );
+    if non_mysql_bypass {
+        let kind = bypass_kind.expect("non_mysql_bypass implies bypass_kind is set");
+        if let Err(error) = set_relational_constraints_enabled(state, request, kind, &token, false).await {
+            emit(sql_file_execution_error_progress(&request.execution_id, started_at, &progress, error.clone()));
+            return Err(error);
+        }
     }
     let file_count = file_paths.len();
     let mut prev_statement_index = 0usize;
@@ -767,6 +931,10 @@ pub async fn execute_sql_file_paths(
         if let Some(executor) = mysql_executor.as_mut() {
             let _ = executor.set_foreign_key_checks(state, &token, true).await;
         }
+    }
+    if non_mysql_bypass {
+        let kind = bypass_kind.expect("non_mysql_bypass implies bypass_kind is set");
+        let _ = set_relational_constraints_enabled(state, request, kind, &token, true).await;
     }
     import_result
 }
