@@ -3389,10 +3389,64 @@ func (s *server) buildViewDDL(schema, name string) (string, error) {
 	}
 	trimmed := strings.TrimSpace(source)
 	upperSource := strings.ToUpper(trimmed)
+	var ddl string
 	if strings.HasPrefix(upperSource, "CREATE ") || strings.HasPrefix(upperSource, "ALTER ") {
-		return trimmed, nil
+		ddl = trimmed
+	} else {
+		ddl = fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s", quoteIdentifier(schema), quoteIdentifier(name), trimmed)
 	}
-	return fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s", quoteIdentifier(schema), quoteIdentifier(name), trimmed), nil
+	return s.appendViewCommentDDLs(schema, name, ddl), nil
+}
+
+// appendViewCommentDDLs appends COMMENT ON TABLE/COLUMN statements for views.
+// Oracle stores view comments in ALL_TAB_COMMENTS / ALL_COL_COMMENTS the same way as tables.
+func (s *server) appendViewCommentDDLs(schema, name, viewDDL string) string {
+	comments, err := s.loadTableCommentDDLs(schema, name)
+	if err != nil || len(comments) == 0 {
+		return viewDDL
+	}
+	var builder strings.Builder
+	builder.WriteString(terminateOracleViewDDL(strings.TrimSpace(viewDDL)))
+	for _, comment := range comments {
+		appendOracleDDLFragment(&builder, comment)
+	}
+	return builder.String()
+}
+
+func terminateOracleViewDDL(ddl string) string {
+	var lastCode byte
+	trailingLineComment := false
+	for pos := 0; pos < len(ddl); pos++ {
+		if isSQLWhitespace(ddl[pos]) {
+			continue
+		}
+		if ddl[pos] == '-' && pos+1 < len(ddl) && ddl[pos+1] == '-' {
+			pos = skipLineCommentSQL(ddl, pos)
+			trailingLineComment = true
+			continue
+		}
+		if ddl[pos] == '/' && pos+1 < len(ddl) && ddl[pos+1] == '*' {
+			pos = skipBlockCommentSQL(ddl, pos)
+			trailingLineComment = false
+			continue
+		}
+		if end, ok := skipOracleAlternativeQuotedSQL(ddl, pos); ok {
+			pos = end
+		} else if ddl[pos] == '\'' {
+			pos = skipSingleQuotedSQL(ddl, pos)
+		} else if ddl[pos] == '"' {
+			pos = skipDoubleQuotedSQL(ddl, pos)
+		}
+		lastCode = ddl[pos]
+		trailingLineComment = false
+	}
+	if lastCode == ';' || lastCode == '/' {
+		return ddl
+	}
+	if trailingLineComment {
+		return ddl + "\n;"
+	}
+	return ddl + ";"
 }
 
 func (s *server) getViewSource(schema, name string) (string, error) {
@@ -3812,7 +3866,7 @@ func (s *server) runPagedOracleSelect(sqlText string, opts queryOptions, pageSiz
 		if err != nil {
 			s.closeRows(rows)
 			var panicErr oracleDriverPanicError
-			if attempt == 0 && errors.As(err, &panicErr) {
+			if attempt == 0 && !oracleSQLLocksRows(sqlText) && errors.As(err, &panicErr) {
 				if placeholder, ok := oraclePlaceholderRetrySQL(sqlText, s.loadOracleColumnMeta); ok {
 					sqlText = placeholder
 					continue
@@ -4157,10 +4211,32 @@ func columnTypeNames(rows *sql.Rows) []string {
 }
 
 func (s *server) queryRowsWithOracleValueRewriteIfNeeded(sqlText string, timeoutSecs int, deferLOBs bool) (*sql.Rows, error) {
+	// A statement that keeps row locks while it runs is rewritten before the
+	// first attempt: when such a statement panics after the rows were locked,
+	// the locks stay behind and the retry below blocks on them until the query
+	// times out (issues #9344 / #9180).
+	if oracleSQLLocksRows(sqlText) {
+		rewritten, err := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, deferLOBs)
+		if err == nil && rewritten != sqlText {
+			return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+		}
+		return s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
+	}
 	if deferLOBs {
 		rewritten, err := rewriteOracleSelectSQL(sqlText, s.loadOracleColumnMeta, true)
 		if err == nil && rewritten != sqlText {
-			return s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+			rows, rewrittenErr := s.queryRowsWithTimeout(rewritten, nil, timeoutSecs)
+			if rewrittenErr == nil {
+				return rows, nil
+			}
+			// A deferred projection can still read a value the driver cannot
+			// decode (user-defined object/collection columns). Only a panic is
+			// worth retrying through the value-rewrite fallback below; other
+			// failures keep their own error.
+			var panicErr oracleDriverPanicError
+			if !errors.As(rewrittenErr, &panicErr) {
+				return nil, rewrittenErr
+			}
 		}
 	}
 	rows, err := s.queryRowsWithTimeout(sqlText, nil, timeoutSecs)
@@ -4535,6 +4611,8 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 					rewritten = append(rewritten, oracleGeometryExpression(column, columnRef, outputAlias))
 				} else if isOracleXMLType(column.DataType) && !deferLOBs {
 					rewritten = append(rewritten, oracleXMLSerializeExpression(columnRef, outputAlias))
+				} else if isOracleOpaqueObjectType(column) {
+					rewritten = append(rewritten, oracleOpaqueObjectExpression(column, columnRef, outputAlias))
 				} else if deferLOBs {
 					if expressions, ok := oracleDeferredLOBExpressions(columnRef, outputAlias, sourceIndex, column); ok {
 						rewritten = append(rewritten, expressions...)
@@ -4565,6 +4643,12 @@ func rewriteOracleSelectItems(items []string, columns []oracleColumnMeta, tableR
 				}
 				if isOracleXMLType(meta.DataType) && !deferLOBs {
 					rewritten = append(rewritten, oracleXMLSerializeExpression(columnRef, outputAlias))
+					changed = true
+					sourceIndex++
+					continue
+				}
+				if isOracleOpaqueObjectType(meta) {
+					rewritten = append(rewritten, oracleOpaqueObjectExpression(meta, columnRef, outputAlias))
 					changed = true
 					sourceIndex++
 					continue
@@ -4620,6 +4704,41 @@ func oracleGeometryPlaceholder(column oracleColumnMeta) string {
 		return "<SDO_GEOMETRY>"
 	}
 	return "<ST_GEOMETRY>"
+}
+
+// oracleOpaqueObjectExpression projects a placeholder instead of the value of a
+// user-defined type (object, collection, ANYDATA, ...). go-ora cannot decode
+// those values over the wire and panics while scanning them, which fails the
+// whole statement and rolls the transaction back (issues #9344 / #9180). The
+// placeholder keeps the statement and the remaining columns readable.
+func oracleOpaqueObjectExpression(column oracleColumnMeta, columnRef, alias string) string {
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE '%s' END AS %s", columnRef, oracleOpaqueObjectPlaceholder(column), alias)
+}
+
+func oracleOpaqueObjectPlaceholder(column oracleColumnMeta) string {
+	name := strings.ToUpper(strings.TrimSpace(column.DataType))
+	if name == "" {
+		name = "OBJECT"
+	}
+	return "<" + name + ">"
+}
+
+// oracleSQLLocksRows reports whether a statement holds row locks while it runs
+// (FOR UPDATE, FOR UPDATE OF ..., NOWAIT / WAIT n / SKIP LOCKED). Such a
+// statement must not be retried after a driver panic: the failed attempt keeps
+// its locks, so the retry would block on them instead of returning.
+func oracleSQLLocksRows(sqlText string) bool {
+	for searchFrom := 0; searchFrom < len(sqlText); {
+		pos := findTopLevelSQLKeyword(sqlText, searchFrom, "for")
+		if pos < 0 {
+			return false
+		}
+		if sqlKeywordAt(sqlText, skipSQLWhitespace(sqlText, pos+len("for")), "update") {
+			return true
+		}
+		searchFrom = pos + len("for")
+	}
+	return false
 }
 
 func oracleDeferredLOBKind(dataType string) (kind, placeholder string, ok bool) {
@@ -4719,7 +4838,15 @@ func oracleQualifierMatchesTable(qualifier string, tableRef oracleTableRef) bool
 
 func oracleColumnsNeedValueRewrite(columns []oracleColumnMeta, deferLOBs bool) bool {
 	for _, column := range columns {
-		if isOracleGeometryType(column) || isOracleXMLType(column.DataType) || (deferLOBs && isOracleDeferredLOBType(column.DataType)) {
+		if isOracleGeometryType(column) || isOracleXMLType(column.DataType) {
+			return true
+		}
+		if deferLOBs && isOracleDeferredLOBType(column.DataType) {
+			return true
+		}
+		// Opaque user-defined types are substituted in both the plain and the
+		// deferred preview projection, so a preview never panics on them.
+		if isOracleOpaqueObjectType(column) {
 			return true
 		}
 	}
@@ -4766,6 +4893,18 @@ func isOracleSDOGeometry(column oracleColumnMeta) bool {
 
 func isOracleGeometryType(column oracleColumnMeta) bool {
 	return isOracleSTGeometry(column) || isOracleSDOGeometry(column)
+}
+
+// isOracleOpaqueObjectType reports whether a column's declared type is a named
+// user-defined type that the driver cannot decode. Built-in scalar types report
+// no DATA_TYPE_OWNER; named types (object, collection, ANYDATA, ...) do. Types
+// DBX is able to render — SDE/SDO geometry, XMLType and deferred LOBs — are
+// matched earlier, so they are never treated as opaque here.
+func isOracleOpaqueObjectType(column oracleColumnMeta) bool {
+	if isOracleGeometryType(column) || isOracleXMLType(column.DataType) || isOracleDeferredLOBType(column.DataType) {
+		return false
+	}
+	return strings.TrimSpace(column.DataTypeOwner) != ""
 }
 
 func leadingSQLSelectListStart(sqlText string) int {

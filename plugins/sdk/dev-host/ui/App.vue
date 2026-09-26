@@ -104,6 +104,8 @@ const themes = () => ({
         "--color-primary-foreground": "#18181b",
         "--color-destructive": "#f3625f",
         "--color-destructive-foreground": "#18181b",
+        "--font-sans": '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+        "--font-mono": "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace",
         "--radius-md": "6px",
         "--radius-lg": "8px",
       }
@@ -121,6 +123,8 @@ const themes = () => ({
         "--color-primary-foreground": "#ffffff",
         "--color-destructive": "#e7000b",
         "--color-destructive-foreground": "#ffffff",
+        "--font-sans": '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+        "--font-mono": "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace",
         "--radius-md": "6px",
         "--radius-lg": "8px",
       },
@@ -257,7 +261,9 @@ function removeFrames(connectionId) {
 }
 async function closeFrame(frame) {
   await run(async () => {
-    if (!(await ask("关闭此页面？未保存修改将丢失；最后一个关联页面关闭后会断开连接。"))) return;
+    // Closing a debug page is cheap — the plugin UI is stateless and rebuilds
+    // on reopen — so it closes immediately instead of behind a modal that
+    // locks the whole shell until answered.
     connections.value = (await api("frames/close", { id: frame.id })).connections;
     windows.delete(frame.id);
     frames.value = frames.value.filter((f) => f.id !== frame.id);

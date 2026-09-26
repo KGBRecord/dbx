@@ -1,4 +1,5 @@
 import { ref, watch } from "vue";
+import type { SqlFilePreview } from "@/lib/backend/api";
 import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
@@ -13,8 +14,13 @@ const showDataCompareDialog = ref(false);
 const showSqlFileDialog = ref(false);
 const showDiagramDialog = ref(false);
 const showDocsDialog = ref(false);
+const showDataDictionaryDialog = ref(false);
 const showTableImportDialog = ref(false);
 const showMongoImportDialog = ref(false);
+const showMongoDatabaseDumpDialog = ref(false);
+const mongoDatabaseDumpPrefillConnectionId = ref("");
+const mongoDatabaseDumpPrefillDatabase = ref("");
+const mongoDatabaseDumpMode = ref<"dump" | "restore">("dump");
 const showTableDataGenerateDialog = ref(false);
 const showFieldLineageDialog = ref(false);
 const showDatabaseSearchDialog = ref(false);
@@ -57,6 +63,7 @@ const dataCompareSessionId = ref<string | null>(null);
 const sqlFilePrefillConnectionId = ref("");
 const sqlFilePrefillDatabase = ref("");
 const sqlFilePrefillFilePath = ref("");
+const sqlFilePrefillPreview = ref<SqlFilePreview>();
 const diagramPrefillConnectionId = ref("");
 const diagramPrefillDatabase = ref("");
 const diagramPrefillSchema = ref("");
@@ -65,6 +72,10 @@ const diagramFocusTableNames = ref<string[]>([]);
 const docsPrefillConnectionId = ref("");
 const docsPrefillDatabase = ref("");
 const docsPrefillSchema = ref("");
+const dataDictionaryPrefillConnectionId = ref("");
+const dataDictionaryPrefillDatabase = ref("");
+const dataDictionaryPrefillSchema = ref("");
+const dataDictionaryPrefillTableNames = ref<string[]>([]);
 const tableImportPrefillConnectionId = ref("");
 const tableImportPrefillDatabase = ref("");
 const tableImportPrefillSchema = ref("");
@@ -191,6 +202,7 @@ export function useDialogSources() {
           sqlFilePrefillConnectionId.value = v.connectionId;
           sqlFilePrefillDatabase.value = v.database;
           sqlFilePrefillFilePath.value = v.filePath ?? "";
+          sqlFilePrefillPreview.value = v.preview;
           showSqlFileDialog.value = true;
           connectionStore.sqlFileSource = null;
         }
@@ -203,7 +215,10 @@ export function useDialogSources() {
     // when stale (they only preselect dropdowns), but a stale path triggers an
     // async file read + preview render — a visible side effect.
     watch(showSqlFileDialog, (open) => {
-      if (!open) sqlFilePrefillFilePath.value = "";
+      if (!open) {
+        sqlFilePrefillFilePath.value = "";
+        sqlFilePrefillPreview.value = undefined;
+      }
     });
 
     watch(
@@ -237,6 +252,20 @@ export function useDialogSources() {
     );
 
     watch(
+      () => connectionStore.dataDictionarySource,
+      (v) => {
+        if (v) {
+          dataDictionaryPrefillConnectionId.value = v.connectionId;
+          dataDictionaryPrefillDatabase.value = v.database;
+          dataDictionaryPrefillSchema.value = v.schema ?? "";
+          dataDictionaryPrefillTableNames.value = v.tableNames ?? [];
+          showDataDictionaryDialog.value = true;
+          connectionStore.dataDictionarySource = null;
+        }
+      },
+    );
+
+    watch(
       () => connectionStore.tableImportSource,
       (v) => {
         if (v) {
@@ -260,6 +289,18 @@ export function useDialogSources() {
           showMongoImportDialog.value = true;
           connectionStore.mongoImportSource = null;
         }
+      },
+    );
+
+    watch(
+      () => connectionStore.mongoDatabaseDumpSource,
+      (source) => {
+        if (!source) return;
+        mongoDatabaseDumpPrefillConnectionId.value = source.connectionId;
+        mongoDatabaseDumpPrefillDatabase.value = source.database;
+        mongoDatabaseDumpMode.value = source.mode;
+        showMongoDatabaseDumpDialog.value = true;
+        connectionStore.mongoDatabaseDumpSource = null;
       },
     );
 
@@ -517,8 +558,13 @@ export function useDialogSources() {
     showSqlFileDialog,
     showDiagramDialog,
     showDocsDialog,
+    showDataDictionaryDialog,
     showTableImportDialog,
     showMongoImportDialog,
+    showMongoDatabaseDumpDialog,
+    mongoDatabaseDumpPrefillConnectionId,
+    mongoDatabaseDumpPrefillDatabase,
+    mongoDatabaseDumpMode,
     showTableDataGenerateDialog,
     showFieldLineageDialog,
     showDatabaseSearchDialog,
@@ -557,6 +603,7 @@ export function useDialogSources() {
     sqlFilePrefillConnectionId,
     sqlFilePrefillDatabase,
     sqlFilePrefillFilePath,
+    sqlFilePrefillPreview,
     diagramPrefillConnectionId,
     diagramPrefillDatabase,
     diagramPrefillSchema,
@@ -565,6 +612,10 @@ export function useDialogSources() {
     docsPrefillConnectionId,
     docsPrefillDatabase,
     docsPrefillSchema,
+    dataDictionaryPrefillConnectionId,
+    dataDictionaryPrefillDatabase,
+    dataDictionaryPrefillSchema,
+    dataDictionaryPrefillTableNames,
     tableImportPrefillConnectionId,
     tableImportPrefillDatabase,
     tableImportPrefillSchema,
