@@ -1108,8 +1108,10 @@ fn write_sql_export_statements(
     wrote_statements: &mut bool,
 ) -> Result<(), String> {
     for statement in statements {
-        let unit = if *wrote_statements { format!("\n{statement}") } else { statement };
-        file.write_all(unit.as_bytes()).map_err(|e| format!("Failed to write SQL: {e}"))?;
+        if *wrote_statements {
+            file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
+        }
+        file.write_all(statement.as_bytes()).map_err(|e| format!("Failed to write SQL: {e}"))?;
         *wrote_statements = true;
     }
     Ok(())
