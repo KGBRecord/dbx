@@ -1062,12 +1062,27 @@ enum TableExportSqlWriter {
     SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
 }
 
+impl TableExportSqlWriter {
+    fn write_sql_unit(&mut self, unit: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.write_all(unit),
+            Self::SplitZip(writer) => writer.write_sql_unit(unit),
+        }
+    }
+}
+
 impl Write for TableExportSqlWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(writer) => writer.write(buffer),
             Self::SplitZip(writer) => writer.write(buffer),
         }
+    }
+
+    fn write_fmt(&mut self, fmt: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        let mut unit = String::new();
+        std::fmt::write(&mut unit, fmt).map_err(|_| std::io::Error::other("Failed to format SQL export unit"))?;
+        self.write_sql_unit(unit.as_bytes())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1085,6 +1100,19 @@ impl TableExportSqlWriter {
             Self::SplitZip(writer) => writer.finish(source_file_name),
         }
     }
+}
+
+fn write_sql_export_statements(
+    file: &mut impl Write,
+    statements: Vec<String>,
+    wrote_statements: &mut bool,
+) -> Result<(), String> {
+    for statement in statements {
+        let unit = if *wrote_statements { format!("\n{statement}") } else { statement };
+        file.write_all(unit.as_bytes()).map_err(|e| format!("Failed to write SQL: {e}"))?;
+        *wrote_statements = true;
+    }
+    Ok(())
 }
 
 fn create_table_export_sql_writer(request: &TableExportRequest) -> Result<TableExportSqlWriter, String> {
@@ -1404,14 +1432,7 @@ async fn try_export_native_table_stream(
                         &sql_export_excluded_columns(request, primary_keys, col_names, column_extras),
                         request.insert_dialect,
                     )?;
-                    if !statements.is_empty() {
-                        if wrote_statements {
-                            file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
-                        }
-                        file.write_all(statements.join("\n").as_bytes())
-                            .map_err(|e| format!("Failed to write SQL: {e}"))?;
-                        wrote_statements = true;
-                    }
+                    write_sql_export_statements(file, statements, &mut wrote_statements)?;
                     Ok(())
                 };
             let result = stream_native_table_rows(
@@ -2263,14 +2284,7 @@ async fn export_table_data_core_inner(
                     &sql_export_excluded_columns(request, &primary_keys, &col_names, &column_extras),
                     request.insert_dialect,
                 )?;
-                if !statements.is_empty() {
-                    if wrote_statements {
-                        file.write_all(b"\n").map_err(|e| format!("Failed to write SQL: {e}"))?;
-                    }
-                    file.write_all(statements.join("\n").as_bytes())
-                        .map_err(|e| format!("Failed to write SQL: {e}"))?;
-                    wrote_statements = true;
-                }
+                write_sql_export_statements(&mut file, statements, &mut wrote_statements)?;
 
                 rows_exported += row_count as u64;
                 if use_keyset {
@@ -2334,6 +2348,39 @@ mod tests {
     use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn split_zip_sql_export_writes_batch_statements_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("export.zip");
+        let statement = format!("INSERT INTO t VALUES ('{}');", "x".repeat(700 * 1024));
+        let mut writer = crate::export_split_zip::SplitZipExportWriter::create(
+            &zip_path,
+            crate::export_split_zip::MIN_SPLIT_PART_MAX_MB,
+            "table",
+            "sql",
+        )
+        .unwrap();
+        let mut wrote_statements = false;
+
+        write_sql_export_statements(&mut writer, vec![statement.clone(), statement.clone()], &mut wrote_statements)
+            .unwrap();
+        writer.finish("table.sql").unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path).unwrap()).unwrap();
+        let mut sql_parts = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if entry.name().ends_with(".sql") {
+                let mut contents = String::new();
+                entry.read_to_string(&mut contents).unwrap();
+                sql_parts.push(contents);
+            }
+        }
+
+        assert_eq!(sql_parts, vec![format!("{statement}\n"), statement]);
+        assert!(sql_parts.iter().all(|part| part.len() <= 1024 * 1024));
+    }
 
     #[test]
     fn table_export_request_defaults_to_source_dialect_and_batch_insert_mode() {
