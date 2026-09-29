@@ -9,9 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::commands::connection::{ensure_connection_writable, AppState};
 use dbx_core::sql_file_import::{
-    execute_sql_file_paths, execute_sql_file_zip_package_paths, mysql_like_sql_file_bootstrap_analysis, read_sql_file_preview,
-    sql_file_progress,
-    SqlFileProgressEmitter,
+    execute_sql_file_paths, execute_sql_file_zip_package_paths, mysql_like_sql_file_bootstrap_analysis,
+    read_sql_file_preview, sql_file_progress, SqlFileProgressEmitter,
 };
 
 pub use dbx_core::sql::{SqlFilePreview, SqlFileRequest, SqlFileStatus};
