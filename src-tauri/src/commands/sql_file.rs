@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::commands::connection::{ensure_connection_writable, AppState};
 use dbx_core::sql_file_import::{
-    execute_sql_file_paths, mysql_like_sql_file_bootstrap_analysis, read_sql_file_preview, sql_file_progress,
+    execute_sql_file_paths, execute_sql_file_zip_package_paths, mysql_like_sql_file_bootstrap_analysis, read_sql_file_preview,
+    sql_file_progress,
     SqlFileProgressEmitter,
 };
 
@@ -119,7 +120,8 @@ pub async fn execute_sql_files(
     }
 
     let started_at = Instant::now();
-    let result = execute_sql_files_inner(&app, &state, &request, &file_paths, token, started_at).await;
+    let is_zip_package = request.file_path.to_ascii_lowercase().ends_with(".zip");
+    let result = execute_sql_files_inner(&app, &state, &request, &file_paths, token, started_at, is_zip_package).await;
     cleanup_sql_zip_package_paths(&file_paths);
     {
         let mut executions = sql_file_executions().write().await;
@@ -185,6 +187,7 @@ async fn execute_sql_files_inner(
     file_paths: &[String],
     token: CancellationToken,
     started_at: Instant,
+    is_zip_package: bool,
 ) -> Result<(), String> {
     let mut progress_emitter = SqlFileProgressEmitter::new(|progress| {
         let _ = app.emit("sql-file-progress", progress);
@@ -202,10 +205,17 @@ async fn execute_sql_files_inner(
     ));
     let paths: Vec<PathBuf> = file_paths.iter().map(PathBuf::from).collect();
     let path_refs: Vec<&std::path::Path> = paths.iter().map(PathBuf::as_path).collect();
-    execute_sql_file_paths(state.inner().as_ref(), request, &path_refs, token, started_at, |progress| {
-        progress_emitter.emit(progress);
-    })
-    .await
+    if is_zip_package {
+        execute_sql_file_zip_package_paths(state.inner().as_ref(), request, &path_refs, token, started_at, |progress| {
+            progress_emitter.emit(progress);
+        })
+        .await
+    } else {
+        execute_sql_file_paths(state.inner().as_ref(), request, &path_refs, token, started_at, |progress| {
+            progress_emitter.emit(progress);
+        })
+        .await
+    }
 }
 
 fn register_sql_file_execution(

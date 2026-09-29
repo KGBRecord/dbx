@@ -8,8 +8,8 @@ use axum::response::sse::{Event, Sse};
 use axum::Json;
 use dbx_core::sql::{self, SqlFileProgress, SqlFileRequest, SqlFileStatus};
 use dbx_core::sql_file_import::{
-    execute_sql_file_paths, sql_file_error_progress, sql_file_progress as build_sql_file_progress,
-    SqlFileProgressEmitter,
+    execute_sql_file_paths, execute_sql_file_zip_package_paths, sql_file_error_progress,
+    sql_file_progress as build_sql_file_progress, SqlFileProgressEmitter,
 };
 use futures::stream::Stream;
 use serde::Deserialize;
@@ -267,6 +267,7 @@ pub async fn execute_sql_file(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let req = body.request;
 
+    let is_zip_package = req.file_path.to_ascii_lowercase().ends_with(".zip");
     let requested_paths = if body.file_paths.is_empty() { vec![req.file_path.clone()] } else { body.file_paths };
     let file_paths = requested_paths
         .iter()
@@ -344,10 +345,17 @@ pub async fn execute_sql_file(
         let file_path_refs: Vec<&Path> = file_paths.iter().map(PathBuf::as_path).collect();
         // The core executor emits exactly one terminal Error with the latest
         // cumulative counters before returning Err.
-        let _ = execute_sql_file_paths(&app, &req, &file_path_refs, token, started_at, |progress| {
-            progress_emitter.emit(progress);
-        })
-        .await;
+        let _ = if is_zip_package {
+            execute_sql_file_zip_package_paths(&app, &req, &file_path_refs, token, started_at, |progress| {
+                progress_emitter.emit(progress);
+            })
+            .await
+        } else {
+            execute_sql_file_paths(&app, &req, &file_path_refs, token, started_at, |progress| {
+                progress_emitter.emit(progress);
+            })
+            .await
+        };
 
         cleanup_sql_file_package_paths(&file_paths);
         cleanup_sql_file_execution(&state_clone, &req.execution_id).await;
