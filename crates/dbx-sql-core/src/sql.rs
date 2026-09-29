@@ -1364,7 +1364,7 @@ fn starts_with_sqlserver_control_flow_batch(sql: &str) -> bool {
         && tokens.iter().any(|token| token.eq_ignore_ascii_case("END"))
 }
 
-fn starts_with_sqlserver_module_ddl(sql: &str) -> bool {
+pub fn starts_with_sqlserver_module_ddl(sql: &str) -> bool {
     let tokens = first_sql_tokens(sql, 4);
     if tokens.len() >= 4
         && tokens[0].eq_ignore_ascii_case("CREATE")
@@ -1617,14 +1617,45 @@ fn mysql_routine_tokens(sql: &str) -> Vec<String> {
 
 fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
     let mut tokens = Vec::new();
-    for token in sql.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
-        if token.is_empty() {
-            continue;
+    let mut token = String::new();
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            for comment_char in chars.by_ref() {
+                if comment_char == '\n' {
+                    break;
+                }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            let mut previous = None;
+            for comment_char in chars.by_ref() {
+                if previous == Some('*') && comment_char == '/' {
+                    break;
+                }
+                previous = Some(comment_char);
+            }
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
         }
-        tokens.push(token.to_string());
+
         if tokens.len() >= limit {
             break;
         }
+    }
+
+    if tokens.len() < limit && !token.is_empty() {
+        tokens.push(token);
     }
     tokens
 }

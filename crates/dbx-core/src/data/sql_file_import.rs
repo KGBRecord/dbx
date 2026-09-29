@@ -14,6 +14,7 @@ use crate::models::connection::DatabaseType;
 
 pub const DEFAULT_SQL_FILE_UPLOAD_MAX_MB: u32 = 200;
 pub const MAX_SQL_FILE_UPLOAD_MAX_MB: u32 = 4096;
+const SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS: usize = 100;
 
 pub fn clamp_sql_file_upload_max_mb(value: u32) -> u32 {
     value.clamp(1, MAX_SQL_FILE_UPLOAD_MAX_MB)
@@ -25,9 +26,9 @@ use crate::query::{
 };
 use crate::sql::{
     optimize_sql_file_import_statements, optimize_sql_file_import_statements_with_max_insert_batch_statements,
-    prepare_sql_file_statement, split_sql_batches, statement_summary, SqlFileImportStatement,
-    SqlFileImportStatementKind, SqlFilePhase, SqlFileProgress, SqlFileRequest, SqlFileStatementAction, SqlFileStatus,
-    SqlParsingOptions, SqlStatementSplitter, SqlStatementWithControl,
+    prepare_sql_file_statement, split_sql_batches, starts_with_sqlserver_module_ddl, statement_summary,
+    SqlFileImportStatement, SqlFileImportStatementKind, SqlFilePhase, SqlFileProgress, SqlFileRequest,
+    SqlFileStatementAction, SqlFileStatus, SqlParsingOptions, SqlStatementSplitter, SqlStatementWithControl,
 };
 use crate::types::QueryResult;
 
@@ -894,12 +895,12 @@ async fn execute_sql_file_paths_inner(
     let mut prev_success_count = 0usize;
     let mut prev_failure_count = 0usize;
     let mut prev_affected_rows = 0u64;
-    let mut splitter = zip_package.then(|| StreamingSqlFileSplitter::new(database_type, options));
+    let mut splitter = zip_package.then(|| StreamingSqlFileSplitter::new(database_type, options, true));
     let mut pending_statements = Vec::with_capacity(SQL_FILE_STATEMENT_BATCH_SIZE);
     let import_result = async {
         for (file_index, file_path) in file_paths.iter().enumerate() {
             if !zip_package {
-                splitter = Some(StreamingSqlFileSplitter::new(database_type, options));
+                splitter = Some(StreamingSqlFileSplitter::new(database_type, options, false));
             }
             let file_name = file_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
@@ -1128,7 +1129,8 @@ async fn scan_sql_file_tables(
     token: &CancellationToken,
 ) -> Result<(Vec<SqlFileTable>, std::collections::BTreeSet<SqlFileTable>), String> {
     let mut decoder = SqlFileStreamDecoder::open_for_target(file_path, true).await?;
-    let mut splitter = StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible());
+    let mut splitter =
+        StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible(), false);
     let mut scan = TableRestoreFilter::default();
     while let Some(chunk) = decoder.next_chunk().await? {
         if token.is_cancelled() {
@@ -1772,8 +1774,12 @@ enum StreamingSqlFileSplitterKind {
 }
 
 impl StreamingSqlFileSplitter {
-    pub(crate) fn new(db_type: Option<DatabaseType>, options: SqlParsingOptions) -> Self {
-        Self(StreamingSqlFileSplitterKind::new(db_type, options))
+    pub(crate) fn new(
+        db_type: Option<DatabaseType>,
+        options: SqlParsingOptions,
+        flush_sqlserver_semicolons: bool,
+    ) -> Self {
+        Self(StreamingSqlFileSplitterKind::new(db_type, options, flush_sqlserver_semicolons))
     }
 
     pub(crate) fn push_chunk(&mut self, chunk: &str) -> Vec<SqlStatementWithControl> {
@@ -1786,9 +1792,9 @@ impl StreamingSqlFileSplitter {
 }
 
 impl StreamingSqlFileSplitterKind {
-    fn new(db_type: Option<DatabaseType>, options: SqlParsingOptions) -> Self {
+    fn new(db_type: Option<DatabaseType>, options: SqlParsingOptions, flush_sqlserver_semicolons: bool) -> Self {
         if db_type == Some(DatabaseType::SqlServer) {
-            Self::SqlServerBatches(SqlServerBatchSplitter::default())
+            Self::SqlServerBatches(SqlServerBatchSplitter::new(flush_sqlserver_semicolons))
         } else {
             Self::Statements(SqlStatementSplitter::with_options(options))
         }
@@ -1815,11 +1821,17 @@ impl StreamingSqlFileSplitterKind {
     }
 }
 
-#[derive(Default)]
 struct SqlServerBatchSplitter {
     batch: String,
     partial_line: String,
     lexical_state: SqlServerLexicalState,
+    flush_semicolons: bool,
+}
+
+impl Default for SqlServerBatchSplitter {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1834,6 +1846,15 @@ enum SqlServerLexicalState {
 }
 
 impl SqlServerBatchSplitter {
+    fn new(flush_semicolons: bool) -> Self {
+        Self {
+            batch: String::new(),
+            partial_line: String::new(),
+            lexical_state: SqlServerLexicalState::default(),
+            flush_semicolons,
+        }
+    }
+
     fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
         self.partial_line.push_str(chunk);
         let mut batches = Vec::new();
@@ -1876,7 +1897,9 @@ impl SqlServerBatchSplitter {
                         self.batch.push(chars.next().unwrap());
                         self.lexical_state = SqlServerLexicalState::BlockComment;
                     }
-                    ';' if !self.is_module_batch() => self.push_batch(batches),
+                    ';' if self.flush_semicolons && !starts_with_sqlserver_module_ddl(&self.batch) => {
+                        self.push_batch(batches)
+                    }
                     _ => {}
                 },
                 SqlServerLexicalState::SingleQuote if ch == '\'' => {
@@ -1911,23 +1934,6 @@ impl SqlServerBatchSplitter {
         if matches!(self.lexical_state, SqlServerLexicalState::LineComment) {
             self.lexical_state = SqlServerLexicalState::Normal;
         }
-    }
-
-    fn is_module_batch(&self) -> bool {
-        let source = strip_leading_sql_comments(&self.batch, false).trim_start();
-        let mut words = source.split_whitespace();
-        let Some(first) = words.next() else { return false };
-        if !matches!(first.to_ascii_uppercase().as_str(), "CREATE" | "ALTER") {
-            return false;
-        }
-        let mut kind = words.next();
-        if kind.is_some_and(|word| word.eq_ignore_ascii_case("OR")) {
-            kind = words.next();
-            if kind.is_some_and(|word| word.eq_ignore_ascii_case("ALTER")) {
-                kind = words.next();
-            }
-        }
-        matches!(kind.map(|word| word.to_ascii_uppercase()), Some(kind) if matches!(kind.as_str(), "PROC" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "VIEW"))
     }
 
     fn push_batch(&mut self, batches: &mut Vec<String>) {
@@ -2073,7 +2079,7 @@ fn plan_sql_file_statements(
 }
 
 fn sql_file_import_max_insert_batch_statements(zip_package: bool, db_type: Option<DatabaseType>) -> Option<usize> {
-    (zip_package && db_type == Some(DatabaseType::SqlServer)).then_some(1)
+    (zip_package && db_type == Some(DatabaseType::SqlServer)).then_some(SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS)
 }
 
 fn optimize_sql_file_import_statements_for_batch(
@@ -2958,7 +2964,7 @@ mod tests {
         assert!(dump.len() > SQL_FILE_STATEMENT_BATCH_MAX_BYTES * 2, "the dump must exceed the byte bound");
 
         let mut splitter =
-            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible());
+            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible(), false);
         let mut pending: Vec<SqlStatementWithControl> = Vec::new();
         let mut batches: Vec<(usize, usize)> = Vec::new();
         let mut largest_statement = 0usize;
@@ -3005,7 +3011,7 @@ mod tests {
             SqlFileTable { database: Some("second".to_string()), name: "b".to_string() },
         ];
         let mut splitter =
-            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible());
+            StreamingSqlFileSplitter::new(Some(DatabaseType::Mysql), SqlParsingOptions::mysql_compatible(), false);
         let mut filter = TableRestoreFilter::default();
         let mut statements = Vec::new();
         for chunk in ["INSERT INTO a VALUES (1); USE second;", "INSERT INTO b VALUES (2); INSERT INTO a VALUES (3);"] {
@@ -3351,7 +3357,8 @@ mod tests {
 
     #[test]
     fn ordinary_multifile_import_does_not_share_splitter_state() {
-        let mut first_file = StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default());
+        let mut first_file =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
         assert!(first_file.push_chunk("INSERT INTO dbo.items VALUES (N'partial").is_empty());
         assert_eq!(
             first_file.finish().into_iter().map(|statement| statement.sql).collect::<Vec<_>>(),
@@ -3359,10 +3366,12 @@ mod tests {
         );
 
         let mut second_file =
-            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default());
-        let statements =
-            second_file.push_chunk("SELECT 2;\n").into_iter().map(|statement| statement.sql).collect::<Vec<_>>();
-        assert_eq!(statements, vec!["SELECT 2;"]);
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+        assert!(second_file.push_chunk("SELECT 2;\n").is_empty());
+        assert_eq!(
+            second_file.finish().into_iter().map(|statement| statement.sql).collect::<Vec<_>>(),
+            vec!["SELECT 2;"]
+        );
     }
 
     #[test]
@@ -3372,7 +3381,10 @@ mod tests {
 
         assert_eq!(sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::Postgres)), None);
         assert_eq!(sql_file_import_max_insert_batch_statements(false, Some(DatabaseType::SqlServer)), None);
-        assert_eq!(sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::SqlServer)), Some(1));
+        assert_eq!(
+            sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::SqlServer)),
+            Some(SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS)
+        );
 
         let postgres =
             optimize_sql_file_import_statements_for_batch(&statements, Some(DatabaseType::Postgres), None, None);
@@ -3385,13 +3397,33 @@ mod tests {
 
         assert_eq!(postgres.len(), 1);
         assert_eq!(postgres[0].source_statement_count, 2);
+        assert_eq!(sqlserver_zip.len(), 1);
+        assert_eq!(sqlserver_zip[0].source_statement_count, 2);
+    }
+
+    #[test]
+    fn sqlserver_zip_insert_cap_still_bounds_very_large_merges() {
+        let statements: Vec<String> = (0..(SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS * 2))
+            .map(|id| format!("INSERT INTO items (id) VALUES ({id});"))
+            .collect();
+
+        let sqlserver_zip = optimize_sql_file_import_statements_for_batch(
+            &statements,
+            Some(DatabaseType::SqlServer),
+            None,
+            sql_file_import_max_insert_batch_statements(true, Some(DatabaseType::SqlServer)),
+        );
+
         assert_eq!(sqlserver_zip.len(), 2);
-        assert!(sqlserver_zip.iter().all(|statement| statement.source_statement_count == 1));
+        assert!(sqlserver_zip
+            .iter()
+            .all(|statement| statement.source_statement_count == SQLSERVER_ZIP_INSERT_BATCH_MAX_STATEMENTS));
     }
 
     #[test]
     fn streaming_sqlserver_splitter_emits_semicolon_terminated_inserts_without_go() {
-        let mut splitter = StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default());
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
         let statements = splitter
             .push_chunk("INSERT INTO dbo.items VALUES (1);\nINSERT INTO dbo.items VALUES (2);\n")
             .into_iter()
@@ -3404,7 +3436,8 @@ mod tests {
 
     #[test]
     fn streaming_sqlserver_splitter_ignores_semicolons_inside_literals_and_comments() {
-        let mut splitter = StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default());
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
         let statements = splitter
             .push_chunk("INSERT INTO dbo.items VALUES (N'one; two', [a;]); -- trailing ;\n/* block ; comment */ INSERT INTO dbo.items VALUES (2);\n")
             .into_iter()
@@ -3426,7 +3459,8 @@ mod tests {
         let part_one = "INSERT INTO [dbo].[VersionValue] ([value]) VALUES (N'{\"materialOrSymbolMate";
         let part_two = "rialId\":\"9625a891-3682-4151-acdb-6480db860033\",\"label\":\"B\\\\u1ebb ch\\\\u00e2n/Th\\\\u1eb3ng/\",\"quote\":\"it''s valid\"}');\n";
         let expected = format!("{part_one}{part_two}").trim().to_string();
-        let mut splitter = StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default());
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
 
         assert!(splitter.push_chunk(part_one).is_empty());
         let statements = splitter.push_chunk(part_two).into_iter().map(|statement| statement.sql).collect::<Vec<_>>();
@@ -3437,7 +3471,8 @@ mod tests {
 
     #[test]
     fn streaming_sqlserver_splitter_keeps_leading_comment_module_semicolons_until_go() {
-        let mut splitter = StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default());
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
 
         assert!(splitter
             .push_chunk("/* setup */\nCREATE OR ALTER PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\n")
@@ -3459,6 +3494,59 @@ mod tests {
         batches.extend(splitter.finish());
 
         assert_eq!(batches, vec!["CREATE PROCEDURE dbo.demo AS\nBEGIN\nSELECT 1;\nEND", "SELECT 2;"]);
+    }
+
+    #[test]
+    fn ordinary_sqlserver_import_keeps_declared_variable_batch_scope() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+
+        let statements = splitter
+            .push_chunk("DECLARE @name nvarchar(50);\nSET @name = 'x';\nSELECT * FROM users WHERE name = @name;\nGO\n")
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statements,
+            vec!["DECLARE @name nvarchar(50);\nSET @name = 'x';\nSELECT * FROM users WHERE name = @name;"]
+        );
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn ordinary_sqlserver_import_keeps_control_flow_batch_together() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), false);
+
+        let statements = splitter
+            .push_chunk(
+                "IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'demo')\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nELSE\nBEGIN\n  SELECT 3;\nEND\nGO\n",
+            )
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statements,
+            vec!["IF EXISTS (SELECT 1 FROM sys.tables WHERE name = 'demo')\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nELSE\nBEGIN\n  SELECT 3;\nEND"]
+        );
+        assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn zip_sqlserver_import_still_keeps_module_body_whole_with_comment_before_keyword() {
+        let mut splitter =
+            StreamingSqlFileSplitter::new(Some(DatabaseType::SqlServer), SqlParsingOptions::default(), true);
+
+        let statements = splitter
+            .push_chunk("CREATE /*c*/ PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nGO\n")
+            .into_iter()
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>();
+
+        assert_eq!(statements, vec!["CREATE /*c*/ PROCEDURE dbo.demo AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND"]);
+        assert!(splitter.finish().is_empty());
     }
 
     #[tokio::test]
