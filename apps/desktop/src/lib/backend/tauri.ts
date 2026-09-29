@@ -51,7 +51,7 @@ import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type Meil
 import type { XuguTablespaceInfo } from "@/types/database";
 import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchCreateIndexInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
-import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
+import type { SqlExportColumnSelection, SqlInsertDialect, SqlInsertMode } from "@/lib/export/sqlInsertMode";
 
 /** Normalize Tauri rejections once at the public backend boundary. */
 async function invokeBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -172,7 +172,7 @@ import type {
   TableAdminSqlOptions,
   VacuumTableSqlOptions,
 } from "@/lib/database/dbAdminSql";
-import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/export/databaseExport";
+import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, BuildExportSqlInsertOptions } from "@/lib/export/databaseExport";
 
 export interface SshPromptResolution {
   id: string;
@@ -387,6 +387,55 @@ export interface WebDavSyncSummary {
   bytes: number;
   exportedAt?: string;
   appVersion?: string;
+}
+
+export interface SyncCatalogItem {
+  id: string;
+  label: string;
+}
+
+export interface PluginUiStorageItemRef {
+  pluginId: string;
+  key: string;
+  pluginName?: string;
+}
+
+export interface SyncSelection {
+  connections?: string[];
+  connectionSecrets?: string[];
+  tunnelProfiles?: string[];
+  tunnelSecrets?: string[];
+  savedSqlFolders?: string[];
+  savedSqlFiles?: string[];
+  desktopSettings?: string[];
+  editorSettings?: string[];
+  aiConfigs?: string[];
+  pluginUiStorage?: PluginUiStorageItemRef[];
+  sidebarLayout?: boolean;
+  pinnedTreeNodeIds?: boolean;
+  includeSecrets: boolean;
+  syncCredentials: boolean;
+}
+
+export interface SyncSnapshotCatalog {
+  exportedAt: string;
+  appVersion: string;
+  hasEncryptedSecrets: boolean;
+  connections: SyncCatalogItem[];
+  connectionSecrets: string[];
+  tunnelProfiles: SyncCatalogItem[];
+  tunnelSecrets: string[];
+  savedSqlFolders: SyncCatalogItem[];
+  savedSqlFiles: SyncCatalogItem[];
+  desktopSettings: SyncCatalogItem[];
+  editorSettings: SyncCatalogItem[];
+  aiConfigs: SyncCatalogItem[];
+  aiConfigsLocked: boolean;
+  pluginUiStorage: PluginUiStorageItemRef[];
+  pluginUiStorageLocked: boolean;
+  hasSidebarLayout: boolean;
+  hasPinnedTreeNodeIds: boolean;
+  selection?: SyncSelection;
 }
 
 export interface WebDavDownloadResult {
@@ -882,6 +931,14 @@ export async function saveHistoryRetentionLimit(limit: number): Promise<void> {
   return invoke("save_history_retention_limit", { limit });
 }
 
+export async function loadMcpHistoryRetentionLimit(): Promise<number> {
+  return invoke("load_mcp_history_retention_limit");
+}
+
+export async function saveMcpHistoryRetentionLimit(limit: number): Promise<void> {
+  return invoke("save_mcp_history_retention_limit", { limit });
+}
+
 export async function loadMaxRetries(): Promise<number> {
   return invoke("load_max_retries");
 }
@@ -1053,17 +1110,26 @@ export async function forgetWebdavSyncSecretsPassphrase(): Promise<void> {
   return invoke("forget_webdav_sync_secrets_passphrase");
 }
 
-export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: unknown, secretsPassphrase?: string, includeSecrets = false): Promise<WebDavSyncSummary> {
+export async function cloudSyncLocalCatalog(editorSettings?: unknown): Promise<SyncSnapshotCatalog> {
+  return invoke("cloud_sync_local_catalog", { editorSettings });
+}
+
+export async function webdavSyncInspect(config: WebDavConfig, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
+  return invoke("webdav_sync_inspect", { config, secretsPassphrase });
+}
+
+export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: unknown, secretsPassphrase?: string, includeSecrets = false, selection?: SyncSelection): Promise<WebDavSyncSummary> {
   return invoke("webdav_sync_upload", {
     config,
     editorSettings,
     secretsPassphrase,
     includeSecrets,
+    selection,
   });
 }
 
-export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true): Promise<WebDavDownloadResult> {
-  return invoke("webdav_sync_download", { config, secretsPassphrase, restoreSecrets });
+export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string, restoreSecrets = true, selection?: SyncSelection): Promise<WebDavDownloadResult> {
+  return invoke("webdav_sync_download", { config, secretsPassphrase, restoreSecrets, selection });
 }
 
 export async function snippetSyncTest(config: SnippetSyncConfig): Promise<void> {
@@ -1094,18 +1160,23 @@ export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Prom
   return invoke("retry_snippet_legacy_cleanup", { config });
 }
 
-export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string): Promise<SnippetSyncSummary> {
+export async function snippetSyncInspect(config: SnippetSyncConfig, snippetPassphrase?: string, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
+  return invoke("snippet_sync_inspect", { config, snippetPassphrase, secretsPassphrase });
+}
+
+export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string, selection?: SyncSelection): Promise<SnippetSyncSummary> {
   return invoke("snippet_sync_upload", {
     config,
     editorSettings,
     snippetPassphrase,
     includeSecrets,
     secretsPassphrase,
+    selection,
   });
 }
 
-export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string): Promise<SnippetDownloadResult> {
-  return invoke("snippet_sync_download", { config, snippetPassphrase, restoreSecrets, secretsPassphrase });
+export async function snippetSyncDownload(config: SnippetSyncConfig, snippetPassphrase?: string, restoreSecrets = false, secretsPassphrase?: string, selection?: SyncSelection): Promise<SnippetDownloadResult> {
+  return invoke("snippet_sync_download", { config, snippetPassphrase, restoreSecrets, secretsPassphrase, selection });
 }
 
 export async function loadPinnedTreeNodeIds(): Promise<string[]> {
@@ -2251,7 +2322,7 @@ export async function buildExportInsertStatements(options: BuildExportInsertStat
   return invoke("build_export_insert_statements", { options });
 }
 
-export async function buildExportSqlInsert(options: BuildExportInsertStatementsOptions): Promise<string> {
+export async function buildExportSqlInsert(options: BuildExportSqlInsertOptions): Promise<string> {
   return invoke("build_export_sql_insert", { options });
 }
 
@@ -2511,8 +2582,8 @@ export async function exportDocsHtml(filePath: string, snapshot: SchemaSnapshot,
   return invoke("docs_export_html", { filePath, snapshot, annotations, lang });
 }
 
-export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {
-  return invoke("save_connections", { configs });
+export async function saveConnections(configs: ConnectionConfig[], removedIds: string[] = []): Promise<void> {
+  return invoke("save_connections", { configs, removedIds });
 }
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
@@ -2663,6 +2734,14 @@ export async function writePluginLocalFileChunk(pluginId: string, handleId: stri
 
 export async function closePluginLocalFile(pluginId: string, handleId: string): Promise<void> {
   return invoke("plugin_file_close", { pluginId, handleId });
+}
+
+export async function openPluginMedia(pluginId: string, method: string, params: Record<string, unknown>): Promise<string> {
+  return invoke("plugin_media_open", { pluginId, method, params });
+}
+
+export async function closePluginMedia(pluginId: string, token: string): Promise<void> {
+  return invoke("plugin_media_close", { pluginId, token });
 }
 
 export async function getPluginUiStorage(pluginId: string, key: string): Promise<unknown> {
@@ -3090,7 +3169,8 @@ export interface RedisKeyInfo {
 
 export interface RedisDatabaseInfo {
   db: number;
-  keys: number;
+  /** 该库的键数量；服务端无法给出可信数量时（如 kvrocks 未执行过 DBSIZE SCAN）缺省。 */
+  keys?: number;
 }
 
 export type RedisBlobEncoding = "utf8" | "binary";
@@ -3194,7 +3274,11 @@ export type RedisValueData =
       scan_cursor?: number;
     }
   | { kind: "stream"; entries: RedisStreamEntry[]; total?: number; next_cursor?: string }
-  | { kind: "unknown" };
+  // kvrocks 把位图/HLL 实现为独立类型（TYPE 返回 bitmap / hyperloglog），
+  // 这里单独建模，避免落到 unknown 后界面显示不出值。
+  | { kind: "bitmap"; content: RedisBlob; total_bytes?: number; truncated?: boolean; set_bits?: number }
+  | { kind: "hyperloglog"; count?: number }
+  | { kind: "unknown"; redis_type: string };
 
 export interface RedisValue {
   key_display: string;
@@ -5086,6 +5170,11 @@ export interface HistoryEntry {
   affected_rows?: number | null;
   rollback_sql?: string | null;
   details_json?: string | null;
+  source?: "sql" | "mcp" | "other";
+  mcp_tool_name?: string | null;
+  mcp_request_json?: string | null;
+  mcp_response_json?: string | null;
+  mcp_session_id?: string | null;
 }
 
 export interface HistoryConnectionFilter {
@@ -5112,6 +5201,8 @@ export interface HistorySearchRequest {
   ended_at?: string;
   cursor?: HistoryCursor;
   limit: number;
+  source?: "sql" | "mcp" | "other";
+  mcp_tool_name?: string;
 }
 
 export interface HistorySearchResult {
@@ -5152,6 +5243,14 @@ export async function clearHistory(): Promise<void> {
   return invoke("clear_history");
 }
 
+export async function clearHistoryBySource(source: string): Promise<void> {
+  return invoke("clear_history_by_source", { source });
+}
+
+export async function cleanupMcpHistoryRetention(): Promise<number> {
+  return invoke("cleanup_mcp_history_retention");
+}
+
 export async function clearRedisHistory(): Promise<void> {
   const entries = await loadRedisHistory(1000, 0);
   await Promise.all(entries.map((e) => deleteHistoryEntry(e.id)));
@@ -5168,6 +5267,7 @@ export interface SqlFileRequest {
   executionId: string;
   connectionId: string;
   database: string;
+  schema?: string;
   filePath: string;
   continueOnError: boolean;
   txnSessionId?: string;
@@ -5293,7 +5393,7 @@ export interface TransferProgress {
   transferFailuresOmitted?: number;
 }
 
-export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void): Promise<void> {
+export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void, onStarted?: () => void): Promise<void> {
   return new Promise((resolve, reject) => {
     let unlisten: UnlistenFn | null = null;
     void (async () => {
@@ -5308,6 +5408,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         });
 
         await invoke("start_transfer", { request });
+        onStarted?.();
       } catch (e) {
         unlisten?.();
         reject(e instanceof BackendErrorException ? e : new BackendErrorException(e));
@@ -5344,9 +5445,10 @@ export async function sortTablesByFkDependency(options: SortTablesByFkOptions): 
 
 // --- Table File Import ---
 export type TableImportMode = "append" | "truncate";
+export type TableImportConflictPolicy = "error" | "skip" | "updateExisting";
 export type TableImportStatus = "running" | "done" | "error" | "cancelled";
 export type TableImportPhase = "preparing" | "detectingEncoding" | "reading" | "writing" | "finalizing" | "done";
-export type TableImportSourceFormat = "csv" | "tsv" | "delimited" | "json" | "excel" | "sql";
+export type TableImportSourceFormat = "csv" | "tsv" | "delimited" | "json" | "excel" | "sql" | "parquet";
 export type TableImportJsonShape = "auto" | "objects" | "arrays";
 export type TableImportTextEncoding = "auto" | "utf8" | "gbk" | "utf16Le" | "utf16Be";
 
@@ -5365,6 +5467,8 @@ export interface TableImportParseOptions {
   lastDataRow?: number | null;
   trimValues?: boolean | null;
   emptyStringAsNull?: boolean | null;
+  /** 分隔文本里代表 NULL 的字面量。缺省表示用后端默认值 `\N`；空串表示关闭字面量，退回「空字段即 NULL」。 */
+  nullLiteral?: string | null;
   sheetName?: string | null;
   sheetIndex?: number | null;
   jsonShape?: TableImportJsonShape | null;
@@ -5373,6 +5477,8 @@ export interface TableImportParseOptions {
 
 export interface TableImportPreviewRequest {
   filePath: string;
+  connectionId?: string | null;
+  database?: string | null;
   sourceRef?: string | null;
   sourceFormat?: TableImportSourceFormat | null;
   parseOptions?: TableImportParseOptions | null;
@@ -5420,6 +5526,8 @@ export interface TableImportRequest {
   dateTimeFormat?: string;
   preparedSource?: TableImportPreparedSource | null;
   retainSource?: boolean;
+  conflictPolicy?: TableImportConflictPolicy;
+  skipDuplicateRows?: boolean;
 }
 
 export interface TableImportSummary {
@@ -5713,6 +5821,7 @@ export interface DatabaseExportRequest {
   failOnError?: boolean;
   preventOverwrite?: boolean;
   outputCompression?: "none" | "gzip";
+  insertDialect?: SqlInsertDialect;
   snapshotSessionId?: string;
   batchSize: number;
   splitMaxMb?: number;
@@ -5753,8 +5862,12 @@ export interface TableExportRequest {
   filePath: string;
   format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt";
   insertMode?: SqlInsertMode;
+  insertDialect?: SqlInsertDialect;
   csvQuoteMode?: CsvQuoteMode;
+  /** CSV 里 NULL 写成什么。缺省表示用后端默认值 `\N`；空串表示关闭字面量。 */
+  nullLiteral?: string;
   columns?: string[];
+  selectedColumns?: SqlExportColumnSelection[];
   columnTypes?: Array<string | null | undefined>;
   /** 与 `columns` 对齐的列 EXTRA 元数据（identity 等），用于 SQL INSERT 导出的 `SET IDENTITY_INSERT`。 */
   columnExtras?: Array<string | null | undefined>;
@@ -5783,6 +5896,8 @@ export interface TableCsvExportOptions {
   pageSize?: number;
   timeoutSecs?: number;
   csvQuoteMode?: CsvQuoteMode;
+  /** CSV 里 NULL 写成什么。缺省表示用后端默认值 `\N`；空串表示关闭字面量。 */
+  nullLiteral?: string;
 }
 
 export interface TableExportProgress {
@@ -5809,6 +5924,8 @@ export interface QueryResultExportRequest {
   format: "csv" | "xlsx" | "json" | "txt" | "sql";
   insertMode?: SqlInsertMode;
   csvQuoteMode?: CsvQuoteMode;
+  /** CSV 里 NULL 写成什么。缺省表示用后端默认值 `\N`；空串表示关闭字面量。 */
+  nullLiteral?: string;
   includeSqlSheet?: boolean;
   pageSize: number;
   rowLimit?: number | null;
@@ -5820,6 +5937,7 @@ export interface QueryResultExportRequest {
   dateTimeFormat?: string;
   exportTableName?: string;
   exportColumnTypes?: Array<string | null | undefined>;
+  selectedColumns?: SqlExportColumnSelection[];
   /**
    * 结果列对应的原表 EXTRA 元数据（identity 等）。后端据此为 SQL INSERT 导出
    * 补上 `SET IDENTITY_INSERT` 包裹，缺省表示未知。
@@ -5965,13 +6083,14 @@ export async function recordDatabaseExportDestination(directory: string): Promis
   await invoke("record_database_export_destination", { directory });
 }
 
-export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all"): Promise<void> {
+export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all", nullLiteral?: string): Promise<void> {
   return invoke("export_query_result_csv", {
     request: {
       filePath,
       columns,
       rows,
       csvQuoteMode,
+      ...(nullLiteral === undefined ? {} : { nullLiteral }),
     },
   });
 }

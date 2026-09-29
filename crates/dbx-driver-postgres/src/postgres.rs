@@ -1539,29 +1539,54 @@ where
     Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
 }
 
-async fn query_with_non_empty_compat_fallback<F, Fut>(
+/// [`query_with_compat_fallback`] variant that also advances past a tier that
+/// *succeeded* without reporting anything the caller can use.
+///
+/// Some PostgreSQL-compatible servers answer the `pg_attribute` metadata tier
+/// for a relation that exists with zero rows (#8728); only a catalog fallback
+/// still reports its columns. A tier that `is_useful` accepts wins immediately,
+/// but the last successful-but-unuseful result is kept so servers that
+/// genuinely have nothing to report — and empty input lists — keep exactly
+/// their previous result instead of turning into an error.
+async fn query_with_useful_compat_fallback<T, F, Fut, P>(
     log_context: &str,
     tiers: &[&'static str],
     mut run: F,
+    is_useful: P,
+) -> Result<T, String>
+where
+    F: FnMut(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tokio_postgres::Error>>,
+    P: Fn(&T) -> bool,
+{
+    let mut unuseful_result = None;
+    let mut errors = Vec::new();
+    for sql in tiers {
+        match run(sql).await {
+            Ok(value) if is_useful(&value) => return Ok(value),
+            Ok(value) => unuseful_result = Some(value),
+            Err(error) => errors.push(pg_error_to_string(error)),
+        }
+    }
+    if let Some(value) = unuseful_result {
+        return Ok(value);
+    }
+    log::debug!("[postgres][{log_context}:compat-failed] {}", errors.join("; "));
+    Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
+}
+
+/// Column-list tier runner: a tier is useful once it reported at least one
+/// column. See [`query_with_useful_compat_fallback`].
+async fn query_with_non_empty_compat_fallback<F, Fut>(
+    log_context: &str,
+    tiers: &[&'static str],
+    run: F,
 ) -> Result<Vec<ColumnInfo>, String>
 where
     F: FnMut(&'static str) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<ColumnInfo>, tokio_postgres::Error>>,
 {
-    let mut empty_result = None;
-    let mut errors = Vec::new();
-    for sql in tiers {
-        match run(sql).await {
-            Ok(columns) if !columns.is_empty() => return Ok(columns),
-            Ok(columns) => empty_result = Some(columns),
-            Err(error) => errors.push(pg_error_to_string(error)),
-        }
-    }
-    if let Some(columns) = empty_result {
-        return Ok(columns);
-    }
-    log::debug!("[postgres][{log_context}:compat-failed] {}", errors.join("; "));
-    Err(errors.into_iter().next_back().unwrap_or_else(|| format!("[postgres][{log_context}] no SQL tiers configured")))
+    query_with_useful_compat_fallback(log_context, tiers, run, |columns: &Vec<ColumnInfo>| !columns.is_empty()).await
 }
 
 fn pg_db_error_to_string(err: &tokio_postgres::error::DbError) -> String {
@@ -4533,9 +4558,12 @@ pub async fn get_columns_for_relations(
     let oids: Vec<i64> = relations.iter().map(|(oid, _, _)| *oid).collect();
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let tiers = postgres_columns_for_relations_query_tiers();
-    query_with_compat_fallback("get_columns_for_relations", &tiers, |sql| {
-        get_columns_for_relations_with_sql(&client, sql, &oids)
-    })
+    query_with_useful_compat_fallback(
+        "get_columns_for_relations",
+        &tiers,
+        |sql| get_columns_for_relations_with_sql(&client, sql, &oids),
+        |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| columns_by_oid.values().any(|columns| !columns.is_empty()),
+    )
     .await
 }
 
@@ -4553,8 +4581,12 @@ async fn get_columns_for_relations_with_sql(
     Ok(result)
 }
 
-fn postgres_columns_for_relations_query_tiers() -> [&'static str; 2] {
-    [postgres_columns_for_relations_sql(), postgres_columns_for_relations_compat_sql()]
+fn postgres_columns_for_relations_query_tiers() -> [&'static str; 3] {
+    [
+        postgres_columns_for_relations_sql(),
+        postgres_columns_for_relations_compat_sql(),
+        postgres_columns_for_relations_information_schema_sql(),
+    ]
 }
 
 // Sibling of `POSTGRES_COLUMNS_SQL`/`POSTGRES_COLUMNS_COMPAT_SQL` below (~line
@@ -4698,6 +4730,46 @@ fn postgres_columns_for_relations_compat_sql() -> &'static str {
              ORDER BY c.oid, a.attnum"
 }
 
+// Information-schema sibling of `POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL`
+// (~line 7520), batched by oid. Last-resort tier: a server whose
+// `pg_attribute` rows for an existing relation come back empty (#8728) still
+// gets its column list back. It cannot report comments, extras or enum labels,
+// so those positions stay NULL exactly like the single-relation version's.
+// Keep `relid` first and every field in the same order as the two
+// `pg_attribute` tiers — `column_info_from_row_offset` decodes the row by
+// position.
+fn postgres_columns_for_relations_information_schema_sql() -> &'static str {
+    "SELECT c.oid::bigint AS relid, ic.column_name AS column_name, \
+             CASE WHEN ic.data_type = 'USER-DEFINED' THEN ic.udt_name ELSE ic.data_type END AS full_type, \
+             ic.is_nullable = 'YES' AS is_nullable, \
+             ic.column_default AS column_default, \
+             EXISTS ( \
+               SELECT 1 FROM information_schema.table_constraints tc \
+               JOIN information_schema.key_column_usage kcu \
+                 ON kcu.constraint_catalog = tc.constraint_catalog \
+                AND kcu.constraint_schema = tc.constraint_schema \
+                AND kcu.constraint_name = tc.constraint_name \
+                AND kcu.table_schema = tc.table_schema \
+                AND kcu.table_name = tc.table_name \
+               WHERE tc.constraint_type = 'PRIMARY KEY' \
+                 AND tc.table_schema = ic.table_schema \
+                 AND tc.table_name = ic.table_name \
+                 AND kcu.column_name = ic.column_name \
+             ) AS is_pk, \
+             NULL::text AS column_comment, \
+             NULL::text AS column_extra, \
+             CAST(ic.numeric_precision AS int) AS numeric_precision, \
+             CAST(ic.numeric_scale AS int) AS numeric_scale, \
+             CAST(ic.character_maximum_length AS int) AS character_maximum_length, \
+             NULL::text AS enum_values \
+             FROM information_schema.columns ic \
+             JOIN pg_catalog.pg_namespace n ON n.nspname = ic.table_schema \
+             JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = ic.table_name \
+             WHERE ic.table_catalog = current_database() \
+             AND c.oid = ANY($1::bigint[]) \
+             ORDER BY c.oid, ic.ordinal_position"
+}
+
 /// Same field layout as `column_info_from_row`, offset by one leading `relid`
 /// column.
 fn column_info_from_row_offset(row: &Row, offset: usize) -> ColumnInfo {
@@ -4790,6 +4862,10 @@ fn postgres_indexes_for_relations_query_tiers() -> [&'static str; 2] {
 // `COALESCE(name, text)` resolves to `name`, so PostgreSQL silently truncates an
 // expression key part to 63 bytes (NAMEDATALEN - 1) and the rebuilt CREATE INDEX
 // becomes invalid SQL (#9988).
+// `constraint_backed` must require the constraint to be owned by the index's own
+// relation: a FOREIGN KEY stores the referenced table's unique index in
+// `conindid`, so matching on `conindid` alone marked that standalone index as
+// constraint-backed and dropped it from generated DDL (#10484).
 fn postgres_indexes_for_relations_sql() -> &'static str {
     "SELECT t.oid::bigint AS relid, i.relname AS index_name, \
              array_agg(COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
@@ -4803,7 +4879,7 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              obj_description(i.oid, 'pg_class') AS index_comment, \
              array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
              array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -4860,7 +4936,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -7271,22 +7347,47 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
     })
 }
 
+/// Row/size estimates for the object browser, per schema.
+///
+/// `pg_class.reltuples` only moves when ANALYZE (or autovacuum) rewrites it, so a
+/// table that was written to — or never analyzed at all — keeps reporting its
+/// last known count, often `0` (#10461). `pg_stat_user_tables.n_live_tup` is the
+/// statistics collector's live estimate: it tracks DML within seconds and still
+/// avoids a `COUNT(*)` scan, which is what the UI promises in its column hint.
+const POSTGRES_OBJECT_STATISTICS_SQL: &str = "SELECT c.relname, \
+        GREATEST(COALESCE(s.n_live_tup, c.reltuples), 0)::bigint AS estimated_rows, \
+        pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
+ FROM pg_catalog.pg_class c \
+ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+ LEFT JOIN pg_catalog.pg_stat_user_tables s ON s.relid = c.oid \
+ WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
+ ORDER BY c.relname";
+
+/// Some Postgres-compatible engines do not expose `pg_stat_user_tables`; fall
+/// back to the ANALYZE-time estimate rather than dropping the columns entirely.
+const POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL: &str = "SELECT c.relname, \
+        GREATEST(c.reltuples, 0)::bigint AS estimated_rows, \
+        pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
+ FROM pg_catalog.pg_class c \
+ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+ WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
+ ORDER BY c.relname";
+
 pub async fn list_object_statistics(pool: &Pool, schema: &str) -> Result<Vec<ObjectStatistics>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(
-        &client,
-        "SELECT c.relname, \
-                GREATEST(c.reltuples, 0)::bigint AS estimated_rows, \
-                pg_catalog.pg_total_relation_size(c.oid)::bigint AS total_bytes \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind IN ('r','m','f','p') \
-         ORDER BY c.relname",
-        &[&schema],
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let rows = match postgres_query_cached(&client, POSTGRES_OBJECT_STATISTICS_SQL, &[&schema]).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::warn!(
+                "[postgres][object-statistics] live tuple estimate unavailable, falling back to reltuples: {}",
+                pg_error_to_string(error)
+            );
+            postgres_query_cached(&client, POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL, &[&schema])
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
     Ok(rows
         .iter()
         .map(|row| ObjectStatistics {
@@ -8904,6 +9005,10 @@ async fn execute_query_with_max_rows_inner(
 // `COALESCE(name, text)` resolves to `name`, so PostgreSQL silently truncates an
 // expression key part to 63 bytes (NAMEDATALEN - 1) and the rebuilt CREATE INDEX
 // becomes invalid SQL (#9988).
+// `constraint_backed` must require the constraint to be owned by the index's own
+// relation: a FOREIGN KEY stores the referenced table's unique index in
+// `conindid`, so matching on `conindid` alone marked that standalone index as
+// constraint-backed and dropped it from generated DDL (#10484).
 const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              array_agg(COALESCE(a.attname::text, pg_get_indexdef(ix.indexrelid, k.n::int, false)) ORDER BY k.n) AS columns, \
              array_agg(CASE WHEN oc.opcdefault THEN NULL ELSE quote_ident(opcns.nspname) || '.' || quote_ident(oc.opcname) END ORDER BY k.n) AS column_opclasses, \
@@ -8916,7 +9021,7 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              obj_description(i.oid, 'pg_class') AS index_comment, \
              array_agg(a.attname IS NULL ORDER BY k.n) AS key_is_expression, \
              array_agg(ix.indoption[(k.n - 1)::int] ORDER BY k.n) FILTER (WHERE k.n <= ix.indnkeyatts) AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -8972,7 +9077,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                ORDER BY pos.n \
              ) AS key_is_expression, \
              string_to_array(ix.indoption::text, ' ')::smallint[] AS key_options, \
-             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid) AS constraint_backed \
+             EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')) AS constraint_backed \
              FROM pg_index ix \
              JOIN pg_class t ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -13463,13 +13568,17 @@ mod tests {
     #[test]
     fn postgres_partition_batch_metadata_uses_bounded_compat_tiers() {
         let column_tiers = postgres_columns_for_relations_query_tiers();
-        assert_eq!(column_tiers.len(), 2);
+        // Two `pg_attribute` tiers plus the information-schema last resort
+        // (#8728); still bounded, and a normal server stops at the first tier.
+        assert_eq!(column_tiers.len(), 3);
         assert!(column_tiers.iter().all(|sql| sql.contains("c.oid = ANY($1::bigint[])")));
         assert!(column_tiers[0].contains("a.attgenerated"));
         assert!(!column_tiers[1].contains("a.attgenerated"));
         assert!(!column_tiers[1].contains("pg_sequence"));
         assert!(column_tiers[1].contains("sequence_dep.deptype = 'a'"));
         assert!(!column_tiers[1].contains("LEFT JOIN LATERAL"));
+        assert!(column_tiers[2].contains("information_schema.columns"));
+        assert!(!column_tiers[2].contains("pg_attribute"));
 
         let index_tiers = postgres_indexes_for_relations_query_tiers();
         assert_eq!(index_tiers.len(), 2);
@@ -13535,6 +13644,96 @@ mod tests {
         assert!(POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("NULL::text AS enum_values"));
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("pg_attribute"));
         assert!(!POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL.contains("regclass"));
+    }
+
+    /// #8728: the batched (partition-tree) column path used to be the only
+    /// metadata path without a catalog fallback, so a server that answers the
+    /// `pg_attribute` tiers with zero rows for an existing relation still
+    /// reported no columns. It now carries the same information-schema last
+    /// resort as the single-relation path.
+    #[test]
+    fn postgres_batched_column_metadata_has_information_schema_fallback() {
+        let tiers = postgres_columns_for_relations_query_tiers();
+        assert_eq!(tiers.len(), 3);
+
+        let sql = postgres_columns_for_relations_information_schema_sql();
+        assert!(sql.contains("information_schema.columns"));
+        assert!(sql.contains("information_schema.table_constraints"));
+        assert!(sql.contains("information_schema.key_column_usage"));
+        assert!(!sql.contains("pg_attribute"));
+        assert!(!sql.contains("regclass"));
+        // `relid` must stay first, and the ignored positions must stay NULL, so
+        // `column_info_from_row_offset` can decode this tier unchanged.
+        assert!(sql.starts_with("SELECT c.oid::bigint AS relid, ic.column_name AS column_name,"));
+        assert!(sql.contains("NULL::text AS column_comment"));
+        assert!(sql.contains("NULL::text AS column_extra"));
+        assert!(sql.contains("NULL::text AS enum_values"));
+        assert!(sql.contains("WHERE ic.table_catalog = current_database()"));
+        assert!(sql.contains("AND c.oid = ANY($1::bigint[])"));
+    }
+
+    #[tokio::test]
+    async fn useful_fallback_advances_past_a_tier_that_reported_nothing() {
+        let tiers: [&'static str; 3] = ["attributes", "compat-attributes", "information-schema"];
+        let calls = Cell::new(Vec::<&'static str>::new());
+        let result = query_with_useful_compat_fallback(
+            "test",
+            &tiers,
+            |sql| {
+                calls.set({
+                    let mut seen = calls.take();
+                    seen.push(sql);
+                    seen
+                });
+                async move {
+                    let mut columns_by_oid: HashMap<i64, Vec<ColumnInfo>> = HashMap::new();
+                    if sql == "information-schema" {
+                        columns_by_oid.insert(7, vec![ColumnInfo { name: "id".to_string(), ..Default::default() }]);
+                    }
+                    Ok(columns_by_oid)
+                }
+            },
+            |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| columns_by_oid.values().any(|columns| !columns.is_empty()),
+        )
+        .await
+        .expect("a tier with columns must win");
+
+        assert_eq!(calls.take(), vec!["attributes", "compat-attributes", "information-schema"]);
+        assert_eq!(result.get(&7).map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn useful_fallback_keeps_the_last_empty_result_when_no_tier_is_useful() {
+        let tiers: [&'static str; 2] = ["attributes", "information-schema"];
+        let result: Result<HashMap<i64, Vec<ColumnInfo>>, String> = query_with_useful_compat_fallback(
+            "test",
+            &tiers,
+            |_sql| async move { Ok(HashMap::<i64, Vec<ColumnInfo>>::new()) },
+            |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| columns_by_oid.values().any(|columns| !columns.is_empty()),
+        )
+        .await;
+
+        assert_eq!(result.expect("an empty-but-successful tier is not an error").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn useful_fallback_reports_the_last_error_when_every_tier_fails() {
+        let tiers: [&'static str; 2] = ["attributes", "information-schema"];
+        let error =
+            query_with_useful_compat_fallback(
+                "test",
+                &tiers,
+                |_sql| async move {
+                    Err::<HashMap<i64, Vec<ColumnInfo>>, _>(tokio_postgres::Error::__private_api_timeout())
+                },
+                |columns_by_oid: &HashMap<i64, Vec<ColumnInfo>>| {
+                    columns_by_oid.values().any(|columns| !columns.is_empty())
+                },
+            )
+            .await
+            .expect_err("every tier failed");
+
+        assert!(!error.is_empty());
     }
 
     #[test]
@@ -13986,7 +14185,12 @@ mod tests {
         ] {
             assert!(sql.contains("ix.indisunique AND ix.indisvalid"));
             assert!(sql.contains("AS constraint_backed"));
-            assert!(sql.contains("con.conindid = i.oid"));
+            // A foreign key's `conindid` is the referenced table's unique index, so the
+            // ownership check also requires the constraint to live on the same relation
+            // and to be an index-owning kind (#10484).
+            assert!(
+                sql.contains("con.conindid = i.oid AND con.conrelid = ix.indrelid AND con.contype IN ('p', 'u', 'x')")
+            );
         }
     }
 
@@ -15427,5 +15631,23 @@ mod tests {
         assert_eq!(parse_pg_partition_bound("NOT A BOUND"), None);
         // `IN` must not match the start of `INTO`.
         assert_eq!(parse_pg_partition_bound("FOR VALUES INTO (1)"), None);
+    }
+
+    #[test]
+    fn object_statistics_prefers_live_tuples_and_keeps_a_reltuples_fallback() {
+        // #10461: `reltuples` lags behind DML, so the live estimate must win when
+        // `pg_stat_user_tables` is available...
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("pg_catalog.pg_stat_user_tables"));
+        assert!(POSTGRES_OBJECT_STATISTICS_SQL.contains("COALESCE(s.n_live_tup, c.reltuples)"));
+        // ...while an engine without that view still reports counts.
+        assert!(!POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL.contains("pg_stat_user_tables"));
+        assert!(POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL.contains("GREATEST(c.reltuples, 0)"));
+        for sql in [POSTGRES_OBJECT_STATISTICS_SQL, POSTGRES_OBJECT_STATISTICS_FALLBACK_SQL] {
+            // Both queries must keep the same projection so the row mapping stays valid.
+            assert!(sql.contains("AS estimated_rows"));
+            assert!(sql.contains("AS total_bytes"));
+            assert!(sql.contains("c.relkind IN ('r','m','f','p')"));
+            assert!(sql.contains("WHERE n.nspname = $1"));
+        }
     }
 }

@@ -302,6 +302,7 @@ pub fn build_table_data_select_sql_with_database(
             database_type,
             &options.columns,
             tdengine_should_include_tbname(database_type, options.table_type.as_deref()),
+            options.identifier_quote.as_deref(),
         )
     };
     let rownum_select_columns = quoted_table_columns_or_star(database_type, &options.columns);
@@ -556,6 +557,9 @@ pub fn uses_connection_identifier_quote(database_type: Option<DatabaseType>, ide
         // Kingbase — when no quote was reported the callers fall back to
         // `quote_table_identifier`, whose static mapping is GoogleSQL-correct.
         || database_type == Some(DatabaseType::Spanner)
+        // Kyuubi normally uses Hive-family backticks, but a Trino-backed
+        // session reports the ANSI double quote through connection info.
+        || (database_type == Some(DatabaseType::Kyuubi) && identifier_quote.is_some())
         || (database_type == Some(DatabaseType::Informix) && identifier_quote.is_some())
         || (matches!(database_type, Some(DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Postgres))
             && identifier_quote.is_some())
@@ -734,6 +738,7 @@ pub(super) fn build_select_columns(
     database_type: Option<DatabaseType>,
     columns: &[String],
     include_tdengine_tbname: bool,
+    identifier_quote: Option<&str>,
 ) -> String {
     if columns.is_empty() {
         if database_type == Some(DatabaseType::Tdengine) && include_tdengine_tbname {
@@ -777,14 +782,24 @@ pub(super) fn build_select_columns(
     // natively and users can narrow the projection by editing the SQL.
     if !matches!(
         database_type,
-        Some(DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala | DatabaseType::Argo)
+        Some(
+            DatabaseType::Hive
+                | DatabaseType::Kyuubi
+                | DatabaseType::Impala
+                | DatabaseType::Argo
+                | DatabaseType::Transwarp
+        )
     ) {
         return "*".to_string();
     }
     columns
         .iter()
         .map(|column| {
-            let ident = quote_table_identifier(database_type, column);
+            let ident = if database_type == Some(DatabaseType::Kyuubi) {
+                quote_table_data_identifier(database_type, column, identifier_quote)
+            } else {
+                quote_table_identifier(database_type, column)
+            };
             if database_type == Some(DatabaseType::Hive) {
                 format!("{ident} AS {ident}")
             } else {
@@ -864,6 +879,38 @@ pub(super) fn build_db2_table_select_page_sql(
     )
 }
 
+/// Neo4j 5.0 replaced `id()` with `elementId()`, and servers before that only know `id()`, so the
+/// generated Cypher has to pick the spelling the connected server accepts. An unknown version keeps
+/// `elementId()`, which is what every caller without connection metadata got before.
+pub fn neo4j_element_id_function(server_version: Option<&str>) -> &'static str {
+    match neo4j_major_version(server_version) {
+        Some(major) if major < NEO4J_ELEMENT_ID_MIN_MAJOR_VERSION => NEO4J_LEGACY_ELEMENT_ID_FUNCTION,
+        _ => "elementId",
+    }
+}
+
+/// The identity function Neo4j used before 5.0. Unlike `elementId()`, which returns a string, it
+/// returns the node's internal `Integer` id, so callers comparing a value read from a grid have to
+/// compare numbers.
+pub const NEO4J_LEGACY_ELEMENT_ID_FUNCTION: &str = "id";
+
+/// Extracts the leading `major` from version strings such as `4.4.44`, `Neo4j/5.26.0` or
+/// `Neo4j/2025.01.0`. The product name itself contains a digit ("Neo4j"), so only a token that
+/// *starts* with digits counts as the version. Anything without one is treated as unknown.
+fn neo4j_major_version(server_version: Option<&str>) -> Option<u32> {
+    let version = server_version?.trim();
+    version.split(|character: char| !character.is_ascii_alphanumeric()).find_map(|token| {
+        let digits: String = token.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
+    })
+}
+
+const NEO4J_ELEMENT_ID_MIN_MAJOR_VERSION: u32 = 5;
+
 pub(super) fn build_neo4j_table_select_sql(options: &TableDataSelectSqlOptions, limit: usize) -> String {
     let label = quote_table_identifier(Some(DatabaseType::Neo4j), &options.table_name);
     let predicate = normalize_where_input(options.where_input.as_deref());
@@ -882,7 +929,8 @@ pub(super) fn build_neo4j_table_select_sql(options: &TableDataSelectSqlOptions, 
             .join(", ")
     };
     let returns = format!(
-        "elementId(n) AS {}, {returned_columns}",
+        "{}(n) AS {}, {returned_columns}",
+        neo4j_element_id_function(options.server_version.as_deref()),
         quote_table_identifier(Some(DatabaseType::Neo4j), DBX_NEO4J_ELEMENT_ID_COLUMN)
     );
     let order_by = options.order_by.as_deref().filter(|order| !order.trim().is_empty());
@@ -970,6 +1018,7 @@ mod tests {
             database_type: Some(database_type),
             driver_profile: None,
             identifier_quote: None,
+            server_version: None,
             schema: None,
             table_name: table.to_string(),
             catalog: catalog.map(|c| c.to_string()),
@@ -1071,7 +1120,34 @@ mod tests {
     }
 
     #[test]
-    fn databricks_table_select_uses_backtick_identifiers() {
+    fn databricks_table_select_uses_unity_catalog_three_part_name() {
+        let explicit_catalog = TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Databricks),
+            catalog: Some("analytics".to_string()),
+            database: Some("ignored_tree_catalog".to_string()),
+            schema: Some("sales".to_string()),
+            table_name: "orders".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_table_data_select_sql(explicit_catalog),
+            "SELECT * FROM `analytics`.`sales`.`orders` LIMIT 100;"
+        );
+
+        let tree_catalog = TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Databricks),
+            database: Some("analytics".to_string()),
+            schema: Some("sales".to_string()),
+            table_name: "orders".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(build_table_data_select_sql(tree_catalog), "SELECT * FROM `analytics`.`sales`.`orders` LIMIT 100;");
+    }
+
+    #[test]
+    fn databricks_table_select_without_catalog_keeps_two_part_name() {
         assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
                 database_type: Some(DatabaseType::Databricks),
@@ -1216,13 +1292,19 @@ mod tests {
     }
 
     #[test]
-    fn external_catalog_is_ignored_for_non_doris_engines() {
+    fn catalog_qualification_does_not_change_other_dialects() {
         // Postgres does not support the 3-part catalog naming; the catalog
         // must be ignored to avoid emitting an invalid qualified name.
-        let sql =
-            build_table_data_select_sql(opts(DatabaseType::Postgres, Some("iceberg_catalog"), Some("sales"), "orders"));
-        assert!(!sql.contains("iceberg_catalog"), "sql was: {sql}");
-        assert!(sql.contains("orders"), "sql was: {sql}");
+        let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Postgres),
+            catalog: Some("analytics".to_string()),
+            database: Some("warehouse".to_string()),
+            schema: Some("sales".to_string()),
+            table_name: "orders".to_string(),
+            limit: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(sql, "SELECT * FROM \"sales\".\"orders\" LIMIT 10;");
     }
 
     #[test]

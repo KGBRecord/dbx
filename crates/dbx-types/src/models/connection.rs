@@ -123,6 +123,9 @@ pub struct ConnectionConfig {
     pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_system_schemas: bool,
+    /// Frontend navigation preference: exhaust the paginated Tables group when opened.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_auto_load_all_tables: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     /// SQL statements executed right after the connection is established
@@ -581,6 +584,8 @@ struct ConnectionConfigData {
     #[serde(default)]
     pub show_system_schemas: bool,
     #[serde(default)]
+    pub sidebar_auto_load_all_tables: bool,
+    #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
     pub init_script: Option<String>,
@@ -691,6 +696,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             visible_database_patterns: data.visible_database_patterns,
             visible_schemas: data.visible_schemas,
             show_system_schemas: data.show_system_schemas,
+            sidebar_auto_load_all_tables: data.sidebar_auto_load_all_tables,
             attached_databases: data.attached_databases,
             init_script: data.init_script,
             color: data.color,
@@ -1172,6 +1178,7 @@ impl ConnectionConfig {
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
             DatabaseType::PrestoSql => format!("prestosql://{host}:{port}{db_part}"),
             DatabaseType::Hive | DatabaseType::Argo => format!("hive://{host}:{port}{db_part}"),
+            DatabaseType::Transwarp => format!("transwarp://{host}:{port}{db_part}"),
             DatabaseType::Kyuubi => format!("kyuubi://{host}:{port}{db_part}"),
             DatabaseType::Impala => format!("impala://{host}:{port}{db_part}"),
             DatabaseType::Spark => format!("spark://{host}:{port}{db_part}"),
@@ -1404,7 +1411,7 @@ impl ConnectionConfig {
             DatabaseType::PrestoSql => {
                 format!("prestosql://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Hive | DatabaseType::Argo => {
+            DatabaseType::Hive | DatabaseType::Argo | DatabaseType::Transwarp => {
                 format!("hive://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Kyuubi => {
@@ -2758,6 +2765,29 @@ mod tests {
         assert_eq!(serde_json::to_value(parsed).unwrap()["default_schema"], "archive");
     }
 
+    #[test]
+    fn sidebar_auto_load_all_tables_defaults_off_and_round_trips() {
+        let mut value = serde_json::json!({
+            "id": "id",
+            "name": "MariaDB",
+            "db_type": "mysql",
+            "host": "localhost",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": "app"
+        });
+        let legacy: ConnectionConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.sidebar_auto_load_all_tables);
+        let serialized_legacy = serde_json::to_value(legacy).unwrap();
+        assert!(serialized_legacy.get("sidebar_auto_load_all_tables").is_none());
+
+        value["sidebar_auto_load_all_tables"] = serde_json::json!(true);
+        let configured: ConnectionConfig = serde_json::from_value(value).unwrap();
+        assert!(configured.sidebar_auto_load_all_tables);
+        assert!(serde_json::to_value(configured).unwrap()["sidebar_auto_load_all_tables"].as_bool().unwrap());
+    }
+
     fn mysql_config(username: &str, password: &str, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
             docs_notes_path: None,
@@ -2779,6 +2809,7 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,

@@ -25,17 +25,23 @@ pub struct TableDataSelectSqlOptions {
     pub driver_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
+    /// Server version reported by the connection (for example `Neo4j/4.4.44`).
+    /// Engines that renamed a built-in function across releases use it to emit
+    /// SQL the connected server understands instead of the newest spelling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     pub table_name: String,
-    /// Doris / StarRocks multi-catalog: when set to a non-`internal` catalog,
-    /// the FROM clause is prefixed with the catalog
-    /// (`<catalog>.<database>.<table>`).
+    /// Catalog namespace used in three-part table names. Databricks emits
+    /// `<catalog>.<schema>.<table>`; Doris / StarRocks external catalogs emit
+    /// `<catalog>.<database>.<table>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
-    /// Doris / StarRocks multi-catalog: the database under the external
-    /// catalog, used as the middle segment of the 3-part qualified name when
-    /// `schema` is absent (Doris/StarRocks have no separate schema concept).
+    /// Database namespace. For Databricks table nodes this carries the JDBC
+    /// catalog when the explicit `catalog` field is unavailable. For Doris /
+    /// StarRocks it is the database under an external catalog and is used as
+    /// the middle segment when `schema` is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

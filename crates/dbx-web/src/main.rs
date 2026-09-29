@@ -310,6 +310,7 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/namespaces/delete", post(routes::mq::delete_namespace))
         .route("/mq/namespaces/policies", post(routes::mq::get_namespace_policies))
         .route("/mq/topics/list", post(routes::mq::list_topics))
+        .route("/mq/topics/list-page", post(routes::mq::list_topics_page))
         .route("/mq/topics/create", post(routes::mq::create_topic))
         .route("/mq/topics/delete", post(routes::mq::delete_topic))
         .route("/mq/topics/update-partitions", post(routes::mq::update_partitions))
@@ -319,6 +320,7 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/topics/alter-config", post(routes::mq::alter_topic_config))
         .route("/mq/topics/skip-accumulation", post(routes::mq::skip_topic_accumulation))
         .route("/mq/exchanges/list", post(routes::mq::list_exchanges))
+        .route("/mq/exchanges/list-page", post(routes::mq::list_exchanges_page))
         .route("/mq/exchanges/create", post(routes::mq::create_exchange))
         .route("/mq/exchanges/delete", post(routes::mq::delete_exchange))
         .route("/mq/bindings/list", post(routes::mq::list_bindings))
@@ -1305,6 +1307,12 @@ async fn serve() {
                 .put(routes::app_settings::save_history_retention_limit),
         )
         .route(
+            "/app-settings/mcp-history-retention-limit",
+            get(routes::app_settings::load_mcp_history_retention_limit)
+                .put(routes::app_settings::save_mcp_history_retention_limit),
+        )
+        .route("/app-settings/mcp-history-retention-cleanup", post(routes::app_settings::cleanup_mcp_history_retention))
+        .route(
             "/app-settings/max-retries",
             get(routes::app_settings::load_max_retries).put(routes::app_settings::save_max_retries),
         )
@@ -1329,6 +1337,8 @@ async fn serve() {
             post(routes::cloud_sync::forget_webdav_sync_secrets_passphrase),
         )
         .route("/cloud-sync/webdav/upload", post(routes::cloud_sync::webdav_sync_upload))
+        .route("/cloud-sync/catalog/local", post(routes::cloud_sync::cloud_sync_local_catalog))
+        .route("/cloud-sync/webdav/inspect", post(routes::cloud_sync::webdav_sync_inspect))
         .route("/cloud-sync/webdav/download", post(routes::cloud_sync::webdav_sync_download))
         .route("/cloud-sync/snippet/test", post(routes::cloud_sync::snippet_sync_test))
         .route("/cloud-sync/snippet/token-status", post(routes::cloud_sync::snippet_token_status))
@@ -1338,6 +1348,7 @@ async fn serve() {
         .route("/cloud-sync/snippet/save-id", post(routes::cloud_sync::save_snippet_sync_id))
         .route("/cloud-sync/snippet/retry-legacy-cleanup", post(routes::cloud_sync::retry_snippet_legacy_cleanup))
         .route("/cloud-sync/snippet/upload", post(routes::cloud_sync::snippet_sync_upload))
+        .route("/cloud-sync/snippet/inspect", post(routes::cloud_sync::snippet_sync_inspect))
         .route("/cloud-sync/snippet/download", post(routes::cloud_sync::snippet_sync_download));
 
     // Do not expose DuckDB-only handlers from builds that omit DuckDB sidecar support.

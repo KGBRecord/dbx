@@ -17,6 +17,15 @@ const STREAM_ENTRY_PAGE_SIZE: usize = 50;
 const STREAM_PENDING_PAGE_SIZE: usize = 100;
 const COLLECTION_PAGE_SIZE: usize = 200;
 const STRING_PREVIEW_MAX_BYTES: usize = 64 * 1024;
+/// A collection page is capped by payload size as well as item count.
+///
+/// `COLLECTION_PAGE_SIZE` alone bounds a page only when the members are small. A hash, list, set
+/// or sorted set whose members are serialized blobs turns 200 members into hundreds of megabytes,
+/// which then has to cross the IPC boundary and be parsed and rendered, so opening the key looks
+/// like it does nothing. Strings already avoid this through `STRING_PREVIEW_MAX_BYTES`; this is
+/// the same guard for collections, except that no member is ever truncated — the page simply ends
+/// early and the remainder is fetched by the existing "load more" cursor.
+const COLLECTION_PAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const COLLECTION_FILTER_SCAN_MAX_ITERATIONS: usize = 10;
 const DEFAULT_REDIS_DATABASES: u32 = 16;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -34,7 +43,10 @@ const MAX_SAFE_INTEGER_CURSOR: u64 = (1 << 53) - 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisDatabaseInfo {
     pub db: u32,
-    pub keys: u64,
+    /// 该库的键数量。`None` 表示服务端无法给出可信数量：kvrocks 的 DBSIZE / INFO keyspace
+    /// 键数是异步统计的（要先执行 `DBSIZE SCAN`），未统计前一律返回 0，这里不把 0 当作事实。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,7 +302,30 @@ pub enum RedisValueData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },
-    Unknown,
+    /// kvrocks 把位图实现成独立类型（`TYPE` 返回 `bitmap`），而 Redis 里 SETBIT 写入的
+    /// 就是普通字符串，所以这个分支只会在 kvrocks 一类兼容服务上出现。kvrocks 上
+    /// `GETRANGE`/`STRLEN` 对该类型会报 WRONGTYPE，只有 `GET` 能读到与 Redis 位序一致的
+    /// 原始字节，因此这里用 GET 取内容、用 BITCOUNT 取置位数量。
+    Bitmap {
+        content: RedisBlob,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        /// `BITCOUNT` 得到的置位数量；命令不可用时为 None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_bits: Option<u64>,
+    },
+    /// kvrocks 的 HyperLogLog 独立类型（`TYPE` 返回 `hyperloglog`）：原始字节不可读，
+    /// 只能通过 `PFCOUNT` 展示基数估计。
+    #[serde(rename = "hyperloglog")]
+    HyperLogLog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count: Option<u64>,
+    },
+    /// 服务端返回了 DBX 尚未支持的类型（如 kvrocks 的 `timeseries`/`TDIS-TYPE`）。
+    /// 带上原始类型名，前端据此给出明确提示，而不是渲染成空值。
+    Unknown { redis_type: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1275,15 +1310,15 @@ where
     let configured_count =
         redis::cmd("CONFIG").arg("GET").arg("databases").query_async(con).await.ok().and_then(parse_database_count);
 
-    let keyspace_dbs = list_keyspace_databases(con).await.unwrap_or_default();
+    let keyspace_db_infos = list_keyspace_databases(con).await.unwrap_or_default();
     let database_count = configured_count.unwrap_or(DEFAULT_REDIS_DATABASES);
-    let max_db = keyspace_dbs.iter().map(|db| db.db).max().map(|db| db + 1).unwrap_or(0);
+    let max_db = keyspace_db_infos.iter().map(|db| db.db).max().map(|db| db + 1).unwrap_or(0);
     let visible_count = database_count.max(max_db).max(1);
     let keyspace_counts =
-        keyspace_dbs.into_iter().map(|db| (db.db, db.keys)).collect::<std::collections::HashMap<_, _>>();
+        keyspace_db_infos.into_iter().map(|db| (db.db, db.keys)).collect::<std::collections::HashMap<_, _>>();
 
     Ok((0..visible_count)
-        .map(|db| RedisDatabaseInfo { db, keys: keyspace_counts.get(&db).copied().unwrap_or(0) })
+        .map(|db| RedisDatabaseInfo { db, keys: keyspace_counts.get(&db).copied().flatten() })
         .collect())
 }
 
@@ -1309,16 +1344,29 @@ where
 {
     let info: String = redis::cmd("INFO").arg("keyspace").query_async(con).await.map_err(|e| e.to_string())?;
 
+    // kvrocks 的键数是异步统计出来的（官方文档：需要先执行 `DBSIZE SCAN` 才会更新
+    // DBSIZE 与 INFO keyspace），未统计前它会把 dbN 的 keys 全部报成 0，并在 keyspace
+    // 段里带上 `last_dbsize_scan_timestamp:0`。识别到这个标记时不把 0 当成真实数量，
+    // 避免侧边栏显示 "db0 (0)" 这类误导信息。
+    let keyspace_counts_are_stale = info.lines().any(|line| {
+        line.split_once(':').is_some_and(|(key, value)| {
+            key.trim().eq_ignore_ascii_case("last_dbsize_scan_timestamp") && value.trim() == "0"
+        })
+    });
+
     let mut dbs = Vec::new();
     for line in info.lines() {
         if line.starts_with("db") {
             if let Some((db_part, stats_part)) = line.split_once(':') {
                 if let Some(num) = db_part.strip_prefix("db") {
                     if let Ok(db) = num.parse::<u32>() {
-                        let keys = stats_part
-                            .split(',')
-                            .find_map(|part| part.strip_prefix("keys=").and_then(|value| value.parse::<u64>().ok()))
-                            .unwrap_or(0);
+                        let keys = if keyspace_counts_are_stale {
+                            None
+                        } else {
+                            stats_part
+                                .split(',')
+                                .find_map(|part| part.strip_prefix("keys=").and_then(|value| value.parse::<u64>().ok()))
+                        };
                         dbs.push(RedisDatabaseInfo { db, keys });
                     }
                 }
@@ -1392,7 +1440,7 @@ pub fn decode_cluster_cursor(cursor: u64) -> (usize, u64) {
 pub async fn list_cluster_databases(pool: &RedisClusterPool) -> Result<Vec<RedisDatabaseInfo>, String> {
     let master_nodes = cluster_master_nodes(pool).await?;
     let keys = cluster_total_keys(pool, &master_nodes).await;
-    Ok(vec![RedisDatabaseInfo { db: 0, keys }])
+    Ok(vec![RedisDatabaseInfo { db: 0, keys: Some(keys) }])
 }
 
 pub async fn scan_cluster_keys_page(
@@ -2682,8 +2730,10 @@ where
             let end = (COLLECTION_PAGE_SIZE as i64) - 1;
             let v: RedisRawValue =
                 redis::cmd("LRANGE").arg(key).arg(0).arg(end).query_async(con).await.map_err(|e| e.to_string())?;
-            let cursor = if len > COLLECTION_PAGE_SIZE as u64 { Some(COLLECTION_PAGE_SIZE as u64) } else { None };
-            RedisValueData::List { items: redis_list_items_from_raw(v, 0), total: len, scan_cursor: cursor }
+            let mut items = redis_list_items_from_raw(v, 0);
+            items.truncate(budgeted_page_len(&items, COLLECTION_PAGE_SIZE, list_item_page_bytes));
+            let next = items.len() as u64;
+            RedisValueData::List { items, total: len, scan_cursor: (next < len).then_some(next) }
         }
         "set" => {
             let len: u64 = redis::cmd("SCARD").arg(key).query_async(con).await.unwrap_or(0);
@@ -2693,9 +2743,10 @@ where
         "zset" => {
             let len: u64 = redis::cmd("ZCARD").arg(key).query_async(con).await.unwrap_or(0);
             let end = (COLLECTION_PAGE_SIZE as i64) - 1;
-            let items = zrange_page_raw(con, key, 0, end, false).await?;
-            let cursor = if len > COLLECTION_PAGE_SIZE as u64 { Some(COLLECTION_PAGE_SIZE as u64) } else { None };
-            RedisValueData::Zset { items, total: len, scan_cursor: cursor }
+            let mut items = zrange_page_raw(con, key, 0, end, false).await?;
+            items.truncate(budgeted_page_len(&items, COLLECTION_PAGE_SIZE, zset_item_page_bytes));
+            let next = items.len() as u64;
+            RedisValueData::Zset { items, total: len, scan_cursor: (next < len).then_some(next) }
         }
         "hash" => {
             let len: u64 = redis::cmd("HLEN").arg(key).query_async(con).await.unwrap_or(0);
@@ -2712,7 +2763,28 @@ where
                 redis::cmd("JSON.GET").arg(key).query_async(con).await.map_err(|e| e.to_string())?;
             RedisValueData::Json { value: redis_json_raw_to_text(raw)? }
         }
-        _ => RedisValueData::Unknown,
+        // kvrocks 的位图/HLL 是独立类型，标准 Redis 类型表里没有它们；不处理就会落到
+        // Unknown，界面上表现为“能看到 Key、看不到值”（issue #10406）。
+        "bitmap" => {
+            // kvrocks 对位图类型只开放 GET（GETRANGE/STRLEN 会报 WRONGTYPE），
+            // 且 GET 返回的字节与 Redis 位序一致，可直接按字符串预览。
+            let raw: RedisRawValue = redis::cmd("GET").arg(key).query_async(con).await.map_err(|e| e.to_string())?;
+            let mut bytes = redis_value_to_bytes(raw).unwrap_or_default();
+            let truncated = bytes.len() > STRING_PREVIEW_MAX_BYTES;
+            if truncated {
+                bytes.truncate(STRING_PREVIEW_MAX_BYTES);
+            }
+            // 截断后拿不到准确长度（kvrocks 位图没有可用的 STRLEN），置空交给前端按未知处理
+            let total_bytes = (!truncated).then_some(bytes.len() as u64);
+            let set_bits: Option<u64> = redis::cmd("BITCOUNT").arg(key).query_async(con).await.ok();
+            RedisValueData::Bitmap { content: redis_blob_from_bytes(&bytes), total_bytes, truncated, set_bits }
+        }
+        "hyperloglog" => {
+            // HLL 原始字节不可读，基数估计是唯一可展示的数据
+            let count: Option<u64> = redis::cmd("PFCOUNT").arg(key).query_async(con).await.ok();
+            RedisValueData::HyperLogLog { count }
+        }
+        _ => RedisValueData::Unknown { redis_type: redis_type.clone() },
     };
 
     Ok(RedisValue {
@@ -2780,7 +2852,9 @@ fn redis_search_value_text(value: &RedisValueData) -> String {
             })
             .collect::<Vec<_>>()
             .join(" "),
-        RedisValueData::Unknown => String::new(),
+        RedisValueData::Bitmap { content, .. } => redis_blob_display_text(content),
+        RedisValueData::HyperLogLog { count } => count.map(|value| value.to_string()).unwrap_or_default(),
+        RedisValueData::Unknown { .. } => String::new(),
     }
 }
 
@@ -2809,7 +2883,14 @@ fn redis_search_value_size(value: &RedisValue) -> u64 {
         | RedisValueData::Hash { total, .. }
         | RedisValueData::Zset { total, .. } => *total,
         RedisValueData::Stream { entries, total, .. } => total.unwrap_or(entries.len() as u64),
-        RedisValueData::Unknown => 0,
+        RedisValueData::Bitmap { content, total_bytes, .. } => total_bytes.unwrap_or_else(|| {
+            base64::engine::general_purpose::STANDARD
+                .decode(&content.raw_base64)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0)
+        }),
+        RedisValueData::HyperLogLog { .. } => 0,
+        RedisValueData::Unknown { .. } => 0,
     }
 }
 
@@ -3924,11 +4005,10 @@ where
             let end = start + count as i64 - 1;
             let v: RedisRawValue =
                 redis::cmd("LRANGE").arg(key).arg(start).arg(end).query_async(con).await.map_err(|e| e.to_string())?;
-            let next = cursor + count as u64;
-            Ok(RedisCollectionPage::List {
-                items: redis_list_items_from_raw(v, cursor),
-                scan_cursor: (next < len).then_some(next),
-            })
+            let mut items = redis_list_items_from_raw(v, cursor);
+            items.truncate(budgeted_page_len(&items, count, list_item_page_bytes));
+            let next = cursor + items.len() as u64;
+            Ok(RedisCollectionPage::List { items, scan_cursor: (next < len).then_some(next) })
         }
         "set" => {
             let (next_cursor, items) = if let Some(query) = filter_query {
@@ -3952,10 +4032,14 @@ where
             let start = cursor as i64;
             let end = start + count as i64;
             let mut items = zrange_page_raw(con, key, start, end, descending).await?;
+            // `zrange_page_raw` reads one extra member to detect a further page; the byte budget
+            // can also end the page before `count`, which likewise leaves members behind.
             let has_more = items.len() > count;
-            items.truncate(count);
-            let next = cursor + count as u64;
-            Ok(RedisCollectionPage::Zset { items, scan_cursor: has_more.then_some(next) })
+            let page_len = budgeted_page_len(&items, count, zset_item_page_bytes);
+            let ended_early = page_len < items.len().min(count);
+            items.truncate(page_len);
+            let next = cursor + items.len() as u64;
+            Ok(RedisCollectionPage::Zset { items, scan_cursor: (has_more || ended_early).then_some(next) })
         }
         "hash" => {
             let (next_cursor, mut items) = if let Some(query) = filter_query {
@@ -4150,7 +4234,8 @@ where
     } else {
         hscan_page_raw(con, key, cursor, count, None).await?
     };
-    let next_cursor = store_hash_overflow_page(key, &mut items, count, next_cursor, filter_query).await;
+    let page_len = budgeted_page_len(&items, count, hash_item_page_bytes);
+    let next_cursor = store_hash_overflow_page(key, &mut items, page_len, next_cursor, filter_query).await;
     Ok((next_cursor, items))
 }
 
@@ -4174,7 +4259,8 @@ where
     } else {
         sscan_page_raw(con, key, cursor, count).await?
     };
-    let next_cursor = store_set_overflow_page(key, &mut items, count, next_cursor, filter_query).await;
+    let page_len = budgeted_page_len(&items, count, set_item_page_bytes);
+    let next_cursor = store_set_overflow_page(key, &mut items, page_len, next_cursor, filter_query).await;
     Ok((next_cursor, items))
 }
 
@@ -4191,7 +4277,9 @@ async fn take_hash_overflow_page(
     let mut sessions = collection_overflow_sessions().lock().await;
     let mut session = sessions.take_matching(cursor, key, RedisCollectionOverflowKind::Hash, filter_query, None)?;
     let page = match &mut session.items {
-        RedisCollectionOverflowItems::Hash(items) => take_vec_page(items, count),
+        RedisCollectionOverflowItems::Hash(items) => {
+            take_vec_page(items, budgeted_page_len(items, count, hash_item_page_bytes))
+        }
         RedisCollectionOverflowItems::Set(_) => return None,
     };
     let has_buffered_items = match &session.items {
@@ -4218,7 +4306,9 @@ async fn take_set_overflow_page(
     let mut sessions = collection_overflow_sessions().lock().await;
     let mut session = sessions.take_matching(cursor, key, RedisCollectionOverflowKind::Set, filter_query, None)?;
     let page = match &mut session.items {
-        RedisCollectionOverflowItems::Set(items) => take_vec_page(items, count),
+        RedisCollectionOverflowItems::Set(items) => {
+            take_vec_page(items, budgeted_page_len(items, count, set_item_page_bytes))
+        }
         RedisCollectionOverflowItems::Hash(_) => return None,
     };
     let has_buffered_items = match &session.items {
@@ -4278,6 +4368,42 @@ async fn store_set_overflow_page(
         last_used: Instant::now(),
     };
     collection_overflow_sessions().lock().await.insert(session)
+}
+
+/// How many leading items fit in one page, honouring both the item count and the byte budget.
+///
+/// Always returns at least one item so a member larger than the whole budget still loads (and
+/// pagination cannot stall), and never more than `items.len()`.
+fn budgeted_page_len<T>(items: &[T], count: usize, size_of: impl Fn(&T) -> usize) -> usize {
+    let limit = count.max(1).min(items.len());
+    let mut used = 0usize;
+    for (index, item) in items.iter().take(limit).enumerate() {
+        used = used.saturating_add(size_of(item));
+        if used > COLLECTION_PAGE_MAX_BYTES {
+            return index.max(1);
+        }
+    }
+    limit
+}
+
+fn blob_page_bytes(blob: &RedisBlob) -> usize {
+    blob.raw_base64.len()
+}
+
+fn hash_item_page_bytes(item: &RedisHashItem) -> usize {
+    blob_page_bytes(&item.field) + blob_page_bytes(&item.value)
+}
+
+fn set_item_page_bytes(item: &RedisSetItem) -> usize {
+    blob_page_bytes(&item.member)
+}
+
+fn list_item_page_bytes(item: &RedisListItem) -> usize {
+    blob_page_bytes(&item.value)
+}
+
+fn zset_item_page_bytes(item: &RedisZsetItem) -> usize {
+    blob_page_bytes(&item.member) + item.score.len()
 }
 
 fn take_vec_page<T>(items: &mut Vec<T>, count: usize) -> Vec<T> {
@@ -5004,6 +5130,49 @@ mod tests {
         assert_eq!(con.command_count("GETRANGE"), 1);
         assert_eq!(con.command_count("GET"), 0);
         assert_eq!(con.command_count("STRLEN"), 1);
+    }
+
+    #[test]
+    fn collection_pages_stop_at_the_byte_budget_without_truncating_a_member() {
+        fn hash_items(count: usize, value_bytes: usize) -> Vec<RedisHashItem> {
+            (0..count)
+                .map(|index| RedisHashItem {
+                    field: text_blob(&format!("f{index}")),
+                    value: text_blob(&"v".repeat(value_bytes)),
+                    field_ttl: None,
+                })
+                .collect()
+        }
+        fn page_bytes(items: &[RedisHashItem]) -> usize {
+            items.iter().map(super::hash_item_page_bytes).sum()
+        }
+
+        // Members are sized as a fraction of the budget; base64 inflates them by 4/3 on the wire,
+        // so the assertions below are on the resulting page rather than on a hand-computed count.
+        for divisor in [2, 3, 8] {
+            let items = hash_items(200, super::COLLECTION_PAGE_MAX_BYTES / divisor);
+            let page_len = super::budgeted_page_len(&items, 200, super::hash_item_page_bytes);
+            assert!((1..200).contains(&page_len), "divisor {divisor}: page_len {page_len}");
+            assert!(
+                page_bytes(&items[..page_len]) <= super::COLLECTION_PAGE_MAX_BYTES,
+                "divisor {divisor} over budget"
+            );
+            assert!(
+                page_bytes(&items[..page_len + 1]) > super::COLLECTION_PAGE_MAX_BYTES,
+                "divisor {divisor}: page ended earlier than the budget required"
+            );
+        }
+
+        // Small members still fill a whole page, and a short input is returned whole.
+        let small = hash_items(500, 1);
+        assert_eq!(super::budgeted_page_len(&small, 200, super::hash_item_page_bytes), 200);
+        assert_eq!(super::budgeted_page_len(&small[..5], 200, super::hash_item_page_bytes), 5);
+
+        // A single member larger than the whole budget still loads, so paging cannot stall.
+        let huge = hash_items(3, super::COLLECTION_PAGE_MAX_BYTES * 2);
+        assert_eq!(super::budgeted_page_len(&huge, 200, super::hash_item_page_bytes), 1);
+
+        assert_eq!(super::budgeted_page_len::<RedisHashItem>(&[], 200, super::hash_item_page_bytes), 0);
     }
 
     #[tokio::test]
@@ -7386,6 +7555,7 @@ mod tests {
             visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,

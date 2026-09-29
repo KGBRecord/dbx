@@ -279,6 +279,12 @@ fn build_create_database_statement(options: &CreateDatabaseSqlOptions) -> Result
     if !supports_create_database_target(options.database_type, options.driver_profile.as_deref()) {
         return Err(format!("Creating databases is not supported for {}.", database_label(options.database_type)));
     }
+    if options.database_type == Some(DatabaseType::Transwarp) {
+        return Ok(format!(
+            "CREATE DATABASE IF NOT EXISTS {};",
+            quote_table_identifier(options.database_type, &options.name)
+        ));
+    }
     if is_informix_family(options.database_type, options.driver_profile.as_deref()) {
         // Informix / GBase 8s accept only a bare `CREATE DATABASE <name>`. The new database
         // inherits the instance default locale, and the MySQL `CHARACTER SET`/`COLLATE`
@@ -347,6 +353,7 @@ pub fn supports_create_database_target(database_type: Option<DatabaseType>, driv
                 | DatabaseType::Highgo
                 | DatabaseType::Kingbase
                 | DatabaseType::Yashandb
+                | DatabaseType::Transwarp
         )
     )
 }
@@ -691,7 +698,11 @@ fn supports_truncate_table_cascade(database_type: Option<DatabaseType>) -> bool 
 }
 
 pub fn build_drop_database_sql(options: DatabaseNameSqlOptions) -> String {
-    format!("DROP DATABASE {};", quote_table_identifier(options.database_type, &options.name))
+    let name = quote_table_identifier(options.database_type, &options.name);
+    if options.database_type == Some(DatabaseType::Transwarp) {
+        return format!("DROP DATABASE IF EXISTS {name};");
+    }
+    format!("DROP DATABASE {name};")
 }
 
 pub fn build_update_database_properties_sql(options: DatabasePropertyEditSqlOptions) -> Result<String, String> {
@@ -799,7 +810,7 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
         format!("CREATE TABLE {target} AS SELECT * FROM {source} WHERE 1=0")
     } else {
         // `WHERE 1=0` rather than `WHERE 0`: PostgreSQL-family engines (HighGo, Kingbase,
-        // Vastbase, ...) and DuckDB require a boolean in WHERE and reject a bare integer
+        // ...) and DuckDB require a boolean in WHERE and reject a bare integer
         // with "argument of WHERE must be type boolean, not type integer" (#9950).
         // `1=0` is a valid false predicate in every dialect, including the permissive
         // MySQL/SQLite-style engines that also accepted `0`.
@@ -921,6 +932,9 @@ pub fn supports_object_rename(database_type: Option<DatabaseType>, object_type: 
     if database_type == DatabaseType::SqlServer {
         return true;
     }
+    if database_type == DatabaseType::Transwarp {
+        return object_type == DatabaseObjectType::Table;
+    }
     if matches!(object_type, DatabaseObjectType::Procedure | DatabaseObjectType::Function) {
         return false;
     }
@@ -961,6 +975,14 @@ pub fn build_rename_object_sql(options: RenameObjectSqlOptions) -> Result<String
             "EXEC sp_rename {}, {}, N'OBJECT';",
             sqlserver_string(&sqlserver_object_name(options.schema.as_deref(), &options.old_name)),
             sqlserver_string(&options.new_name)
+        ));
+    }
+
+    if database_type == Some(DatabaseType::Transwarp) {
+        return Ok(format!(
+            "ALTER TABLE {} RENAME TO {};",
+            qualified_name(database_type, options.schema.as_deref(), &options.old_name),
+            qualified_name(database_type, options.schema.as_deref(), &options.new_name)
         ));
     }
 
@@ -1099,6 +1121,7 @@ fn is_postgres_like_structure_copy(database_type: DatabaseType) -> bool {
             | DatabaseType::Gaussdb
             | DatabaseType::Kwdb
             | DatabaseType::OpenGauss
+            | DatabaseType::Vastbase
             | DatabaseType::Questdb
     )
 }
@@ -1538,6 +1561,50 @@ mod tests {
         assert!(!supports_create_database_target(Some(DatabaseType::Gbase), Some("gbase8a")));
         assert!(!supports_create_database_target(Some(DatabaseType::Gbase), None));
         assert!(supports_create_database_target(Some(DatabaseType::Informix), None));
+        assert!(supports_create_database_target(Some(DatabaseType::Transwarp), Some("transwarp-inceptor")));
+    }
+
+    #[test]
+    fn transwarp_database_actions_match_waterdrop_ddl() {
+        assert!(!supports_create_schema_target(Some(DatabaseType::Transwarp)));
+        assert_eq!(
+            build_create_database_sql(CreateDatabaseSqlOptions {
+                database_type: Some(DatabaseType::Transwarp),
+                driver_profile: Some("transwarp-inceptor".to_string()),
+                target: None,
+                parent: None,
+                name: "analytics db".to_string(),
+                charset: None,
+                collation: None,
+            })
+            .unwrap(),
+            "CREATE DATABASE IF NOT EXISTS `analytics db`;"
+        );
+        assert_eq!(
+            build_drop_database_sql(DatabaseNameSqlOptions {
+                database_type: Some(DatabaseType::Transwarp),
+                name: "analytics db".to_string(),
+            }),
+            "DROP DATABASE IF EXISTS `analytics db`;"
+        );
+    }
+
+    #[test]
+    fn transwarp_table_rename_matches_waterdrop_ddl() {
+        assert!(supports_object_rename(Some(DatabaseType::Transwarp), DatabaseObjectType::Table));
+        assert!(!supports_object_rename(Some(DatabaseType::Transwarp), DatabaseObjectType::View));
+        assert!(!supports_database_rename(Some(DatabaseType::Transwarp)));
+        assert_eq!(
+            build_rename_object_sql(RenameObjectSqlOptions {
+                database_type: Some(DatabaseType::Transwarp),
+                object_type: DatabaseObjectType::Table,
+                schema: Some("analytics".to_string()),
+                old_name: "old table".to_string(),
+                new_name: "new table".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE `analytics`.`old table` RENAME TO `analytics`.`new table`;"
+        );
     }
 
     #[test]
@@ -2298,13 +2365,35 @@ mod tests {
             identifier_quote: Some("\"".to_string()),
         });
         let expected_statements = vec![
-            "CREATE TABLE \"业\"\"务\".\"订\"\"单_副本\" AS SELECT * FROM \"业\"\"务\".\"订\"\"单\" WHERE 1=0",
+            "CREATE TABLE \"业\"\"务\".\"订\"\"单_副本\" (LIKE \"业\"\"务\".\"订\"\"单\" INCLUDING ALL)",
             "COMMENT ON TABLE \"业\"\"务\".\"订\"\"单_副本\" IS '  客户''s;订单  '",
             "COMMENT ON COLUMN \"业\"\"务\".\"订\"\"单_副本\".\"备\"\"注\" IS '用户''s;备注'",
             "COMMENT ON COLUMN \"业\"\"务\".\"订\"\"单_副本\".\"路径\" IS E'C:\\\\订单\\n明细\\t\\''",
         ];
         assert_eq!(sql, format!("{};", expected_statements.join(";\n")));
         assert_eq!(crate::sql::split_sql_statements_for_database(&sql, DatabaseType::Vastbase), expected_statements);
+    }
+
+    #[test]
+    fn duplicate_table_structure_vastbase_keeps_constraints_and_indexes() {
+        // Regression for t8y2/dbx#10345: Vastbase G100 used to clone through
+        // `CREATE TABLE ... AS SELECT ... WHERE 1=0`, which silently dropped the primary key,
+        // unique constraints and secondary indexes. `LIKE ... INCLUDING ALL` copies all of them
+        // (verified against a live Vastbase G100 3.0.9 instance).
+        assert_eq!(
+            build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+                database_type: Some(DatabaseType::Vastbase),
+                schema: Some("public".to_string()),
+                source_name: "orders".to_string(),
+                target_name: "orders_copy".to_string(),
+                table_comment: None,
+                column_comments: vec![],
+                primary_key_columns: vec!["id".to_string()],
+                primary_key_constraint_name: Some("orders_copy_pkey".to_string()),
+                identifier_quote: Some("\"".to_string()),
+            }),
+            "CREATE TABLE \"public\".\"orders_copy\" (LIKE \"public\".\"orders\" INCLUDING ALL);"
+        );
     }
 
     #[test]
@@ -2329,7 +2418,7 @@ mod tests {
                         primary_key_constraint_name: None,
                         identifier_quote: None,
                     });
-                    let mut expected = "CREATE TABLE \"copy\" AS SELECT * FROM \"source\" WHERE 1=0;".to_string();
+                    let mut expected = "CREATE TABLE \"copy\" (LIKE \"source\" INCLUDING ALL);".to_string();
                     match table_comment {
                         Some("表注释") => expected.push_str("\nCOMMENT ON TABLE \"copy\" IS '表注释';"),
                         Some("路径\\'\n归档") => {
@@ -2411,15 +2500,11 @@ mod tests {
     #[test]
     fn duplicate_table_structure_uses_boolean_false_predicate_for_pg_family_fallbacks() {
         // Regression for #9950: the generic fallback used `WHERE 0`. PostgreSQL-family
-        // engines require a boolean there, so cloning a HighGo/Kingbase/Vastbase table
-        // failed with "argument of WHERE must be type boolean, not type integer".
-        for database_type in [
-            DatabaseType::Highgo,
-            DatabaseType::Kingbase,
-            DatabaseType::Vastbase,
-            DatabaseType::DuckDb,
-            DatabaseType::Sqlite,
-        ] {
+        // engines require a boolean there, so cloning a HighGo/Kingbase table failed with
+        // "argument of WHERE must be type boolean, not type integer". Vastbase now clones
+        // through `LIKE ... INCLUDING ALL` (t8y2/dbx#10345) and no longer hits this branch.
+        for database_type in [DatabaseType::Highgo, DatabaseType::Kingbase, DatabaseType::DuckDb, DatabaseType::Sqlite]
+        {
             assert_eq!(
                 build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
                     database_type: Some(database_type),
@@ -2919,6 +3004,7 @@ mod tests {
                 table_comment: None,
                 original_table_comment: None,
                 mysql_engine: None,
+                transwarp_create: None,
                 partitioned: false,
                 is_gaussdb_m_mode: false,
                 table_collation: None,

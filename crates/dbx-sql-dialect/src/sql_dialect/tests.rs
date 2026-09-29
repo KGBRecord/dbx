@@ -80,6 +80,42 @@ fn quotes_spanner_identifiers_by_connection_dialect() {
 }
 
 #[test]
+fn kyuubi_table_data_uses_connection_identifier_quote() {
+    let columns = vec!["id".to_string(), "order\"value".to_string()];
+    let base = TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::Kyuubi),
+        schema: Some("sales\"daily".to_string()),
+        table_name: "event\"log".to_string(),
+        columns,
+        limit: Some(25),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            identifier_quote: Some("\"".to_string()),
+            ..base.clone()
+        }),
+        "SELECT \"id\", \"order\"\"value\" FROM \"sales\"\"daily\".\"event\"\"log\" LIMIT 25;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            identifier_quote: Some("`".to_string()),
+            ..base.clone()
+        }),
+        "SELECT `id`, `order\"value` FROM `sales\"daily`.`event\"log` LIMIT 25;"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Hive),
+            identifier_quote: Some("\"".to_string()),
+            ..base
+        }),
+        "SELECT `id` AS `id`, `order\"value` AS `order\"value` FROM `sales\"daily`.`event\"log` LIMIT 25;"
+    );
+}
+
+#[test]
 fn quotes_gaussdb_jdbc_identifiers_selectively() {
     for (name, expected) in [
         ("schema_01", "schema_01"),
@@ -163,6 +199,15 @@ fn maps_table_pagination_strategy_by_database_type() {
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Questdb)), TablePaginationStrategy::QuestDbLimit);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Oracle)), TablePaginationStrategy::Rownum);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Oscar)), TablePaginationStrategy::Rownum);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Cassandra)), TablePaginationStrategy::AgentMaxRows);
+    assert_eq!(
+        pagination_strategy(Some(DatabaseType::Cassandra), PaginationContext::BoundedRead),
+        TablePaginationStrategy::LimitOffset
+    );
+    assert_eq!(
+        pagination_strategy(Some(DatabaseType::Cassandra), PaginationContext::UserQuery),
+        TablePaginationStrategy::AgentMaxRows
+    );
     assert_eq!(
         pagination_strategy(Some(DatabaseType::Oracle), PaginationContext::BoundedRead),
         TablePaginationStrategy::Rownum
@@ -183,6 +228,22 @@ fn maps_table_pagination_strategy_by_database_type() {
     // Both Spanner dialects support `LIMIT n OFFSET m`; pin the fallback.
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Spanner)), TablePaginationStrategy::LimitOffset);
     assert_eq!(table_pagination_strategy(None), TablePaginationStrategy::LimitOffset);
+}
+
+#[test]
+fn cassandra_table_data_pagination_uses_the_agent_cursor() {
+    for offset in [0, 100, 200] {
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::Cassandra),
+                table_name: "paged_rows".to_string(),
+                limit: Some(100),
+                offset: Some(offset),
+                ..Default::default()
+            }),
+            "SELECT * FROM \"paged_rows\";"
+        );
+    }
 }
 
 #[test]
@@ -1512,6 +1573,37 @@ fn builds_oracle_and_neo4j_table_data_queries() {
             }),
             "MATCH (n:`Employee`) RETURN elementId(n) AS `__DBX_ELEMENT_ID`, n.`id` AS `id`, n.`first name` AS `first name`, n.`role` AS `role` LIMIT 100;"
         );
+}
+
+#[test]
+fn neo4j_element_id_function_follows_the_connected_server_version() {
+    // Neo4j 4.x and older only know `id()`; `elementId()` arrived in 5.0.
+    assert_eq!(neo4j_element_id_function(Some("4.4.44")), "id");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j/4.4.44")), "id");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j 4.4.44 (community)")), "id");
+    assert_eq!(neo4j_element_id_function(Some("3.5.35")), "id");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j/5.26.0")), "elementId");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j/2025.01.0")), "elementId");
+    // Unknown or unparsable versions keep the current spelling.
+    assert_eq!(neo4j_element_id_function(None), "elementId");
+    assert_eq!(neo4j_element_id_function(Some("")), "elementId");
+    assert_eq!(neo4j_element_id_function(Some("Neo4j Community")), "elementId");
+}
+
+#[test]
+fn builds_neo4j_table_select_with_the_legacy_element_id_on_neo4j_4() {
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Neo4j),
+            table_name: "Employee".to_string(),
+            primary_keys: vec!["id".to_string()],
+            columns: vec!["id".to_string(), "role".to_string()],
+            server_version: Some("Neo4j/4.4.44".to_string()),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "MATCH (n:`Employee`) RETURN id(n) AS `__DBX_ELEMENT_ID`, n.`id` AS `id`, n.`role` AS `role` LIMIT 100;"
+    );
 }
 
 #[test]
