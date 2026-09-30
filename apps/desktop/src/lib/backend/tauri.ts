@@ -448,6 +448,16 @@ export interface WebDavDownloadResult {
   };
 }
 
+export interface LocalBackupImportResult {
+  editorSettings?: unknown;
+  desktopSettings: DesktopSettings;
+  applySummary: WebDavDownloadResult["applySummary"];
+}
+
+export interface LocalBackupExportSummary {
+  bytes: number;
+}
+
 export interface WebDavPasswordStatus {
   hasSavedPassword: boolean;
 }
@@ -1114,6 +1124,18 @@ export async function cloudSyncLocalCatalog(editorSettings?: unknown): Promise<S
   return invoke("cloud_sync_local_catalog", { editorSettings });
 }
 
+export async function localBackupExport(path: string, editorSettings: unknown, secretsPassphrase: string | undefined, selection: SyncSelection): Promise<LocalBackupExportSummary> {
+  return invoke("local_backup_export", { path, editorSettings, secretsPassphrase, selection });
+}
+
+export async function localBackupInspect(path: string, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
+  return invoke("local_backup_inspect", { path, secretsPassphrase });
+}
+
+export async function localBackupImport(path: string, secretsPassphrase: string | undefined, restoreSecrets: boolean, selection: SyncSelection): Promise<LocalBackupImportResult> {
+  return invoke("local_backup_import", { path, secretsPassphrase, restoreSecrets, selection });
+}
+
 export async function webdavSyncInspect(config: WebDavConfig, secretsPassphrase?: string): Promise<SyncSnapshotCatalog> {
   return invoke("webdav_sync_inspect", { config, secretsPassphrase });
 }
@@ -1317,6 +1339,13 @@ export interface AiChatMessage {
   failed?: boolean;
   /** Target frozen when this assistant turn started, retained for confirmation. */
   sourceBinding?: import("@/lib/ai/aiConversationBinding").AiConversationBinding;
+  /**
+   * Footprint of a turn that carried a context selection (#10058). The selection
+   * text is never persisted (it can be 12 000 chars and records are
+   * cloud-synced), so this boolean is all a reloaded transcript has left to say
+   * the turn was not empty. Absent on records written before the field existed.
+   */
+  selectionsOmitted?: boolean;
 }
 
 export interface AiConversation {
@@ -2722,6 +2751,18 @@ export interface PluginLocalFileWriteResult {
 
 export async function openPluginLocalFile(pluginId: string, path: string, write: boolean): Promise<PluginLocalFileHandle> {
   return invoke("plugin_file_open", { pluginId, path, write });
+}
+
+// The native open/save dialogs run on the Rust side: the host never passes
+// paths into the plugin-file registry, it only receives handles for what the
+// user picked. Only the OS drop flow still goes through openPluginLocalFile,
+// and the Rust command accepts exactly the paths its own drop pipeline granted.
+export async function pickPluginLocalFiles(pluginId: string, multiple: boolean): Promise<PluginLocalFileHandle[]> {
+  return invoke("plugin_file_pick_files", { pluginId, multiple });
+}
+
+export async function savePluginLocalFileAs(pluginId: string, defaultFileName: string): Promise<PluginLocalFileHandle | null> {
+  return invoke("plugin_file_save_as", { pluginId, defaultFileName });
 }
 
 export async function readPluginLocalFileChunk(pluginId: string, handleId: string, offset: number, length?: number): Promise<PluginLocalFileChunk> {
@@ -5460,6 +5501,7 @@ export interface TableImportColumnMapping {
 
 export interface TableImportParseOptions {
   delimiter?: string | null;
+  decimalSeparator?: string | null;
   encoding?: TableImportTextEncoding | null;
   hasHeader?: boolean | null;
   titleRow?: number | null;

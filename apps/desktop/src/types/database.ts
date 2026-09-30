@@ -1440,6 +1440,8 @@ export interface QueryResultRun {
   resultPageSql?: string;
   resultPageLimit?: number;
   resultPageOffset?: number;
+  resultExecutedPageLimit?: number;
+  resultExecutedPageOffset?: number;
   resultCountSql?: string;
   resultTotalRowCount?: number;
   resultTotalRowCountLoading?: boolean;
@@ -1571,6 +1573,7 @@ export type TreeNodeType =
   | "event-trigger"
   | "object-browser"
   | "user-admin"
+  | "xugu-user-admin"
   | "dameng-users"
   | "dameng-roles"
   | "dameng-job-admin"
@@ -1912,6 +1915,15 @@ export interface QueryTab {
   resultPageSql?: string;
   resultPageLimit?: number;
   resultPageOffset?: number;
+  /**
+   * Pagination of the execution that actually produced (or extended) the
+   * displayed result. `resultPageLimit`/`resultPageOffset` deliberately stay on
+   * the logical first page so a later refresh never re-runs only the appended
+   * tail segment; this pair mirrors the segment that ran instead, which the grid
+   * needs to show the SQL behind the current rows after "load all".
+   */
+  resultExecutedPageLimit?: number;
+  resultExecutedPageOffset?: number;
   resultCountSql?: string;
   resultTotalRowCount?: number;
   resultTotalRowCountLoading?: boolean;
@@ -2000,6 +2012,7 @@ export interface QueryTab {
     | "objects"
     | "structure"
     | "users"
+    | "xugu-users"
     | "dameng-users"
     | "dameng-roles"
     | "dameng-jobs"

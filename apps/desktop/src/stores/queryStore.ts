@@ -31,7 +31,18 @@ import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
 import { isSqlErrorPositionDebugEnabled, logSqlErrorPosition, sqlErrorHasMessagePosition, sqlErrorMessageText } from "@/lib/sql/errorPosition";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQueryEditability, analyzeSelectStructureForDisplay, resolveMetadataColumnName, resolveSourceColumnsByOrdinal, sourceColumnsForResult, type EditableQueryInfo, type EditableQuerySource } from "@/lib/sql/sqlAnalysis";
+import {
+  allEditableColumnsWriteable,
+  allPrimaryKeysPresent,
+  analyzeEditableQueryEditability,
+  analyzeSelectStructureForDisplay,
+  foldUnquotedPostgresMetadataIdentifier,
+  resolveMetadataColumnName,
+  resolveSourceColumnsByOrdinal,
+  sourceColumnsForResult,
+  type EditableQueryInfo,
+  type EditableQuerySource,
+} from "@/lib/sql/sqlAnalysis";
 import { buildQueryWithHiddenPrimaryKeys, hiddenResultColumnIndexes, type HiddenPrimaryKeyProjection } from "@/lib/sql/editableQueryHiddenKeys";
 import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs, type OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 import {
@@ -1764,6 +1775,8 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultPageSql = undefined;
     tab.resultPageLimit = undefined;
     tab.resultPageOffset = undefined;
+    tab.resultExecutedPageLimit = undefined;
+    tab.resultExecutedPageOffset = undefined;
     tab.resultCountSql = undefined;
     tab.resultTotalRowCount = undefined;
     tab.resultTotalRowCountLoading = false;
@@ -1845,6 +1858,8 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultPageSql = run.resultPageSql;
     tab.resultPageLimit = run.resultPageLimit;
     tab.resultPageOffset = run.resultPageOffset;
+    tab.resultExecutedPageLimit = run.resultExecutedPageLimit;
+    tab.resultExecutedPageOffset = run.resultExecutedPageOffset;
     tab.resultCountSql = run.resultCountSql;
     tab.resultTotalRowCount = run.resultTotalRowCount;
     tab.resultTotalRowCountLoading = run.resultTotalRowCountLoading;
@@ -2120,6 +2135,8 @@ export const useQueryStore = defineStore("query", () => {
         resultPageSql: run.resultPageSql,
         resultPageLimit: run.resultPageLimit,
         resultPageOffset: run.resultPageOffset,
+        resultExecutedPageLimit: run.resultExecutedPageLimit,
+        resultExecutedPageOffset: run.resultExecutedPageOffset,
         resultCountSql: run.resultCountSql,
         resultTotalRowCount: run.resultTotalRowCount,
         cachedAt: Date.now(),
@@ -2188,6 +2205,8 @@ export const useQueryStore = defineStore("query", () => {
       resultPageSql: tab.resultPageSql,
       resultPageLimit: tab.resultPageLimit,
       resultPageOffset: tab.resultPageOffset,
+      resultExecutedPageLimit: tab.resultExecutedPageLimit,
+      resultExecutedPageOffset: tab.resultExecutedPageOffset,
       resultCountSql: tab.resultCountSql,
       resultTotalRowCount: tab.resultTotalRowCount,
       resultTotalRowCountLoading: tab.resultTotalRowCountLoading,
@@ -2295,6 +2314,8 @@ export const useQueryStore = defineStore("query", () => {
       resultPageSql: tab.resultPageSql,
       resultPageLimit: tab.resultPageLimit,
       resultPageOffset: tab.resultPageOffset,
+      resultExecutedPageLimit: tab.resultExecutedPageLimit,
+      resultExecutedPageOffset: tab.resultExecutedPageOffset,
       resultCountSql: tab.resultCountSql,
       resultTotalRowCount: tab.resultTotalRowCount,
       resultTotalRowCountLoading: tab.resultTotalRowCountLoading,
@@ -3355,6 +3376,29 @@ export const useQueryStore = defineStore("query", () => {
       isCancelling: false,
       isExplaining: false,
       mode: "users",
+    };
+    return registerOpenTab(tab);
+  }
+
+  function openXuguUserAdmin(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "xugu-users" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: t("xuguUserPermissions.title"),
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "xugu-users",
     };
     return registerOpenTab(tab);
   }
@@ -4613,6 +4657,8 @@ export const useQueryStore = defineStore("query", () => {
       resultPageSql: undefined,
       resultPageLimit: undefined,
       resultPageOffset: undefined,
+      resultExecutedPageLimit: undefined,
+      resultExecutedPageOffset: undefined,
       resultCountSql: undefined,
       resultTotalRowCount: undefined,
       resultTotalRowCountLoading: undefined,
@@ -5503,6 +5549,20 @@ export const useQueryStore = defineStore("query", () => {
     persistSavedSqlExecutionTarget(tab, options);
   }
 
+  /**
+   * Editing a saved connection's default database (Connection dialog Save) only
+   * updates the connection record — tabs opened before the edit keep whatever
+   * database was snapshotted onto them at creation time (issue #7905). Re-point
+   * every open tab that was still on the connection's old default over to the
+   * new one, same as if the tab had just been created fresh.
+   */
+  function syncTabsDatabaseForConnectionEdit(connectionId: string, previousDatabase: string, nextDatabase: string) {
+    if (previousDatabase === nextDatabase) return;
+    for (const tab of tabs.value) {
+      if (tab.connectionId === connectionId && tab.database === previousDatabase) updateDatabase(tab.id, nextDatabase);
+    }
+  }
+
   function updateCatalog(id: string, catalog: string | undefined, database: string, options: UpdateExecutionTargetOptions = {}) {
     const tab = tabs.value.find((candidate) => candidate.id === id);
     if (!tab || (tab.catalog === catalog && tab.database === database)) return;
@@ -5896,7 +5956,13 @@ export const useQueryStore = defineStore("query", () => {
     // unqualified object reference. Resolve metadata through the login's
     // default schema (with the driver's dbo fallback) so metadata and writes
     // target the same object as the original SELECT.
-    const schema = source.schema || (dbType === "sqlserver" ? "" : tab.schema) || "";
+    // PostgreSQL-compatible engines resolve an unquoted identifier by folding
+    // it to lower case, so the query's original spelling is not addressable:
+    // quoting it (grid saves) fails with `relation ... does not exist`
+    // (issue #10567). Fold the SQL-text schema, not a tab-selected one — the
+    // object tree already reports the stored spelling.
+    const foldedSourceSchema = foldUnquotedPostgresMetadataIdentifier(metadataDbType, source.schema, source.schemaQuoted);
+    const schema = foldedSourceSchema || (dbType === "sqlserver" ? "" : tab.schema) || "";
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
@@ -5911,7 +5977,7 @@ export const useQueryStore = defineStore("query", () => {
     const useCurrentPostgresSchema = (dbType === "postgres" || dbType === "kwdb") && !source.schema && !tab.schema;
     const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(metadataDbType) && !schema) || resolveAgentSearchPathSchema || useCurrentPostgresSchema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
     const metadataSchema = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
-    const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, source.tableName, source.tableNameQuoted)!;
+    const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, foldUnquotedPostgresMetadataIdentifier(metadataDbType, source.tableName, source.tableNameQuoted)!, source.tableNameQuoted)!;
     // An unqualified source resolves in the tab's current external catalog on
     // Doris-family federation: the statement executed there through the
     // catalog execution context, so the column lookup must carry the same
@@ -7459,6 +7525,8 @@ export const useQueryStore = defineStore("query", () => {
           current.resultPageSql = undefined;
           current.resultPageLimit = mongoFindPageState?.pageLimit;
           current.resultPageOffset = shouldAppendResult ? (current.resultPageOffset ?? 0) : mongoFindPageState?.pageOffset;
+          current.resultExecutedPageLimit = mongoFindPageState?.pageLimit;
+          current.resultExecutedPageOffset = mongoFindPageState?.pageOffset;
           current.resultCountSql = undefined;
           current.resultSessionId = undefined;
           current.resultClientSessionId = undefined;
@@ -7975,6 +8043,10 @@ export const useQueryStore = defineStore("query", () => {
         const displayPageLimit = typeof pageLimit === "number" ? (requestedPageLimit ?? pageLimit) : undefined;
         current.resultPageLimit = shouldAppendResult ? (current.resultPageLimit ?? displayPageLimit) : displayPageLimit;
         current.resultPageOffset = shouldAppendResult ? (current.resultPageOffset ?? 0) : pageOffset;
+        // An appended segment keeps the base page above, but the SQL shown for the
+        // grid has to describe the segment that actually ran.
+        current.resultExecutedPageLimit = pageLimit;
+        current.resultExecutedPageOffset = pageOffset;
         current.resultCountSql = countSql;
         current.resultSessionId = current.result?.session_id ?? undefined;
         current.resultClientSessionId = current.resultSessionId ? executionClientSessionId : undefined;
@@ -8151,6 +8223,8 @@ export const useQueryStore = defineStore("query", () => {
         current.resultPageSql = pageSql;
         current.resultPageLimit = typeof pageLimit === "number" ? (requestedPageLimit ?? pageLimit) : undefined;
         current.resultPageOffset = pageOffset;
+        current.resultExecutedPageLimit = pageLimit;
+        current.resultExecutedPageOffset = pageOffset;
         current.resultCountSql = countSql;
         current.resultSessionId = undefined;
         current.resultClientSessionId = undefined;
@@ -8827,6 +8901,8 @@ export const useQueryStore = defineStore("query", () => {
     // Restoring this state must not change the global page-size defaults.
     tab.resultPageLimit = snapshot.resultPageLimit;
     tab.resultPageOffset = snapshot.resultPageOffset;
+    tab.resultExecutedPageLimit = snapshot.resultExecutedPageLimit;
+    tab.resultExecutedPageOffset = snapshot.resultExecutedPageOffset;
     tab.resultCountSql = snapshot.resultCountSql;
     tab.resultTotalRowCount = snapshot.resultTotalRowCount;
     tab.resultTotalRowCountLoading = false;
@@ -9118,7 +9194,9 @@ export const useQueryStore = defineStore("query", () => {
         if (pageDocuments.length === 0 || pageDocuments.length < plan.requestLimit || reachedLogicalLimit || reachedExactTotal) break;
       }
 
-      const result = mongoDocumentsToQueryResult(documents, performance.now() - exportStartedAt, totalRows ?? documents.length, copyDocuments, totalRows !== null);
+      // Full exports return source rows (CSV/SQL text), not the live grid's
+      // BSON-faithful cell encoding.
+      const result = mongoDocumentsToQueryResult(documents, performance.now() - exportStartedAt, totalRows ?? documents.length, copyDocuments, totalRows !== null, { documentGridValues: false });
       if (result.columns.length === 0) {
         result.columns = tab.result.columns;
         result.column_types = tab.result.column_types;
@@ -9416,6 +9494,7 @@ export const useQueryStore = defineStore("query", () => {
     openMongoGridFs,
     openMongoBucket,
     openUserAdmin,
+    openXuguUserAdmin,
     openProcessList,
     openSqlServerActivityTrace,
     openMysqlDashboard,
@@ -9446,6 +9525,7 @@ export const useQueryStore = defineStore("query", () => {
     reorderTab,
     createExecutionTargetGuard,
     updateDatabase,
+    syncTabsDatabaseForConnectionEdit,
     updateCatalog,
     updateSchema,
     updateConnection,

@@ -27,7 +27,8 @@ use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::object_source_sql::{build_executable_object_source_statements, EditableObjectSourceSqlInput};
 use crate::query::{
     agent_execute_query_params, is_dbx_query_timeout_error, pool_error_action, query_timeout_duration,
-    wait_for_query_opt, PoolErrorAction, QueryExecutionOptions, StreamProgressClock, AGENT_PROTOCOL_MAX_ROWS,
+    should_discard_pool_after_query_timeout, wait_for_query_opt, PoolErrorAction, QueryExecutionOptions,
+    StreamProgressClock, AGENT_PROTOCOL_MAX_ROWS,
 };
 use crate::sql::{split_sql_statements, split_sql_statements_for_database};
 use crate::sql_dialect::{
@@ -1920,9 +1921,9 @@ async fn execute_transfer_write_statement(
         crate::query::check_read_only_for_connection(state, target_pool_key, sql).await?;
         let (_, _, _, query_timeout_secs) = transfer_pool_context(state, target_pool_key).await;
         let query_timeout = query_timeout_duration(query_timeout_secs);
-        let pool_handle = state.pool_handle(target_pool_key).await;
-        let client = match pool_handle.as_ref() {
-            Some(PoolKind::SqlServer(client)) => client.clone(),
+        let pool = ensure_transfer_statement_pool(state, target_pool_key).await?;
+        let client = match &pool {
+            PoolKind::SqlServer(client) => client.clone(),
             _ => return Err("SQL Server connection not found".to_string()),
         };
         let mut client = client.lock().await;
@@ -3440,6 +3441,25 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
     // Extract basic type, `bigint unsigned` -> `bigint`
     base = base.split(' ').next().unwrap_or(base).trim();
 
+    // SQLite has no integer widths: every column whose declared type carries the
+    // `INT` substring — `INTEGER`, `INT`, `TINYINT`, `SMALLINT`, even the
+    // SQLite-only `UNSIGNED BIG INT` spelling — is stored as a full 64-bit signed
+    // integer (that is SQLite's documented INTEGER affinity rule). Routing those
+    // names through the 32-bit arms below builds a target column that cannot hold
+    // the source's own values, and the transfer then dies mid-batch instead of
+    // writing the row: SQL Server rejects the batch with code 248
+    // ("The conversion of the nvarchar value '...' overflowed an int column").
+    // rqlite, Turso and Cloudflare D1 are SQLite underneath and share the storage
+    // classes. Send integer-affinity columns down the 64-bit arm instead;
+    // Oracle-family targets keep `INTEGER`, which is already `NUMBER(38, 0)`.
+    if is_sqlite_transfer_dialect(source_db) && t.contains("int") {
+        base = if matches!(target_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+            "integer"
+        } else {
+            "bigint"
+        };
+    }
+
     if matches!(
         target_db,
         DatabaseType::Hive | DatabaseType::Kyuubi | DatabaseType::Impala | DatabaseType::Argo | DatabaseType::Transwarp
@@ -3610,6 +3630,13 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         },
         _ => target_text_type(target_db).into(),
     }
+}
+
+/// SQLite and the databases that embed it (`rqlite`, Turso, Cloudflare D1) all
+/// use SQLite's storage classes, where any column with INTEGER affinity holds a
+/// 64-bit signed integer regardless of the width its declared type suggests.
+fn is_sqlite_transfer_dialect(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1)
 }
 
 fn mysql_type_needs_key_prefix(mapped_type: &str) -> bool {
@@ -6352,6 +6379,52 @@ fn should_prepare_fresh_agent_transfer_session(db_type: Option<DatabaseType>, er
     )
 }
 
+/// Whether a discarded transfer pool has to be replaced before the next statement runs.
+///
+/// Every error that reaches the `Discard` arm tears the pool down: the failed statement
+/// is never replayed (its outcome on the server is unknown), and a driver whose query
+/// timed out may still own a checked-out connection. The pool key, though, is shared by
+/// every table of the transfer, so leaving it missing turns one transient failure into a
+/// *misleading* "Connection not found" on the next table instead of that table running
+/// (or failing) on its own. Prepare a replacement for native drivers; agent/JDBC
+/// sessions keep their stricter rule, where recovery stays gated on the structured
+/// quarantine decision.
+fn should_reconnect_discarded_transfer_pool(db_type: Option<DatabaseType>) -> bool {
+    db_type.is_some_and(|db_type| !crate::database_capabilities::is_agent_type(&db_type))
+}
+
+/// Resolve the pool a transfer statement runs on, re-creating it when it is gone.
+///
+/// A bulk transfer lives for tens of minutes and shares one pool key across every table,
+/// so a pool that disappears between two statements used to abort the run with a
+/// misleading `Connection not found` that says nothing about the database being
+/// unreachable. The pool can legitimately be gone: `execute_on_pool_once` drops the pool
+/// of a driver whose query timed out, the connection keepalive tears down a pool whose
+/// ping failed or timed out, and every other transfer statement reuses the same key.
+/// Rebuilding it here is safe -- the statement has not run yet, so nothing is replayed --
+/// and keeps the transfer working on a fresh connection instead of failing the table.
+async fn ensure_transfer_statement_pool(state: &AppState, pool_key: &str) -> Result<PoolKind, String> {
+    if let Some(pool) = state.pool_handle(pool_key).await {
+        return Ok(pool);
+    }
+    let (connection_id, database, _, _) = transfer_pool_context(state, pool_key).await;
+    let Some(connection_id) = connection_id else {
+        return Err("Connection not found".to_string());
+    };
+    let catalog = catalog_from_pool_key(pool_key).map(str::to_string);
+    let client_session_id = client_session_id_from_pool_key(pool_key).map(str::to_string);
+    state
+        .get_or_create_pool_for_session_with_catalog(
+            &connection_id,
+            database.as_deref(),
+            catalog.as_deref(),
+            client_session_id.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("Connection not found: {error}"))?;
+    state.pool_handle(pool_key).await.ok_or_else(|| "Connection not found".to_string())
+}
+
 async fn transfer_pool_context(
     state: &AppState,
     pool_key: &str,
@@ -6411,7 +6484,8 @@ async fn execute_on_pool_with_options(
                 // the failed statement above, only prepares the pool for
                 // whichever statement runs next.
                 let prepare_agent_session = should_prepare_fresh_agent_transfer_session(db_type, error);
-                if pool_error_action(db_type, error) == PoolErrorAction::ReconnectAndRetry || prepare_agent_session {
+                let reconnect_pool = should_reconnect_discarded_transfer_pool(db_type);
+                if reconnect_pool || prepare_agent_session {
                     if let Some(connection_id) = connection_id.as_deref() {
                         let catalog = catalog_from_pool_key(&current_pool_key).map(str::to_string);
                         let recovery = if prepare_agent_session {
@@ -6475,13 +6549,12 @@ async fn execute_on_pool_once(
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<db::QueryResult, String> {
-    let (_connection_id, _database, _db_type, query_timeout_secs) = transfer_pool_context(state, pool_key).await;
+    let (_connection_id, _database, db_type, query_timeout_secs) = transfer_pool_context(state, pool_key).await;
     let query_timeout = query_timeout_duration(query_timeout_secs);
 
     // Read-only check: block transfer operations in readonly mode.
     crate::query::check_read_only_for_connection(state, pool_key, sql).await?;
-    let pool_handle = state.pool_handle(pool_key).await;
-    let pool = pool_handle.as_ref().ok_or("Connection not found")?;
+    let pool = ensure_transfer_statement_pool(state, pool_key).await?;
 
     // Transfer reads run under the per-connection operation budget. Drivers that
     // expose an incremental result stream (MySQL, PostgreSQL, SQLite, SQL Server)
@@ -6491,7 +6564,7 @@ async fn execute_on_pool_once(
     // whose protocol returns the whole result in one shot — ClickHouse, InfluxDB,
     // the Agent/JDBC path, external drivers and the DuckDB sidecar worker — expose
     // no incremental progress, so they keep the plain wall-clock timeout.
-    let result = match pool {
+    let result = match &pool {
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
@@ -6601,11 +6674,17 @@ async fn execute_on_pool_once(
         }
         _ => Err("Unsupported database type for transfer".to_string()),
     };
-    drop(pool_handle);
-    if result.as_ref().is_err_and(|error| is_transfer_query_timeout(error)) {
+    drop(pool);
+    if result.as_ref().is_err_and(|error| is_transfer_query_timeout(error))
+        && should_discard_pool_after_query_timeout(db_type)
+    {
         // A timed-out native driver future may still own a checked-out
         // connection. Discard the pool so a late server response cannot be
-        // reused by the next transfer statement.
+        // reused by the next transfer statement. Drivers that keep their pool on
+        // a timeout (`pool_error_action` -> `Keep`, e.g. the embedded SQLite
+        // worker) must not lose it here either: the pool key is shared by every
+        // table in the transfer, so dropping it would make all later tables fail
+        // with "Connection not found".
         state.remove_pool_by_key(pool_key).await;
     }
     result
@@ -9787,6 +9866,14 @@ where
     // A preexisting target also needs its columns read, even for a data-only
     // transfer: the write SQL has to address the target's declared column
     // names, which can differ from the source in case (#9320).
+    //
+    // SQL Server belongs to the always-read set for its identity flags, not just
+    // for a preexisting target: a freshly created target reuses the source DDL
+    // (`can_reuse`), which carries the source's `IDENTITY` clause, so the new
+    // target is an identity target too. `writes_identity_insert_columns` decides
+    // whether the batch needs the `SET IDENTITY_INSERT` wrapper, and without the
+    // target metadata it stays false — SQL Server then rejects the explicit
+    // identity values with 544.
     let needs_target_columns = default_rows_only
         || target_table_preexisting
         || (request.mode == TransferMode::Upsert
@@ -9799,7 +9886,10 @@ where
                     | DatabaseType::Argo
                     | DatabaseType::Transwarp
             ))
-        || matches!(target_db_type, DatabaseType::Postgres | DatabaseType::Dameng | DatabaseType::H2);
+        || matches!(
+            target_db_type,
+            DatabaseType::Postgres | DatabaseType::Dameng | DatabaseType::H2 | DatabaseType::SqlServer
+        );
     let target_columns = if needs_target_columns {
         get_columns_for_transfer(
             state,
@@ -18008,6 +18098,52 @@ SELECT 1 FROM dual"#
     }
 
     #[test]
+    fn map_column_type_keeps_mysql_and_duckdb_integer_widths() {
+        // The widening below is specific to SQLite's storage classes: MySQL's
+        // `int` really is 32-bit and DuckDB's `INTEGER` is 32-bit too, so their
+        // mappings must not change.
+        assert_eq!(map_column_type("int", &DatabaseType::Mysql, &DatabaseType::SqlServer), "INT");
+        assert_eq!(map_column_type("INTEGER", &DatabaseType::DuckDb, &DatabaseType::SqlServer), "INT");
+    }
+
+    #[test]
+    fn map_column_type_widens_sqlite_integer_affinity_columns() {
+        // User report (SQL Server data transfer): a SQLite `INTEGER` column was
+        // mapped onto SQL Server `INT`, and the first value above 2^31 killed the
+        // batch with code 248 ("... overflowed an int column"). SQLite stores every
+        // integer-affinity column — the declared name is not a width — in a 64-bit
+        // signed integer, so the mapping has to stay 64-bit wide.
+        for source in [DatabaseType::Sqlite, DatabaseType::Rqlite, DatabaseType::Turso, DatabaseType::CloudflareD1] {
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::SqlServer), "BIGINT");
+            assert_eq!(map_column_type("int", &source, &DatabaseType::SqlServer), "BIGINT");
+            assert_eq!(map_column_type("INT(11)", &source, &DatabaseType::SqlServer), "BIGINT");
+            assert_eq!(map_column_type("smallint", &source, &DatabaseType::SqlServer), "BIGINT");
+            assert_eq!(map_column_type("tinyint", &source, &DatabaseType::SqlServer), "BIGINT");
+            assert_eq!(map_column_type("BIGINT", &source, &DatabaseType::SqlServer), "BIGINT");
+            // SQLite's own affinity rule matches the `INT` substring anywhere in
+            // the declared type, which is why `UNSIGNED BIG INT` is an integer.
+            assert_eq!(map_column_type("UNSIGNED BIG INT", &source, &DatabaseType::SqlServer), "BIGINT");
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::Mysql), "BIGINT");
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::Postgres), "BIGINT");
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::Kingbase), "BIGINT");
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::Hive), "BIGINT");
+            // Oracle-family targets keep `INTEGER`, which is already NUMBER(38, 0)
+            // and covers the whole 64-bit range without a `BIGINT` spelling Oracle
+            // does not define.
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::Oracle), "INTEGER");
+            assert_eq!(map_column_type("INTEGER", &source, &DatabaseType::OceanbaseOracle), "INTEGER");
+            // Non-integer declared types keep their existing mapping.
+            assert_eq!(map_column_type("TEXT", &source, &DatabaseType::SqlServer), "TEXT");
+            assert_eq!(map_column_type("REAL", &source, &DatabaseType::SqlServer), "FLOAT");
+            assert_eq!(map_column_type("NUMERIC", &source, &DatabaseType::SqlServer), "NUMERIC");
+            assert_eq!(map_column_type("BLOB", &source, &DatabaseType::SqlServer), "VARBINARY(MAX)");
+        }
+        // A SQLite target is unchanged: it accepts any 64-bit value in `INTEGER`.
+        assert_eq!(map_column_type("int", &DatabaseType::Mysql, &DatabaseType::Sqlite), "INTEGER");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::Sqlite), "BIGINT");
+    }
+
+    #[test]
     fn map_column_type_longtext_falls_back_to_text_for_non_mysql_target() {
         assert_eq!(map_column_type("longtext", &DatabaseType::Mysql, &DatabaseType::Postgres), "TEXT");
     }
@@ -18301,5 +18437,72 @@ CREATE INDEX items_name_idx ON public.items (id);"#;
         }
 
         assert_eq!(receiver.len(), TRANSFER_PROGRESS_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn discarded_transfer_pool_is_replaced_for_native_drivers() {
+        // Discarding a pool never replays the failed statement, but the rest of a
+        // multi-table transfer keeps reusing the same pool key, so the pool has to
+        // be replaced for later tables. Only agent/JDBC sessions are excluded: their
+        // recovery stays gated on the structured quarantine decision.
+        for db_type in [
+            DatabaseType::Mysql,
+            DatabaseType::Postgres,
+            DatabaseType::SqlServer,
+            DatabaseType::ClickHouse,
+            DatabaseType::Gaussdb,
+            DatabaseType::Sqlite,
+        ] {
+            assert!(
+                should_reconnect_discarded_transfer_pool(Some(db_type)),
+                "{db_type:?} must prepare a replacement pool for later tables"
+            );
+        }
+        for db_type in [DatabaseType::Oracle, DatabaseType::Dameng] {
+            assert!(
+                !should_reconnect_discarded_transfer_pool(Some(db_type)),
+                "{db_type:?} keeps the stricter agent session rule"
+            );
+        }
+        assert!(!should_reconnect_discarded_transfer_pool(None));
+    }
+
+    #[test]
+    fn every_discard_decision_leaves_a_usable_pool_behind() {
+        // Connection drops on a write are downgraded to Discard (the write is never
+        // replayed) and query timeouts tear the pool down too. Whatever produced the
+        // Discard, a native driver must still get a pool for the next table instead
+        // of the misleading "Connection not found" seen in the wild.
+        for (db_type, error) in [
+            (DatabaseType::Postgres, "connection reset by peer"),
+            (DatabaseType::Mysql, "Connection timed out"),
+            (DatabaseType::Postgres, "Query timed out after 30 seconds"),
+            (DatabaseType::Sqlite, "PostgreSQL schema.reset cleanup failed: schema.reset timed out after 3 seconds"),
+        ] {
+            assert_eq!(
+                transfer_pool_error_action(TransferExecutionSafety::WriteNoReplay, Some(db_type), error),
+                PoolErrorAction::Discard,
+                "{db_type:?} must discard its pool for: {error}"
+            );
+            assert!(
+                should_reconnect_discarded_transfer_pool(Some(db_type)),
+                "{db_type:?} must be handed a replacement pool after discarding"
+            );
+        }
+        // Errors that keep the pool never reach the reconnect branch.
+        assert_eq!(
+            transfer_pool_error_action(
+                TransferExecutionSafety::WriteNoReplay,
+                Some(DatabaseType::Postgres),
+                "duplicate key value violates unique constraint \"items_pkey\""
+            ),
+            PoolErrorAction::Keep
+        );
+        // Agent sessions only replace the session on a structured quarantine hint.
+        assert!(!should_prepare_fresh_agent_transfer_session(
+            Some(DatabaseType::Oracle),
+            "Query timed out after 30 seconds"
+        ));
+        assert!(!should_reconnect_discarded_transfer_pool(Some(DatabaseType::Oracle)));
     }
 }

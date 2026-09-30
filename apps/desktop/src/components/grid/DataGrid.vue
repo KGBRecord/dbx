@@ -108,7 +108,7 @@ import type { BuildSingleColumnAlterSqlOptions } from "@/lib/table/tableStructur
 import { buildTableSelectSql, qualifyTableReferencesInSql, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
 import { uuid } from "@/lib/common/utils";
 import { generateCellValues, type CellValueGenerationKind } from "@/lib/dataGrid/cellValueGeneration";
-import { MONGO_DOCUMENT_GRID_NULL, mongoDocumentGridClipboardText, mongoDocumentGridDisplayText, mongoDocumentGridEditorText, mongoDocumentGridExternalValue, mongoDocumentGridInputValue } from "@/lib/mongo/mongoDocumentValues";
+import { MONGO_DOCUMENT_GRID_NULL, mongoDocumentGridClipboardText, mongoDocumentGridDisplayText, mongoDocumentGridEditorText, mongoDocumentGridExternalValue, mongoDocumentGridInputValue, mongoDocumentRelaxedExtendedJson } from "@/lib/mongo/mongoDocumentValues";
 import { compactHeaderColumnType, formatMetadataColumnTypeLabel, isNumericColumnType, resolveDataGridTypeVisualKind, resolveHeaderColumnType, resolveResultColumnType } from "@/lib/dataGrid/dataGridColumnType";
 import { dataGridCellTextClass, dataGridTypeVisualClass } from "@/lib/dataGrid/dataGridCellTextVisual";
 import { DATA_GRID_TYPE_COLOR_KEYS, resolveActiveDataGridTypeColors } from "@/lib/dataGrid/dataGridTypeColorScheme";
@@ -202,6 +202,7 @@ import {
   isDeleteCurrentRowShortcut,
   isEditTableStructureShortcut,
   isFocusSearchShortcut,
+  isFocusWhereShortcut,
   isGoToColumnShortcut,
   isGoToFirstPageShortcut,
   isGoToLastPageShortcut,
@@ -217,6 +218,7 @@ import {
   canGoNextDataGridPage,
   dataGridLoadAllSegment,
   dataGridTotalRowCountLabelKey,
+  dataGridUserFacingPage,
   dataGridTruncationHintKey,
   ELASTICSEARCH_PAGE_JUMP_WARNING_REQUESTS,
   elasticsearchCursorPageJumpRequestCount,
@@ -501,6 +503,13 @@ interface DataGridProps {
   autoShowTableInfo?: boolean;
   pageOffset?: number;
   pageLimit?: number;
+  /**
+   * Pagination of the segment that produced the currently displayed rows. It
+   * differs from `pageOffset`/`pageLimit` once a result was extended by
+   * "load all" or infinite scroll, because those stay on the logical first page.
+   */
+  executedPageOffset?: number;
+  executedPageLimit?: number;
   countSql?: string;
   totalRowCount?: number;
   totalRowCountIsExact?: boolean;
@@ -745,8 +754,12 @@ const columnTypeMap = computed(() => {
 });
 const resolvedConnectionConfig = computed(() => connectionStore.getConfig(props.connectionId ?? ""));
 const resolvedDatabaseType = computed(() => props.databaseType ?? effectiveDatabaseTypeForConnection(resolvedConnectionConfig.value));
+// The collection grid and Mongo query-result grids share the document-grid value
+// encoding (BSON null sentinel + JSON-prefixed containers), so every display,
+// editor and clipboard path must decode it whenever MongoDB values are on screen.
+const usesMongoDocumentGridValues = computed(() => props.mongoCollectionGrid === true || resolvedDatabaseType.value === "mongodb");
 const isResultsContext = computed(() => props.context === "results");
-const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value && resolvedDatabaseType.value !== "victoriametrics");
+const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value && resolvedDatabaseType.value !== "victoriametrics" && resolvedDatabaseType.value !== "nebula");
 const canUseWhereSearch = computed(() => !!props.tableMeta && canShowWhereSearch.value);
 const canUseServerColumnFilter = computed(() => canUseWhereSearch.value && !!props.connectionId && !!props.tableMeta);
 const tableStructureCapabilities = computed(() => getTableStructureCapabilities(resolvedDatabaseType.value, resolvedConnectionConfig.value?.db_type));
@@ -1059,6 +1072,7 @@ const transposeScrollRef = ref<HTMLElement | { $el?: HTMLElement }>();
 const transposeScrollLeft = ref(0);
 const transposeViewportWidth = ref(0);
 const { sortColumn: sortCol, sortColumnIndex: sortColIndex, sortDirection: sortDir, sortMode, setSort, clearSort } = useDataGridSort();
+const queryControlsRef = ref<InstanceType<typeof DataGridQueryControls>>();
 const searchBarRef = ref<{ focus: (select?: boolean) => void } | null>(null);
 const replaceOpen = ref(false);
 const replacementText = ref("");
@@ -1877,6 +1891,11 @@ function navigateSuggestion(delta: number) {
   dataGridSearch.navigateSuggestion(delta);
 }
 
+function focusWhere(): boolean {
+  if (!canUseWhereSearch.value) return false;
+  return queryControlsRef.value?.focusWhere() ?? false;
+}
+
 function focusSearch(target: Element | null = null): boolean {
   const tableInfoDrawer = target?.closest<HTMLElement>("[data-table-info-drawer]");
   if (tableInfoDrawer) {
@@ -2210,7 +2229,7 @@ const columnAligns = computed<("left" | "right")[]>(() => {
 
 function gridCellTextColorClass(item: RowItem, actualColIdx: number, visibleColIdx: number): string {
   const value = item.data[actualColIdx];
-  const isGridNull = value === null || (props.mongoCollectionGrid === true && value === MONGO_DOCUMENT_GRID_NULL);
+  const isGridNull = value === null || (usesMongoDocumentGridValues.value && value === MONGO_DOCUMENT_GRID_NULL);
   if (isGridNull) return "text-muted-foreground italic";
   if (!colorizeDataGridCellTypes.value) return "text-foreground";
   const checkbox = booleanCellsUseCheckbox.value && isBooleanGridCell(item, actualColIdx) && value !== null;
@@ -2233,7 +2252,7 @@ function transposeCellTextColorClass(recordIndex: number, actualColIdx: number):
   const item = displayItems.value[recordIndex];
   if (!item) return "text-foreground";
   const value = item.data[actualColIdx];
-  const isGridNull = value === null || (props.mongoCollectionGrid === true && value === MONGO_DOCUMENT_GRID_NULL);
+  const isGridNull = value === null || (usesMongoDocumentGridValues.value && value === MONGO_DOCUMENT_GRID_NULL);
   if (isGridNull) return "text-muted-foreground italic";
   if (!colorizeDataGridCellTypes.value) return "text-foreground";
   return dataGridCellTextClass({
@@ -4019,7 +4038,7 @@ const editor = useDataGridEditor({
   includeDatabaseNameInSaveSql: computed(() => settingsStore.editorSettings.generateSqlIncludeDatabaseName),
   initialEditColumn: firstVisibleColumnIndex,
   cellEditorText: cellEditorTextForValue,
-  normalizeEditorInput: (value) => (props.mongoCollectionGrid ? mongoDocumentGridInputValue(value) : value),
+  normalizeEditorInput: (value) => (usesMongoDocumentGridValues.value ? mongoDocumentGridInputValue(value) : value),
   getRowItem,
   pageSize,
   currentPage,
@@ -4303,7 +4322,7 @@ function cellEditContentNeedsExpandedEditor(options: { displayText: string; edit
 }
 
 function cellEditorTextForValue(value: CellValue | undefined, columnIndex: number): string {
-  if (props.mongoCollectionGrid) {
+  if (usesMongoDocumentGridValues.value) {
     const documentGridText = mongoDocumentGridEditorText(value);
     if (documentGridText !== undefined) return documentGridText;
   }
@@ -4374,7 +4393,7 @@ function isIoTDBTimestampColumn(columnIndex: number): boolean {
 }
 
 function inlineCellEditorText(value: CellValue, columnIndex: number): string {
-  if (props.mongoCollectionGrid) {
+  if (usesMongoDocumentGridValues.value) {
     const documentGridText = mongoDocumentGridEditorText(value);
     if (documentGridText !== undefined) return documentGridText;
   }
@@ -5981,11 +6000,11 @@ const contextCellDetail = computed(() => {
 // The MongoDB collection grid stores an internal sentinel for explicit BSON
 // null; detail panes must render display text instead of leaking that marker.
 function gridDetailRawValue(value: CellValue): string {
-  return props.mongoCollectionGrid ? (mongoDocumentGridDisplayText(value) ?? displayCellValue(value)) : displayCellValue(value);
+  return usesMongoDocumentGridValues.value ? (mongoDocumentGridDisplayText(value) ?? displayCellValue(value)) : displayCellValue(value);
 }
 
 function gridDetailIsNullValue(value: CellValue): boolean {
-  return value === null || (props.mongoCollectionGrid === true && value === MONGO_DOCUMENT_GRID_NULL);
+  return value === null || (usesMongoDocumentGridValues.value && value === MONGO_DOCUMENT_GRID_NULL);
 }
 
 function cellDetailFor(rowIndex: number, columnIndex: number): DataGridCellDetail | null {
@@ -6030,7 +6049,9 @@ const mongoJsonPreviewFullText = computed(() => {
   const document = activeMongoJsonDocument.value;
   if (document === undefined) return "";
   try {
-    return JSON.stringify(document, null, 2) ?? "";
+    // Relaxed Extended JSON (`{"$date": "…"}`) like Compass's JSON view, instead
+    // of the browser form's escaped `ISODate("…")` strings.
+    return JSON.stringify(mongoDocumentRelaxedExtendedJson(document), null, 2) ?? "";
   } catch {
     return "";
   }
@@ -6294,6 +6315,19 @@ watch(valueEditorContainer, async (el) => {
       onBlur: () => {
         if (!detailValueDiffOpen.value && !detailTransformOpen.value) commitValueEditorEdit();
       },
+      // 非 temporal 值编辑器（CodeMirror）里按 Ctrl/Cmd+S：仅靠网格全局快捷键不会把
+      // 草稿提交成待保存变更，必须在这里认领保存键——先 commitValueEditorEdit 落脏，
+      // 再触发保存（#10515；temporal 走 @save→onTemporalCellEditorSave）。
+      // useCellDetailEditor 对每个 keydown 都会回调本钩子，必须先用 isSaveShortcut
+      // 过滤：否则普通按键也被吞掉（preventDefault），编辑器将完全无法输入。
+      onSaveShortcut: (event) => {
+        if (!isSaveShortcut(event, settingsStore.editorSettings.shortcuts)) return false;
+        commitValueEditorEdit();
+        void nextTick().then(() => {
+          void saveGridChangesFromShortcut();
+        });
+        return true;
+      },
       editorTheme: editorThemeAccessor,
       appAppearance: editorAppAppearance,
       appPalette: editorAppPalette,
@@ -6324,7 +6358,7 @@ const detailEdit = useDataGridCellDetailEdit({
   resultRows: computed(() => props.result.rows),
   getColumnInfo: (columnIndex) => tableColumnForGridColumn(columnIndex) ?? resultColumnInfoForGridColumn(columnIndex),
   cellEditorText: cellEditorTextForValue,
-  normalizeEditorInput: (value) => (props.mongoCollectionGrid ? mongoDocumentGridInputValue(value) : value),
+  normalizeEditorInput: (value) => (usesMongoDocumentGridValues.value ? mongoDocumentGridInputValue(value) : value),
   nullValue: () => (props.mongoCollectionGrid ? MONGO_DOCUMENT_GRID_NULL : null),
   getRowItem,
   hydrateLargeValueCell,
@@ -6656,7 +6690,7 @@ function primitiveCellFormatKey(value: CellValue, columnIndex?: number): string 
 
 function formatCell(value: CellValue, columnIndex?: number, originalBytes?: number, limitDisplay = true): string {
   const formatter = columnIndex === undefined ? undefined : resolvedColumnFormatters.value[columnIndex];
-  if (props.mongoCollectionGrid) {
+  if (usesMongoDocumentGridValues.value) {
     const documentGridText = mongoDocumentGridDisplayText(value, formatter);
     if (documentGridText !== undefined) return documentGridText;
   }
@@ -7603,7 +7637,7 @@ function drawCanvasGrid() {
     searchMatchKeys: searchMatchSet.value,
     currentSearchMatch: currentSearchMatch.value,
     formatCell: (value, columnIndex, row) => formatCellCached(visibleLargeValuePreviewValue(row, columnIndex, value), columnIndex, largeValueOriginalBytes(row, columnIndex)),
-    isNullValue: (value) => value === null || (props.mongoCollectionGrid === true && value === MONGO_DOCUMENT_GRID_NULL),
+    isNullValue: (value) => value === null || (usesMongoDocumentGridValues.value && value === MONGO_DOCUMENT_GRID_NULL),
     newRowCellPlaceholder,
     isRowActive,
     rowCellsUseSelectionVisual,
@@ -7852,6 +7886,14 @@ async function syncUserFacingSql() {
 
   try {
     const config = props.connectionId ? connectionStore.getConfig(props.connectionId) : undefined;
+    const footerPage = dataGridUserFacingPage({
+      executedPageLimit: props.executedPageLimit,
+      executedPageOffset: props.executedPageOffset,
+      pageLimit: props.pageLimit,
+      pageOffset: props.pageOffset,
+      fallbackLimit: pageSize.value,
+      fallbackOffset: Math.max(0, currentPage.value - 1) * pageSize.value,
+    });
     const sql = await buildTableSelectSql({
       databaseType: resolvedDatabaseType.value,
       driverProfile: config?.driver_profile,
@@ -7866,8 +7908,8 @@ async function syncUserFacingSql() {
       injectDefaultTimeSeriesWhere: true,
       whereInput: currentWhereInput(),
       orderBy: currentOrderBy(),
-      limit: props.pageLimit ?? pageSize.value,
-      offset: props.pageOffset ?? Math.max(0, currentPage.value - 1) * pageSize.value,
+      limit: footerPage.limit,
+      offset: footerPage.offset,
     });
     if (generation === userFacingSqlGeneration) userFacingSql.value = sqlWithDisplayDatabaseName(sql);
   } catch {
@@ -7876,7 +7918,7 @@ async function syncUserFacingSql() {
 }
 
 watch(
-  () => [props.sql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, currentWhereInput(), currentOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
+  () => [props.sql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, props.executedPageLimit, props.executedPageOffset, currentWhereInput(), currentOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
   () => void syncUserFacingSql(),
   { immediate: true },
 );
@@ -7935,8 +7977,8 @@ const {
   columnComments: visibleColumnComments,
   allColumnComments,
   displayValue: formatCellCached,
-  cellClipboardText: (value) => (props.mongoCollectionGrid ? mongoDocumentGridClipboardText(value) : undefined),
-  externalCellValue: (value) => (props.mongoCollectionGrid ? mongoDocumentGridExternalValue(value) : value),
+  cellClipboardText: (value) => (usesMongoDocumentGridValues.value ? mongoDocumentGridClipboardText(value) : undefined),
+  externalCellValue: (value) => (usesMongoDocumentGridValues.value ? mongoDocumentGridExternalValue(value) : value),
   mongoDocuments: computed(() => props.result.mongo_copy_documents ?? props.result.mongo_documents),
   spatialColumns: computed(() => props.result.spatial_columns),
   spatialValues: computed(() => props.result.spatial_values),
@@ -9429,6 +9471,12 @@ function openCellDetailSearch(): boolean {
 async function onGridKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
 
+  if (isFocusWhereShortcut(event, settingsStore.editorSettings.shortcuts) && focusWhere()) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+
   const targetAllowsNativeClipboard = eventTargetAllowsNativeClipboard(event);
   if (!targetAllowsNativeClipboard && props.context === "table-data" && canOpenTableStructureEditor.value && isEditTableStructureShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
@@ -9588,7 +9636,7 @@ async function onGridKeydown(event: KeyboardEvent) {
 }
 
 function detailClipboardText(detail: DataGridCellDetail): string {
-  if (props.mongoCollectionGrid) {
+  if (usesMongoDocumentGridValues.value) {
     const documentGridText = mongoDocumentGridClipboardText(detail.value);
     if (documentGridText !== undefined) return documentGridText;
   }
@@ -9603,7 +9651,7 @@ function detailClipboardText(detail: DataGridCellDetail): string {
 // grid's BSON null marker is restored to a real null instead of leaking the
 // internal sentinel into clipboard JSON/TSV.
 function gridDetailExternalValue(value: CellValue): CellValue {
-  return props.mongoCollectionGrid ? mongoDocumentGridExternalValue(value) : value;
+  return usesMongoDocumentGridValues.value ? mongoDocumentGridExternalValue(value) : value;
 }
 
 async function copyDetailValue() {
@@ -11889,6 +11937,7 @@ defineExpose({
   setMultiRowTranspose,
   toggleMultiRowTranspose,
   focusSearch,
+  focusWhere,
   openGoToColumn,
   visibleColumnCount,
   displayableColumnCount,
@@ -12390,6 +12439,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               </template>
               <template v-if="canShowWhereSearch">
                 <DataGridQueryControls
+                  ref="queryControlsRef"
                   v-model:where-input="whereFilterInput"
                   v-model:order-by-input="orderByInput"
                   v-model:filter-builder-open="filterBuilderOpen"
@@ -12457,22 +12507,6 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
           >
             <template #leading>
               <slot v-if="hasResultToolbarActionsSlot" name="result-toolbar-actions" :compact="compactDataGridToolbar" />
-              <Tooltip v-if="props.context === 'table-data' && canOpenTableStructureEditor">
-                <TooltipTrigger as-child>
-                  <Button
-                    data-grid-edit-table-structure-action
-                    variant="ghost"
-                    size="sm"
-                    :class="['data-grid-topbar-action-button h-5 shrink-0 px-1.5 text-xs', compactDataGridToolbar ? 'data-grid-topbar-action-button--compact' : '']"
-                    :aria-label="t('contextMenu.editStructure')"
-                    @click="openTableStructureEditor"
-                  >
-                    <PencilRuler class="data-grid-topbar-action-icon h-3 w-3" />
-                    <span class="data-grid-topbar-action-label" :class="{ 'data-grid-topbar-action-label--compact': compactDataGridToolbar }">{{ t("contextMenu.editStructure") }}</span>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">{{ t("contextMenu.editStructure") }}</TooltipContent>
-              </Tooltip>
               <Tooltip v-if="showQueryEditReadOnlyBadge">
                 <TooltipTrigger as-child>
                   <div class="flex h-5 items-center gap-1 rounded border border-muted-foreground/30 bg-muted/60 px-1.5 text-xs font-medium text-muted-foreground">
@@ -12518,9 +12552,9 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
             </template>
 
             <template #navigation="{ compact }">
-              <Tooltip v-if="props.result.columns.length">
-                <TooltipTrigger as-child>
-                  <Popover v-model:open="goToColumnOpen">
+              <Popover v-if="props.result.columns.length" v-model:open="goToColumnOpen">
+                <Tooltip>
+                  <TooltipTrigger as-child>
                     <PopoverTrigger as-child>
                       <Button data-toolbar-action="navigation" variant="ghost" size="sm" :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compact ? 'data-grid-topbar-action-button--compact' : '', goToColumnOpen ? 'text-primary bg-primary/10' : '']">
                         <Columns3 class="data-grid-topbar-action-icon w-3 h-3" />
@@ -12533,39 +12567,39 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                         >
                       </Button>
                     </PopoverTrigger>
-                    <PopoverContent align="end" class="w-56 p-2" @keydown="onGoToColumnKeydown">
-                      <div class="relative mb-1">
-                        <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                        <input ref="goToColumnSearchInput" v-model="goToColumnSearch" :placeholder="t('grid.searchColumn')" class="h-8 w-full rounded-md border bg-transparent pl-7 pr-6 text-xs outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25" />
-                        <button v-if="goToColumnSearch" type="button" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" @click="goToColumnSearch = ''">
-                          <X class="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                      <div ref="goToColumnListRef" class="max-h-56 overflow-auto rounded border">
-                        <button
-                          v-for="(column, index) in filteredGoToColumns"
-                          :key="column.index"
-                          type="button"
-                          :class="[
-                            'grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5 px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none',
-                            index === goToColumnSelectedIndex ? 'bg-accent text-accent-foreground' : '',
-                          ]"
-                          @pointerenter="goToColumnSelectedIndex = index"
-                          @click="scrollToColumn(column.index)"
-                        >
-                          <span class="min-w-0 truncate">{{ column.name }}</span>
-                          <span class="shrink-0 font-mono text-[10px] text-muted-foreground">#{{ column.index + 1 }}</span>
-                          <span v-if="column.comment" class="col-span-2 min-w-0 truncate text-[11px] leading-4 text-muted-foreground" :title="column.comment">{{ column.comment }}</span>
-                        </button>
-                        <div v-if="!filteredGoToColumns.length" class="px-2 py-3 text-center text-xs text-muted-foreground">
-                          {{ t("grid.noColumnsFound") }}
-                        </div>
-                      </div>
-                    </PopoverContent>
-                  </Popover>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">{{ t("grid.goToColumn") }}</TooltipContent>
-              </Tooltip>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">{{ t("grid.goToColumn") }}</TooltipContent>
+                </Tooltip>
+                <PopoverContent align="end" class="w-56 p-2" @keydown="onGoToColumnKeydown">
+                  <div class="relative mb-1">
+                    <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <input ref="goToColumnSearchInput" v-model="goToColumnSearch" :placeholder="t('grid.searchColumn')" class="h-8 w-full rounded-md border bg-transparent pl-7 pr-6 text-xs outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25" />
+                    <button v-if="goToColumnSearch" type="button" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" @click="goToColumnSearch = ''">
+                      <X class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div ref="goToColumnListRef" class="max-h-56 overflow-auto rounded border">
+                    <button
+                      v-for="(column, index) in filteredGoToColumns"
+                      :key="column.index"
+                      type="button"
+                      :class="[
+                        'grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5 px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none',
+                        index === goToColumnSelectedIndex ? 'bg-accent text-accent-foreground' : '',
+                      ]"
+                      @pointerenter="goToColumnSelectedIndex = index"
+                      @click="scrollToColumn(column.index)"
+                    >
+                      <span class="min-w-0 truncate">{{ column.name }}</span>
+                      <span class="shrink-0 font-mono text-[10px] text-muted-foreground">#{{ column.index + 1 }}</span>
+                      <span v-if="column.comment" class="col-span-2 min-w-0 truncate text-[11px] leading-4 text-muted-foreground" :title="column.comment">{{ column.comment }}</span>
+                    </button>
+                    <div v-if="!filteredGoToColumns.length" class="px-2 py-3 text-center text-xs text-muted-foreground">
+                      {{ t("grid.noColumnsFound") }}
+                    </div>
+                  </div>
+                </PopoverContent>
+              </Popover>
             </template>
           </DataGridToolbar>
         </div>
@@ -14156,7 +14190,6 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                     :kind="detailTemporalEditorConfig.kind"
                     :fraction-precision="detailTemporalEditorConfig.fractionPrecision"
                     variant="inline"
-                    :commit-on-close="false"
                     @cancel="cancelValueEditorEdit"
                     @commit="commitValueEditorEdit"
                     @save="onTemporalCellEditorSave"
