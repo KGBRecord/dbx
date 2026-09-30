@@ -110,7 +110,24 @@ pub async fn execute_sql_file(
 /// -flush importer must be derived from those actual execution paths, not
 /// from `request.file_path`'s extension.
 fn execution_targets_zip_package(file_paths: &[String]) -> bool {
-    file_paths.iter().any(|path| dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(Path::new(path)))
+    file_paths.iter().any(|path| is_desktop_sql_zip_package_part(Path::new(path)))
+}
+
+/// A desktop ZIP-package part lives in a `dbx-sql-package-<uuid>` directory
+/// under the OS temp dir, exactly where `preview_sql_file` extracts uploads.
+/// Requiring both the prefix and the temp-dir parent confines matching to
+/// directories DBX created itself: desktop `file_paths` are arbitrary
+/// user-chosen paths, so a user directory named `package-1.0/` (or even
+/// `dbx-sql-package-...`) must never be mistaken for an extraction dir and
+/// routed through the ZIP importer or its `remove_dir_all` cleanup.
+fn is_desktop_sql_zip_package_part(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        parent.starts_with(std::env::temp_dir())
+            && dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(
+                path,
+                dbx_core::sql_file_zip_package::SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_DESKTOP,
+            )
+    })
 }
 
 #[tauri::command]
@@ -146,8 +163,8 @@ fn cleanup_sql_zip_package_paths(file_paths: &[String]) {
     let mut directories = std::collections::HashSet::new();
     for path in file_paths {
         let path = PathBuf::from(path);
-        if dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(&path) {
-            directories.insert(path.parent().expect("checked by is_extracted_sql_zip_package_path").to_path_buf());
+        if is_desktop_sql_zip_package_part(&path) {
+            directories.insert(path.parent().expect("checked by is_desktop_sql_zip_package_part").to_path_buf());
         }
     }
     for directory in directories {
@@ -342,19 +359,60 @@ mod execution_tests {
         // `executionPaths = packageFilePaths ?? [filePath]`, i.e. the extracted
         // `.sql` part paths, as `file_paths` -- `request.file_path` on its own
         // (still `.zip` in that case) must never gate this decision.
+        // Extraction dirs live under the OS temp dir, so the fixtures must too.
+        let temp = std::env::temp_dir();
         let zip_upload_part_paths = vec![
-            "/tmp/dbx-sql-package-11111111-1111-1111-1111-111111111111/00001-dump.sql".to_string(),
-            "/tmp/dbx-sql-package-11111111-1111-1111-1111-111111111111/00002-dump.sql".to_string(),
+            temp.join("dbx-sql-package-11111111-1111-1111-1111-111111111111/00001-dump.sql")
+                .to_string_lossy()
+                .into_owned(),
+            temp.join("dbx-sql-package-11111111-1111-1111-1111-111111111111/00002-dump.sql")
+                .to_string_lossy()
+                .into_owned(),
         ];
         assert!(execution_targets_zip_package(&zip_upload_part_paths));
 
-        let ordinary_upload_paths = vec!["/tmp/upload-22222222.sql".to_string()];
+        let ordinary_upload_paths = vec![temp.join("upload-22222222.sql").to_string_lossy().into_owned()];
         assert!(!execution_targets_zip_package(&ordinary_upload_paths));
 
         // `execute_sql_file` forwards `vec![request.file_path.clone()]` as the
         // sole `file_paths` entry, so a single extracted part must also match.
-        let single_zip_part_as_sole_path = vec!["/tmp/dbx-sql-package-33333333/00001-dump.sql".to_string()];
+        let single_zip_part_as_sole_path =
+            vec![temp.join("dbx-sql-package-33333333/00001-dump.sql").to_string_lossy().into_owned()];
         assert!(execution_targets_zip_package(&single_zip_part_as_sole_path));
+    }
+
+    #[test]
+    fn zip_package_routing_ignores_user_directories_sharing_an_extraction_prefix() {
+        // Scoping regression for PR #10632 review: desktop `file_paths` are
+        // arbitrary user-chosen paths, so only `dbx-sql-package-*` directories
+        // under the OS temp dir count as extraction dirs.
+        let temp = std::env::temp_dir();
+        let web_style_user_dir = vec![temp.join("package-1.0/00001-dump.sql").to_string_lossy().into_owned()];
+        assert!(!execution_targets_zip_package(&web_style_user_dir));
+
+        let desktop_named_dir_outside_temp =
+            vec!["/definitely/not/the/temp/dbx-sql-package-44444444/00001-dump.sql".to_string()];
+        assert!(!execution_targets_zip_package(&desktop_named_dir_outside_temp));
+    }
+
+    #[test]
+    fn zip_package_cleanup_never_removes_user_directories_sharing_a_prefix() {
+        let temp = std::env::temp_dir();
+        let extraction = temp.join(format!("dbx-sql-package-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&extraction).unwrap();
+        std::fs::write(extraction.join("00001-dump.sql"), "SELECT 1;\n").unwrap();
+        let user_dir = temp.join(format!("package-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(user_dir.join("user.sql"), "SELECT 2;\n").unwrap();
+
+        cleanup_sql_zip_package_paths(&[
+            extraction.join("00001-dump.sql").to_string_lossy().into_owned(),
+            user_dir.join("user.sql").to_string_lossy().into_owned(),
+        ]);
+
+        assert!(!extraction.exists());
+        assert!(user_dir.exists());
+        let _ = std::fs::remove_dir_all(&user_dir);
     }
 
     #[test]

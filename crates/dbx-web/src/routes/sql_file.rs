@@ -377,7 +377,10 @@ fn send_sql_file_progress(tx: &broadcast::Sender<String>, progress: SqlFileProgr
 fn cleanup_sql_file_package_paths(file_paths: &[PathBuf]) {
     let mut directories = std::collections::HashSet::new();
     for path in file_paths {
-        if dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(path) {
+        if dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(
+            path,
+            dbx_core::sql_file_zip_package::SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_WEB,
+        ) {
             directories.insert(path.parent().expect("checked by is_extracted_sql_zip_package_path").to_path_buf());
         }
     }
@@ -449,9 +452,17 @@ fn cleanup_sql_file_uploads_except(tmp_dir: &Path, max_age: Duration, active: &H
 /// paths for a ZIP upload, never the original `.zip` path (that stays only in
 /// `SqlFileRequest::file_path`), so routing to the ZIP-package incremental
 /// -flush importer must be derived from those actual execution paths, not
-/// from `req.file_path`'s extension.
+/// from `req.file_path`'s extension. Web only ever extracts under the
+/// `package-` prefix, and every path reaching here has already passed
+/// `validated_uploaded_sql_path`, which confines it to the managed upload
+/// tmp dir.
 fn execution_targets_zip_package(file_paths: &[PathBuf]) -> bool {
-    file_paths.iter().any(|path| dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(path))
+    file_paths.iter().any(|path| {
+        dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(
+            path,
+            dbx_core::sql_file_zip_package::SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_WEB,
+        )
+    })
 }
 
 fn validated_uploaded_sql_path(data_dir: &Path, file_path: &str) -> Result<PathBuf, AppError> {
@@ -671,6 +682,13 @@ mod tests {
         // no-`file_paths`-supplied call shape from `execute_sql_file`.
         let single_zip_part_as_sole_path = vec![PathBuf::from("/data/tmp/sql_file/package-33333333/00001-dump.sql")];
         assert!(execution_targets_zip_package(&single_zip_part_as_sole_path));
+
+        // Desktop extraction dirs (`dbx-sql-package-`, under the OS temp dir)
+        // are not this site's to match: web only ever extracts `package-*`
+        // dirs, and the generic name must not pull user directories into the
+        // ZIP importer or its cleanup.
+        let desktop_style_paths = vec![PathBuf::from("/tmp/dbx-sql-package-44444444/00001-dump.sql")];
+        assert!(!execution_targets_zip_package(&desktop_style_paths));
     }
 
     #[test]
