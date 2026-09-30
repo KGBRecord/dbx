@@ -8,6 +8,34 @@ pub const SQL_FILE_ZIP_MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const SQL_FILE_ZIP_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const SQL_FILE_ZIP_MAX_PART_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Extraction-directory prefix used by the desktop (Tauri) dispatch site,
+/// under the OS temp dir: `dbx-sql-package-<uuid>`.
+pub const SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_DESKTOP: &str = "dbx-sql-package-";
+
+/// Extraction-directory prefix used by the web dispatch site, under the
+/// managed upload tmp dir: `package-<uuid>`.
+pub const SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_WEB: &str = "package-";
+
+/// Every prefix `extract_sql_file_zip_package` extracts a package into.
+/// Dispatch sites must derive "is this execution a ZIP package" from the
+/// actual paths they are about to execute (via
+/// `is_extracted_sql_zip_package_path`), not from the original upload's file
+/// name/extension: the frontend always sends the extracted `.sql` part paths
+/// as the execution paths, never the original `.zip` path, so a suffix check
+/// on the original request field never matches.
+pub const SQL_FILE_ZIP_EXTRACTION_DIR_PREFIXES: [&str; 2] =
+    [SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_DESKTOP, SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_WEB];
+
+/// True if `path`'s parent directory name starts with one of the known SQL
+/// ZIP package extraction-directory prefixes, i.e. `path` is one of the parts
+/// `extract_sql_file_zip_package` wrote out for a `.zip` upload.
+pub fn is_extracted_sql_zip_package_path(path: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| SQL_FILE_ZIP_EXTRACTION_DIR_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SqlZipManifest {
@@ -133,6 +161,19 @@ mod tests {
         zip.start_file("manifest.json", options).unwrap();
         zip.write_all(serde_json::to_string(&manifest).unwrap().as_bytes()).unwrap();
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn is_extracted_sql_zip_package_path_matches_both_known_extraction_prefixes() {
+        assert!(is_extracted_sql_zip_package_path(Path::new(
+            "/tmp/dbx-sql-package-11111111-1111-1111-1111-111111111111/00001-dump.sql"
+        )));
+        assert!(is_extracted_sql_zip_package_path(Path::new(
+            "/var/data/tmp/sql_file/package-22222222-2222-2222-2222-222222222222/00001-dump.sql"
+        )));
+        assert!(!is_extracted_sql_zip_package_path(Path::new("/tmp/upload-33333333.sql")));
+        assert!(!is_extracted_sql_zip_package_path(Path::new("/var/data/tmp/sql_file/restore-44444444/backup.sql")));
+        assert!(!is_extracted_sql_zip_package_path(Path::new("standalone.sql")));
     }
 
     #[test]

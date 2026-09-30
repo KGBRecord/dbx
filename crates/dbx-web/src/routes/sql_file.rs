@@ -223,7 +223,11 @@ async fn preview_uploaded_sql_file(
     let tmp_dir = file_path.parent().ok_or_else(|| AppError::from("Invalid SQL file path".to_string()))?;
 
     if file_name.to_ascii_lowercase().ends_with(".zip") {
-        let extraction_dir = tmp_dir.join(format!("package-{}", Uuid::new_v4()));
+        let extraction_dir = tmp_dir.join(format!(
+            "{}{}",
+            dbx_core::sql_file_zip_package::SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_WEB,
+            Uuid::new_v4()
+        ));
         let package = dbx_core::sql_file_zip_package::extract_sql_file_zip_package(file_path, &extraction_dir)
             .map_err(AppError::from)?;
         let paths = dbx_core::sql_file_zip_package::extracted_sql_zip_paths(&extraction_dir, &package)
@@ -267,12 +271,12 @@ pub async fn execute_sql_file(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let req = body.request;
 
-    let is_zip_package = req.file_path.to_ascii_lowercase().ends_with(".zip");
     let requested_paths = if body.file_paths.is_empty() { vec![req.file_path.clone()] } else { body.file_paths };
     let file_paths = requested_paths
         .iter()
         .map(|file_path| validated_uploaded_sql_path(&state.data_dir, file_path))
         .collect::<Result<Vec<_>, _>>()?;
+    let is_zip_package = execution_targets_zip_package(&file_paths);
     let managed_previews = state.managed_sql_previews.claim(&file_paths)?;
 
     // Fast-fail: reject early if the connection is read-only (individual statements are also checked in do_execute)
@@ -373,11 +377,8 @@ fn send_sql_file_progress(tx: &broadcast::Sender<String>, progress: SqlFileProgr
 fn cleanup_sql_file_package_paths(file_paths: &[PathBuf]) {
     let mut directories = std::collections::HashSet::new();
     for path in file_paths {
-        let Some(parent) = path.parent() else {
-            continue;
-        };
-        if parent.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("package-")) {
-            directories.insert(parent.to_path_buf());
+        if dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(path) {
+            directories.insert(path.parent().expect("checked by is_extracted_sql_zip_package_path").to_path_buf());
         }
     }
     for directory in directories {
@@ -442,6 +443,15 @@ fn cleanup_sql_file_uploads_except(tmp_dir: &Path, max_age: Duration, active: &H
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// The frontend always sends the extracted `.sql` part paths as the execution
+/// paths for a ZIP upload, never the original `.zip` path (that stays only in
+/// `SqlFileRequest::file_path`), so routing to the ZIP-package incremental
+/// -flush importer must be derived from those actual execution paths, not
+/// from `req.file_path`'s extension.
+fn execution_targets_zip_package(file_paths: &[PathBuf]) -> bool {
+    file_paths.iter().any(|path| dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(path))
 }
 
 fn validated_uploaded_sql_path(data_dir: &Path, file_path: &str) -> Result<PathBuf, AppError> {
@@ -639,6 +649,28 @@ mod tests {
         assert!(source.exists());
         assert!(!token.is_cancelled());
         assert!(state.sql_file_executions.read().await.contains_key("existing-job"));
+    }
+
+    #[test]
+    fn zip_package_routing_is_selected_from_extracted_part_paths_not_the_original_zip_name() {
+        // Regression for PR #10632 review: the frontend sends the extracted
+        // `.sql` part paths as execution paths, never the original `.zip`
+        // upload path, so routing must key off the actual paths, not
+        // `req.file_path`'s extension.
+        let zip_upload_part_paths = vec![
+            PathBuf::from("/data/tmp/sql_file/package-11111111-1111-1111-1111-111111111111/00001-dump.sql"),
+            PathBuf::from("/data/tmp/sql_file/package-11111111-1111-1111-1111-111111111111/00002-dump.sql"),
+        ];
+        assert!(execution_targets_zip_package(&zip_upload_part_paths));
+
+        let ordinary_upload_paths = vec![PathBuf::from("/data/tmp/sql_file/upload-22222222.sql")];
+        assert!(!execution_targets_zip_package(&ordinary_upload_paths));
+
+        // A single-file (non-multi-file) request always executes exactly the
+        // `req.file_path` value as its only path, so this also exercises the
+        // no-`file_paths`-supplied call shape from `execute_sql_file`.
+        let single_zip_part_as_sole_path = vec![PathBuf::from("/data/tmp/sql_file/package-33333333/00001-dump.sql")];
+        assert!(execution_targets_zip_package(&single_zip_part_as_sole_path));
     }
 
     #[test]

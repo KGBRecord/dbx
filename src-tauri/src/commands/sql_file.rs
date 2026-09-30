@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -47,7 +47,11 @@ pub async fn preview_sql_file(file_path: String) -> Result<SqlFilePreview, Strin
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
     {
         sweep_stale_sql_zip_packages();
-        let extraction_dir = std::env::temp_dir().join(format!("dbx-sql-package-{}", uuid::Uuid::new_v4()));
+        let extraction_dir = std::env::temp_dir().join(format!(
+            "{}{}",
+            dbx_core::sql_file_zip_package::SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_DESKTOP,
+            uuid::Uuid::new_v4()
+        ));
         let (package, extracted_paths) = tokio::task::spawn_blocking({
             let path = path.clone();
             let extraction_dir = extraction_dir.clone();
@@ -100,6 +104,15 @@ pub async fn execute_sql_file(
     execute_sql_files(app, state, request.clone(), vec![request.file_path.clone()]).await
 }
 
+/// The frontend always sends the extracted `.sql` part paths as `file_paths`
+/// for a ZIP upload, never the original `.zip` path (that only ever lives in
+/// `SqlFileRequest::file_path`), so routing to the ZIP-package incremental
+/// -flush importer must be derived from those actual execution paths, not
+/// from `request.file_path`'s extension.
+fn execution_targets_zip_package(file_paths: &[String]) -> bool {
+    file_paths.iter().any(|path| dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(Path::new(path)))
+}
+
 #[tauri::command]
 pub async fn execute_sql_files(
     app: AppHandle,
@@ -119,7 +132,7 @@ pub async fn execute_sql_files(
     }
 
     let started_at = Instant::now();
-    let is_zip_package = request.file_path.to_ascii_lowercase().ends_with(".zip");
+    let is_zip_package = execution_targets_zip_package(&file_paths);
     let result = execute_sql_files_inner(&app, &state, &request, &file_paths, token, started_at, is_zip_package).await;
     cleanup_sql_zip_package_paths(&file_paths);
     {
@@ -133,11 +146,8 @@ fn cleanup_sql_zip_package_paths(file_paths: &[String]) {
     let mut directories = std::collections::HashSet::new();
     for path in file_paths {
         let path = PathBuf::from(path);
-        let Some(parent) = path.parent() else {
-            continue;
-        };
-        if parent.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("dbx-sql-package-")) {
-            directories.insert(parent.to_path_buf());
+        if dbx_core::sql_file_zip_package::is_extracted_sql_zip_package_path(&path) {
+            directories.insert(path.parent().expect("checked by is_extracted_sql_zip_package_path").to_path_buf());
         }
     }
     for directory in directories {
@@ -153,7 +163,9 @@ fn sweep_stale_sql_zip_packages() {
         return;
     };
     for entry in entries.flatten() {
-        if !entry.file_name().to_str().is_some_and(|name| name.starts_with("dbx-sql-package-")) {
+        if !entry.file_name().to_str().is_some_and(|name| {
+            name.starts_with(dbx_core::sql_file_zip_package::SQL_FILE_ZIP_EXTRACTION_DIR_PREFIX_DESKTOP)
+        }) {
             continue;
         }
         let expired = entry
@@ -322,6 +334,27 @@ mod execution_tests {
 
         assert_eq!(summary.success_count, 1);
         assert_eq!(summary.status, SqlFileStatus::Cancelled);
+    }
+
+    #[test]
+    fn zip_package_routing_is_selected_from_extracted_part_paths_not_the_original_zip_name() {
+        // Regression for PR #10632 review: `SqlFileExecutionDialog.vue` sends
+        // `executionPaths = packageFilePaths ?? [filePath]`, i.e. the extracted
+        // `.sql` part paths, as `file_paths` -- `request.file_path` on its own
+        // (still `.zip` in that case) must never gate this decision.
+        let zip_upload_part_paths = vec![
+            "/tmp/dbx-sql-package-11111111-1111-1111-1111-111111111111/00001-dump.sql".to_string(),
+            "/tmp/dbx-sql-package-11111111-1111-1111-1111-111111111111/00002-dump.sql".to_string(),
+        ];
+        assert!(execution_targets_zip_package(&zip_upload_part_paths));
+
+        let ordinary_upload_paths = vec!["/tmp/upload-22222222.sql".to_string()];
+        assert!(!execution_targets_zip_package(&ordinary_upload_paths));
+
+        // `execute_sql_file` forwards `vec![request.file_path.clone()]` as the
+        // sole `file_paths` entry, so a single extracted part must also match.
+        let single_zip_part_as_sole_path = vec!["/tmp/dbx-sql-package-33333333/00001-dump.sql".to_string()];
+        assert!(execution_targets_zip_package(&single_zip_part_as_sole_path));
     }
 
     #[test]
