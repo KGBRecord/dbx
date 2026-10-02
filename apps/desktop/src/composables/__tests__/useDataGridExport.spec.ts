@@ -737,6 +737,27 @@ describe("useDataGridExport prepared row statements", () => {
     ]);
   });
 
+  it("copies a selected row as whole-row TSV across all visible columns on smart copy", async () => {
+    // Row selection only (no cell matrix): the Cmd+C smart path must copy the
+    // full row (#10573), not just a single cell.
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "1\tAda", mimeType: "text/tab-separated-values", fileExtension: "tsv", rowCount: 1, columnCount: 2 });
+    const state = createExportState(editableTable, ["id", "name"], undefined, undefined, undefined, [[1, "Ada"]], [1]);
+
+    await expect(state.copyWithPreference("smart")).resolves.toBe(true);
+
+    expect(extractDataGridSelection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        extractor: "tsv",
+        selectionKind: "rows",
+        rows: [[1, "Ada"]],
+        selectedColumnIndexes: [0, 1],
+      }),
+    );
+    expect(copyToClipboard).toHaveBeenCalledWith("1\tAda");
+    // The internal clipboard matrix keeps the row paste-able back into a new row.
+    expect(parseDataGridClipboard("1\tAda")).toEqual([["1", "Ada"]]);
+  });
+
   it("uses TSV (quotes only for separator/newline) for a multi-cell smart copy without relying on clipboard metadata", async () => {
     const rows = [
       [1, '{"msg":"success"}'],
@@ -1702,6 +1723,21 @@ describe("useDataGridExport prepared row statements", () => {
 
     await fullExportState.exportCsv();
     expect(exportQueryResultCsv).toHaveBeenLastCalledWith(expect.any(String), ["_id", "value"], [["1", reservedString]], expect.anything(), expect.anything());
+  });
+
+  it("exports temporal CSV values without an Excel formula wrapper (#10694)", async () => {
+    setActivePinia(createPinia());
+    const timestamp = "2026-09-30 12:34:56.789";
+    const table: DataGridTableMeta = {
+      tableName: "events",
+      primaryKeys: [],
+      columns: [{ name: "created_at", data_type: "timestamp" }],
+    };
+    const state = createExportState(table, ["created_at"], undefined, [timestamp]);
+
+    await state.exportCurrentPageCsv();
+
+    expect(exportQueryResultCsv).toHaveBeenLastCalledWith(expect.any(String), ["created_at"], [[timestamp]], expect.anything(), expect.anything());
   });
 
   it("exports only visible Mongo columns from the full result set", async () => {

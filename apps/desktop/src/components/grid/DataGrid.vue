@@ -59,6 +59,8 @@ import {
   WandSparkles,
   Camera,
   AlertTriangle,
+  FileSpreadsheet,
+  Globe2,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -66,6 +68,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Input } from "@/components/ui/input";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import DataGridBusyOverlay from "@/components/grid/DataGridBusyOverlay.vue";
+import ProductionWatermark from "@/components/common/ProductionWatermark.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import LightDropdownMenu from "@/components/ui/LightDropdownMenu.vue";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
@@ -87,6 +90,8 @@ import DataGridQueryControls from "@/components/grid/DataGridQueryControls.vue";
 import DataGridFilterBuilder from "@/components/grid/DataGridFilterBuilder.vue";
 import DataGridFilterWorkbench from "@/components/grid/DataGridFilterWorkbench.vue";
 import DataGridTextFilterWorkbench from "@/components/grid/DataGridTextFilterWorkbench.vue";
+import DataGridSortWorkbench from "@/components/grid/DataGridSortWorkbench.vue";
+import DataGridTextSortWorkbench from "@/components/grid/DataGridTextSortWorkbench.vue";
 import DataGridTableInfoPanels from "@/components/grid/DataGridTableInfoPanels.vue";
 import DataGridColumnFilterPopover from "@/components/grid/DataGridColumnFilterPopover.vue";
 import DataGridCellDetailHeader from "@/components/grid/DataGridCellDetailHeader.vue";
@@ -216,6 +221,7 @@ import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid
 import {
   canFetchNextDataGridSegment,
   canGoNextDataGridPage,
+  dataGridLoadAllNextSegment,
   dataGridLoadAllSegment,
   dataGridTotalRowCountLabelKey,
   dataGridUserFacingPage,
@@ -249,6 +255,7 @@ import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarSta
 import { buildDataGridSavedRowRefreshPlan, dataGridSavedRowRefreshPatches } from "@/lib/dataGrid/dataGridSavedRowRefresh";
 import type { QueryEditabilityReason } from "@/lib/sql/sqlAnalysis";
 import { sqlWithoutCommentsForCopy } from "@/lib/sql/sqlWithoutCommentsForCopy";
+import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editor/editorThemes";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import {
@@ -305,8 +312,10 @@ import { useToast } from "@/composables/useToast";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { useNavigationTargets } from "@/composables/useNavigationTargets";
 import { useDataGridExport, type MongoCopyUpdateTarget } from "@/composables/useDataGridExport";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/common/clipboard";
 import { claimDataGridPaste, claimDataGridSelectAll, clearDataGridClipboardCopy, parseDataGridClipboard, planDataGridPaste } from "@/lib/dataGrid/dataGridClipboard";
+import { parseInsertStatementPaste } from "@/lib/dataGrid/dataGridInsertPaste";
 import { beginDataGridNativeSelectionBlock, finishDataGridNativeSelectionBlock } from "@/lib/dataGrid/dataGridNativeSelection";
 import { DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS, DATA_GRID_COPY_EXTRACTOR_IDS, DATA_GRID_DEFAULT_COPY_PREFERENCES, extractorUnavailableForDatabase, type DataGridCopyExtractorId, type DataGridCopyPreference } from "@/lib/dataGrid/dataGridCopyExtractor";
 import { columnNamesForCopy } from "@/lib/dataGrid/dataGridColumnNameCopy";
@@ -327,6 +336,7 @@ import type { GridSnapshotSource } from "@/lib/gridSnapshot/gridSnapshot";
 import { createDataGridRuntimeScope } from "@/lib/dataGrid/dataGridRuntime";
 import { useDataGridEditor } from "@/composables/useDataGridEditor";
 import { useDataGridSort } from "@/composables/useDataGridSort";
+import { buildDataGridStructuredOrderBy, combineDataGridOrderByInputs, useDataGridSortBuilder } from "@/composables/useDataGridSortBuilder";
 import { useDataGridSearch, type DataGridSearchMatch } from "@/composables/useDataGridSearch";
 import { findDataGridReplacementMatches, prepareDataGridCellReplacements, type DataGridReplaceScope } from "@/lib/dataGrid/dataGridReplace";
 import { useDataGridResultLifecycle } from "@/composables/useDataGridResultLifecycle";
@@ -490,6 +500,7 @@ interface DataGridProps {
   sortColumnIndex?: number;
   sortDirection?: DataGridSortDirection;
   sortMode?: DataGridSortMode;
+  databaseSortEnabled?: boolean;
   tableMeta?: {
     catalog?: string;
     database?: string;
@@ -589,6 +600,7 @@ const props = withDefaults(defineProps<DataGridProps>(), {
   totalRowCountIsExact: true,
   inexactTotalRowCountMode: "at-least",
   paginationEnabled: true,
+  databaseSortEnabled: true,
   loadAllRowsEnabled: true,
   // Omitted row-action limits must keep normal table-data editing.
   allowInsertRows: undefined,
@@ -623,9 +635,10 @@ function logDataGridTiming(message: string, payload?: Record<string, unknown>) {
 const emit = defineEmits<{
   reload: [sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent];
   paginate: [offset: number, limit: number, whereInput?: string, orderBy?: string, appendResult?: boolean];
-  sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode];
+  sort: [column: string, columnIndex: number, direction: "asc" | "desc" | null, whereInput?: string, mode?: DataGridSortMode, effectiveOrderBy?: string];
   "update:whereInput": [value: string];
   "update:orderByInput": [value: string];
+  "update:structuredOrderByInput": [value: string];
   "local-column-filters-change": [value: Record<string, string[]>];
   changeQueryTimeout: [connectionId: string];
   cancel: [];
@@ -754,6 +767,7 @@ const columnTypeMap = computed(() => {
 });
 const resolvedConnectionConfig = computed(() => connectionStore.getConfig(props.connectionId ?? ""));
 const resolvedDatabaseType = computed(() => props.databaseType ?? effectiveDatabaseTypeForConnection(resolvedConnectionConfig.value));
+const productionContext = computed(() => productionContextForDatabase(resolvedConnectionConfig.value, props.database));
 // The collection grid and Mongo query-result grids share the document-grid value
 // encoding (BSON null sentinel + JSON-prefixed containers), so every display,
 // editor and clipboard path must decode it whenever MongoDB values are on screen.
@@ -910,7 +924,7 @@ function sortMenuItems(column: string, columnIndex: number) {
     column,
     columnIndex,
     state: currentColumnSortState(),
-    databaseSortEnabled: databaseSortSupportedForDatabase(resolvedDatabaseType.value),
+    databaseSortEnabled: props.databaseSortEnabled !== false && databaseSortSupportedForDatabase(resolvedDatabaseType.value),
     labels: {
       databaseAscending: t("grid.sortDatabaseAscending"),
       databaseDescending: t("grid.sortDatabaseDescending"),
@@ -1218,6 +1232,12 @@ const filterModeOptions = computed(() => allFilterModeOptions.filter((option) =>
 const filterBuilderColumnOptions = computed(() => filterBuilderColumns.value.map((column) => column.name));
 const structuredFilterCacheKey = computed(() => props.cacheKey || [props.connectionId ?? "", props.database ?? "", props.context ?? "", props.tableMeta?.schema ?? "", props.tableMeta?.tableName ?? ""].join("\u0001"));
 const structuredFilterScopeKey = computed(() => [props.connectionId ?? "", props.database ?? "", props.schema ?? "", props.context ?? "", props.tableMeta?.schema ?? "", props.tableMeta?.tableName ?? "", props.tableMeta?.columns.map((column) => column.name).join("\0") ?? ""].join("\u0001"));
+const sortBuilderScopeKey = computed(() =>
+  JSON.stringify({
+    filterScope: structuredFilterScopeKey.value,
+    columns: filterBuilderColumnOptions.value,
+  }),
+);
 function isStructuredFilterRuleComplete(rule: StructuredFilterRule): boolean {
   return filterModeIsSupportedForDatabase(rule.mode, resolvedDatabaseType.value) && filterModeHasCompleteValue(rule.mode, rule.rawValue, rule.rawEndValue);
 }
@@ -1242,12 +1262,14 @@ async function buildStructuredFilterCondition(rule: StructuredFilterRule): Promi
 
 const filterBuilder = useDataGridFilterBuilder({
   columns: filterBuilderColumnOptions,
+  commentByColumn: columnCommentMap,
   createId: uuid,
   isComplete: isStructuredFilterRuleComplete,
   buildCondition: buildStructuredFilterCondition,
 });
 const conditionalBulkEditFilterBuilder = useDataGridFilterBuilder({
   columns: filterBuilderColumnOptions,
+  commentByColumn: columnCommentMap,
   createId: uuid,
   isComplete: isStructuredFilterRuleComplete,
   buildCondition: buildStructuredFilterCondition,
@@ -1366,7 +1388,7 @@ const localColumnFilterRuntime = useDataGridColumnFilters({
   getGlobalQueryTimeoutSecs: () => settingsStore.editorSettings.globalQueryTimeoutSecs,
   getNewRows: () => getGridNewRows(),
   getRowData: (row, sourceIndex) => getGridRowData(row, sourceIndex),
-  formatValue: formatCellCached,
+  formatValue: (value, columnIndex) => formatCell(value, columnIndex, undefined, false),
   waitForTableMeta,
   applyWhereFilter,
   resetGridVerticalScroll: () => resetLocalFilterGridScroll(),
@@ -2020,8 +2042,7 @@ watch(whereFilterInput, () => {
 });
 
 function clearOrderByInput() {
-  orderByInput.value = "";
-  void applyOrderBySearch();
+  void clearStructuredSortRules();
 }
 
 watch(orderByInput, (value) => {
@@ -2046,6 +2067,78 @@ watch(
 );
 
 const isApplyingWhere = ref(false);
+const sortBuilder = useDataGridSortBuilder({
+  columns: filterBuilderColumnOptions,
+  cacheKey: structuredFilterCacheKey,
+  scopeKey: sortBuilderScopeKey,
+  createId: uuid,
+});
+const structuredSortRules = sortBuilder.rules;
+const sortBuilderOpen = sortBuilder.open;
+const appliedStructuredOrderByInput = sortBuilder.appliedOrderByInput;
+const sortButtonCount = sortBuilder.activeRuleCount;
+const sortButtonActive = computed(() => !!appliedStructuredOrderByInput.value);
+const applyingOnlyStructuredSort = ref(false);
+const sortSqlPreview = computed(() => {
+  const draftStructuredOrderBy = buildDataGridStructuredOrderBy(structuredSortRules.value, queryColumnRef) ?? "";
+  const orderBy = combineDataGridOrderByInputs(orderByInput.value, draftStructuredOrderBy);
+  return orderBy ? `ORDER BY ${orderBy}` : "";
+});
+
+function copySortSqlPreview() {
+  if (!sortSqlPreview.value) return;
+  void copyText(sortSqlPreview.value);
+  toast(t("grid.sortSqlCopied"));
+}
+
+function setSortBuilderOpen(value: boolean) {
+  sortBuilder.setOpen(value);
+}
+
+async function applyStructuredSortRules() {
+  const nextOrderBy = buildDataGridStructuredOrderBy(structuredSortRules.value, queryColumnRef);
+  if (nextOrderBy === undefined) {
+    toast(t("grid.sortBuilderCompleteRuleFirst"));
+    return;
+  }
+  const applied = await applyOrderBySearch(undefined, nextOrderBy);
+  if (!applied) return;
+  if (filterEditorView.value === "quick") sortBuilder.setOpen(false);
+}
+
+async function applyOnlyStructuredSortRule(ruleId: string) {
+  if (!canUseWhereSearch.value || applyingOnlyStructuredSort.value || isApplyingWhere.value) return;
+  const rule = structuredSortRules.value.find((item) => item.id === ruleId);
+  if (!rule?.columnName) {
+    toast(t("grid.sortBuilderCompleteRuleFirst"));
+    return;
+  }
+  const nextOrderBy = buildDataGridStructuredOrderBy([{ ...rule, disabled: false }], queryColumnRef);
+  if (!nextOrderBy) {
+    toast(t("grid.sortBuilderCompleteRuleFirst"));
+    return;
+  }
+  applyingOnlyStructuredSort.value = true;
+  const scopeKey = sortBuilderScopeKey.value;
+  const cacheKey = structuredFilterCacheKey.value;
+  try {
+    sortBuilder.enableOnlyRule(ruleId);
+    const applied = await applyOrderBySearch(undefined, nextOrderBy);
+    if (applied && filterEditorView.value === "quick" && scopeKey === sortBuilderScopeKey.value && cacheKey === structuredFilterCacheKey.value) sortBuilder.setOpen(false);
+  } finally {
+    applyingOnlyStructuredSort.value = false;
+  }
+}
+
+async function clearStructuredSortRules() {
+  if (isApplyingWhere.value) return;
+  sortBuilder.clear();
+  orderByInput.value = "";
+  await applyOrderBySearch(undefined, "");
+}
+
+watch(filterEditorView, () => sortBuilder.setOpen(false));
+
 const rowStatusFilter = ref<RowStatusFilter>("all");
 const gridRef = ref<HTMLDivElement>();
 const dataGridTopbarRef = ref<HTMLDivElement>();
@@ -2095,6 +2188,17 @@ const goToColumnOpen = ref(false);
 const goToColumnSearch = ref("");
 const goToColumnSearchInput = ref<HTMLInputElement>();
 const goToColumnListRef = ref<HTMLElement>();
+// The trigger lives inside a Tooltip so the icon keeps its hover hint, and that
+// tooltip claims the popper anchor for its own popper root. Pointing the popover at
+// the button element directly keeps the column list positioned on screen.
+const goToColumnTriggerRef = ref<HTMLElement | { $el?: HTMLElement }>();
+
+function goToColumnTriggerElement(): HTMLElement | undefined {
+  const trigger = goToColumnTriggerRef.value;
+  if (!trigger) return undefined;
+  return trigger instanceof HTMLElement ? trigger : trigger.$el;
+}
+
 const goToColumnSelectedIndex = ref(0);
 const columnOrderKeys = computed(() => uniqueDataGridColumnOrderKeys(props.result.columns, props.sourceColumns));
 const resolvedColumnLayoutScopeKey = computed(
@@ -3173,6 +3277,10 @@ let infiniteScrollAllLoaded = false;
 let infiniteScrollRequestedOffset: number | undefined;
 let infiniteScrollRequestedLimit: number | undefined;
 let infiniteScrollLoadAllPending = false;
+// True while an explicit "load all" run is still appending chunks. The per-request
+// row cap bounds each request, not the run — the run only stops when the server
+// runs out of rows, so a table larger than the cap does not silently stop halfway (#10752).
+let loadAllRowsLoopActive = false;
 const loadAllRowsActive = ref(false);
 // Tracks whether the current loading cycle was triggered by a refresh/rollback
 // (as opposed to a normal paginate). Used to decide whether to auto-redirect
@@ -3195,7 +3303,7 @@ watch(
     // Switched between paginated and infinite scroll: reset to first page
     if (enabled !== prevEnabled) {
       resetInfiniteScrollState();
-      emit("paginate", 0, pageSize.value, currentWhereInput(), currentOrderBy());
+      emit("paginate", 0, pageSize.value, currentWhereInput(), effectiveOrderBy());
     }
   },
 );
@@ -3231,9 +3339,14 @@ watch(
         currentPage.value = Math.max(1, currentPage.value - 1);
         lastInfiniteScrollPage = Math.max(0, currentPage.value - 1);
         loadAllRowsActive.value = false;
+        loadAllRowsLoopActive = false;
         return;
       }
       const appendedRows = props.result.rows.length - requestedOffset;
+      if (loadAllRowsLoopActive) {
+        finishOrContinueLoadAllRun(requestedOffset, requestedLimit);
+        return;
+      }
       if (props.result.rows.length >= infiniteScrollMaxRows.value || appendedRows < (requestedLimit ?? pageSize.value)) {
         infiniteScrollAllLoaded = true;
       }
@@ -3244,6 +3357,11 @@ watch(
 );
 const manualTotalRowCount = ref<number | undefined>(undefined);
 const manualTotalRowCountLoading = ref(false);
+let manualTotalRowCountGeneration = 0;
+function invalidateManualTotalRowCount() {
+  manualTotalRowCountGeneration++;
+  manualTotalRowCount.value = undefined;
+}
 const esDeepPageJumpConfirmOpen = ref(false);
 const pendingEsDeepPageJump = ref<{ targetPage: number; requestCount: number; updateCurrentPage: boolean }>();
 // One "load all" click fetches the whole remaining segment in a single request;
@@ -3400,7 +3518,7 @@ watch(
       if (currentPage.value <= lastPageNum) return;
       currentPage.value = lastPageNum;
       resetGridVerticalScroll(true);
-      emit("paginate", (lastPageNum - 1) * pageSize.value, pageSize.value, currentWhereInput(), currentOrderBy());
+      emit("paginate", (lastPageNum - 1) * pageSize.value, pageSize.value, currentWhereInput(), effectiveOrderBy());
     }
   },
 );
@@ -3451,9 +3569,10 @@ function currentWhereInput(): string | undefined {
   return combineWhereInputs(whereFilterInput.value, appliedStructuredWhereInput.value);
 }
 
-function currentOrderBy(): string | undefined {
-  const structuredOrderBy = sortMode.value === "database" && sortCol.value ? `${queryColumnRef(sortCol.value)} ${sortDir.value.toUpperCase()}` : undefined;
-  return orderByInput.value.trim() || structuredOrderBy;
+function effectiveOrderBy(): string | undefined {
+  const columnOrderBy = sortMode.value === "database" && sortCol.value ? `${queryColumnRef(sortCol.value)} ${sortDir.value.toUpperCase()}` : undefined;
+  const manualOrderBy = orderByInput.value.trim() || columnOrderBy;
+  return combineDataGridOrderByInputs(manualOrderBy, appliedStructuredOrderByInput.value);
 }
 
 function executeServerPageJump(targetPage: number, updateCurrentPage = false) {
@@ -3465,7 +3584,7 @@ function executeServerPageJump(targetPage: number, updateCurrentPage = false) {
     currentPage.value = targetPage;
   }
   resetGridVerticalScroll(true);
-  emit("paginate", offset, pageSize.value, currentWhereInput(), currentOrderBy());
+  emit("paginate", offset, pageSize.value, currentWhereInput(), effectiveOrderBy());
 }
 
 function requestServerPageJump(targetPage: number, updateCurrentPage = false) {
@@ -3494,8 +3613,9 @@ watch(
   () => [props.countSql ?? "", props.tableMeta?.schema ?? "", props.tableMeta?.tableName ?? "", currentWhereInput() ?? "", props.database ?? "", props.connectionId ?? ""],
   (values, previousValues) => {
     if (!didDataGridInfiniteScrollContextChange(values, previousValues)) return;
-    manualTotalRowCount.value = undefined;
+    invalidateManualTotalRowCount();
   },
+  { flush: "sync" },
 );
 
 function syncOrderByInputWithSort(column: string | null, direction: "asc" | "desc" | null) {
@@ -3524,7 +3644,7 @@ function firstPage() {
   currentPage.value = 1;
   lastInfiniteScrollPage = 0;
   resetGridVerticalScroll(true);
-  emit("paginate", 0, pageSize.value, currentWhereInput(), currentOrderBy());
+  emit("paginate", 0, pageSize.value, currentWhereInput(), effectiveOrderBy());
 }
 function prevPage() {
   if (currentPage.value <= 1) {
@@ -3536,7 +3656,7 @@ function nextPage() {
   if (!canGoNextPage.value) return;
   currentPage.value++;
   resetGridVerticalScroll(true);
-  emit("paginate", (currentPage.value - 1) * pageSize.value, pageSize.value, currentWhereInput(), currentOrderBy());
+  emit("paginate", (currentPage.value - 1) * pageSize.value, pageSize.value, currentWhereInput(), effectiveOrderBy());
 }
 
 function jumpPage(page: number) {
@@ -3575,7 +3695,7 @@ function infiniteScrollNextPage() {
   currentPage.value = nextPageNum;
   // Fetch only the missing segment. Re-reading offset 0 grows transfer and replaces
   // row identities, which would invalidate pending edits while the user scrolls.
-  emit("paginate", nextOffset, nextLimit, currentWhereInput(), currentOrderBy());
+  emit("paginate", nextOffset, nextLimit, currentWhereInput(), effectiveOrderBy());
 }
 
 function selectAndRevealLastLoadedRow() {
@@ -3633,13 +3753,38 @@ function loadAllRowsAndGoToLast() {
 
 function startLoadAllRows(segment: { offset: number; limit: number }) {
   loadAllRowsActive.value = true;
+  loadAllRowsLoopActive = true;
   infiniteScrollLoadAllPending = true;
   infiniteScrollLoading.value = true;
   isInfiniteScrollPaginating.value = true;
   infiniteScrollRequestedOffset = segment.offset;
   infiniteScrollRequestedLimit = segment.limit;
   currentPage.value++;
-  emit("paginate", segment.offset, segment.limit, currentWhereInput(), currentOrderBy(), true);
+  emit("paginate", segment.offset, segment.limit, currentWhereInput(), effectiveOrderBy(), true);
+}
+
+// Continues an explicit "load all" run chunk by chunk until the server runs
+// out of rows (a chunk returns fewer rows than requested) or an exact known
+// total has been reached. Returns true when another chunk was dispatched.
+// The per-request result-row cap bounds each chunk, never the run (#10752).
+function finishOrContinueLoadAllRun(requestedOffset: number | undefined, requestedLimit: number | undefined): boolean {
+  if (!loadAllRowsLoopActive) return false;
+  const nextSegment = canFetchNextInfiniteScrollSegment.value
+    ? dataGridLoadAllNextSegment({
+        loadedRowCount: props.result.rows.length,
+        requestedOffset: requestedOffset ?? props.result.rows.length,
+        requestedLimit: requestedLimit ?? pageSize.value,
+        totalRowCount: totalRowCountIsExact.value ? displayedTotalRowCount.value : undefined,
+      })
+    : null;
+  if (!nextSegment) {
+    loadAllRowsLoopActive = false;
+    infiniteScrollAllLoaded = true;
+    selectAndRevealLastLoadedRow();
+    return false;
+  }
+  startLoadAllRows(nextSegment);
+  return true;
 }
 
 function confirmLoadAllRows() {
@@ -3672,9 +3817,10 @@ function changePageSize(size: number) {
   lastInfiniteScrollPage = 0;
   infiniteScrollAllLoaded = false;
   loadAllRowsActive.value = false;
+  loadAllRowsLoopActive = false;
   infiniteScrollPositions = new WeakMap();
   resetGridVerticalScroll(true);
-  emit("paginate", 0, normalizedSize, currentWhereInput(), currentOrderBy());
+  emit("paginate", 0, normalizedSize, currentWhereInput(), effectiveOrderBy());
 }
 
 function setDefaultPageSize() {
@@ -3704,12 +3850,13 @@ function jumpToCountedLastPage(total: number) {
   requestServerPageJump(lastPageNum);
 }
 
-async function beginManualTotalRowCount(): Promise<boolean> {
-  if (manualTotalRowCountLoading.value) return false;
+async function beginManualTotalRowCount(): Promise<number | undefined> {
+  if (manualTotalRowCountLoading.value) return undefined;
+  const generation = manualTotalRowCountGeneration;
   manualTotalRowCountLoading.value = true;
   // Flush busy UI (overlay / spinner) before the slow COUNT starts.
   await nextTick();
-  return true;
+  return generation;
 }
 
 async function lastPage() {
@@ -3725,9 +3872,12 @@ async function lastPage() {
   }
   // Navicat-style: always re-COUNT when jumping to the last page.
   if (props.countTotalRows) {
-    if (!(await beginManualTotalRowCount())) return;
+    const generation = await beginManualTotalRowCount();
+    if (generation === undefined) return;
     try {
+      if (generation !== manualTotalRowCountGeneration) return;
       const total = await props.countTotalRows();
+      if (generation !== manualTotalRowCountGeneration) return;
       if (typeof total !== "number" || !Number.isFinite(total) || total < 0) return;
       manualTotalRowCount.value = total;
       jumpToCountedLastPage(total);
@@ -3746,12 +3896,15 @@ async function lastPage() {
     return;
   }
   if (props.connectionId && (props.countSql || props.tableMeta)) {
-    if (!(await beginManualTotalRowCount())) return;
+    const generation = await beginManualTotalRowCount();
+    if (generation === undefined) return;
     try {
+      if (generation !== manualTotalRowCountGeneration) return;
       const countTarget = await buildCurrentCountTarget();
       const sql = countTarget?.sql;
-      if (!sql) return;
+      if (!sql || generation !== manualTotalRowCountGeneration) return;
       const result = await api.executeQuery(props.connectionId, props.executionDatabase ?? props.database ?? "", sql, countTarget.schema, undefined, dataGridCountQueryOptions(connectionStore.getConfig(props.connectionId), settingsStore.editorSettings.globalQueryTimeoutSecs));
+      if (generation !== manualTotalRowCountGeneration) return;
       const total = Number(result.rows?.[0]?.[0] ?? 0);
       if (!Number.isFinite(total) || total < 0) return;
       manualTotalRowCount.value = total;
@@ -3807,10 +3960,13 @@ async function buildCurrentCountTarget(): Promise<{ sql: string; schema?: string
 }
 
 async function calculateTotalRowCount() {
-  if (!(await beginManualTotalRowCount())) return;
+  const generation = await beginManualTotalRowCount();
+  if (generation === undefined) return;
   try {
+    if (generation !== manualTotalRowCountGeneration) return;
     if (props.countTotalRows) {
       const total = await props.countTotalRows();
+      if (generation !== manualTotalRowCountGeneration) return;
       if (typeof total === "number" && Number.isFinite(total) && total >= 0) {
         manualTotalRowCount.value = total;
       }
@@ -3818,8 +3974,9 @@ async function calculateTotalRowCount() {
     }
     if (!props.connectionId) return;
     const countTarget = await buildCurrentCountTarget();
-    if (!countTarget?.sql) return;
+    if (!countTarget?.sql || generation !== manualTotalRowCountGeneration) return;
     const result = await api.executeQuery(props.connectionId, props.executionDatabase ?? props.database ?? "", countTarget.sql, countTarget.schema, undefined, dataGridCountQueryOptions(connectionStore.getConfig(props.connectionId), settingsStore.editorSettings.globalQueryTimeoutSecs));
+    if (generation !== manualTotalRowCountGeneration) return;
     const total = Number(result.rows?.[0]?.[0] ?? 0);
     if (Number.isFinite(total) && total >= 0) {
       manualTotalRowCount.value = total;
@@ -3881,7 +4038,7 @@ async function refreshSavedRows(request: { dirtyRows: ReadonlyMap<number, Readon
     context: props.context,
     infiniteScroll: infiniteScrollEnabled.value,
     filterActive: !!currentWhereInput() || hasLocalColumnFilters.value || (dataGridSearchMode.value === "filter" && !!deferredClientSearchText.value),
-    orderActive: !!orderByInput.value.trim() || !!sortCol.value,
+    orderActive: !!effectiveOrderBy(),
     columns: request.columns,
     sourceColumns: props.sourceColumns,
     rows: request.rows,
@@ -4030,7 +4187,7 @@ const editor = useDataGridEditor({
   searchText,
   whereFilterInput,
   currentWhereInput: computed(() => currentWhereInput()),
-  orderByInput,
+  orderByInput: computed(() => effectiveOrderBy() ?? ""),
   rowStatusFilter,
   dataGridQuickEntryEnabled: computed(() => settingsStore.editorSettings.dataGridQuickEntry),
   confirmDangerousRowDeletion: computed(() => settingsStore.editorSettings.confirmDangerousSqlExecution),
@@ -4516,11 +4673,15 @@ function resetInfiniteScrollState() {
   infiniteScrollLoading.value = false;
   infiniteScrollLoadAllPending = false;
   loadAllRowsActive.value = false;
+  loadAllRowsLoopActive = false;
   infiniteScrollPositions = new WeakMap();
   resetGridVerticalScroll(true);
 }
 
 function prepareFullReload() {
+  // Counts belong to the previous data snapshot; paging can reuse them, but
+  // refresh/rollback must also reject any pending COUNT from that snapshot.
+  invalidateManualTotalRowCount();
   const viewportAnchor = captureViewportAnchorForRefresh();
   if (infiniteScrollEnabled.value || loadAllRowsActive.value) {
     resetInfiniteScrollState();
@@ -4549,7 +4710,7 @@ async function reloadTableData(intent: DataGridReloadIntent) {
   }
   markConditionInputsApplied();
   prepareFullReload();
-  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, resetToFirstPage ? 0 : (currentPage.value - 1) * pageSize.value, intent);
+  emit("reload", props.sql, searchText.value, currentWhereInput(), effectiveOrderBy(), pageSize.value, resetToFirstPage ? 0 : (currentPage.value - 1) * pageSize.value, intent);
 }
 
 function setAutoRefreshInterval(seconds: number) {
@@ -4567,7 +4728,7 @@ async function onToolbarCommit() {
 function onToolbarRollback() {
   discardChanges();
   prepareFullReload();
-  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, (currentPage.value - 1) * pageSize.value);
+  emit("reload", props.sql, searchText.value, currentWhereInput(), effectiveOrderBy(), pageSize.value, (currentPage.value - 1) * pageSize.value);
 }
 
 function addRow() {
@@ -5056,11 +5217,14 @@ function scrollToCurrentMatch() {
 }
 
 function scrollTransposeFieldIntoView(visibleFieldIndex: number) {
+  const actualColumnIndex = visibleColumnIndexes.value[visibleFieldIndex];
+  const sortedIndex = transposeRows.value.findIndex((item) => item.columnIndex === actualColumnIndex);
+  if (sortedIndex < 0) return;
   const scroller = transposeScrollRef.value;
   if (scroller && !(scroller instanceof HTMLElement)) {
-    (scroller as { scrollToItem?: (index: number) => void }).scrollToItem?.(visibleFieldIndex);
+    (scroller as { scrollToItem?: (index: number) => void }).scrollToItem?.(sortedIndex);
   } else if (scroller instanceof HTMLElement) {
-    scroller.scrollTop = visibleFieldIndex * transposeRowHeight.value;
+    scroller.scrollTop = sortedIndex * transposeRowHeight.value;
   }
 }
 
@@ -5510,7 +5674,7 @@ function currentViewProbe(): string {
     largeValueCells: props.result.large_value_cells,
     navigation: {
       whereInput: currentWhereInput(),
-      orderByInput: orderByInput.value,
+      orderByInput: effectiveOrderBy() ?? "",
       pageOffset: props.pageOffset,
       pageLimit: pageSize.value,
       sortColumn: props.sortColumn,
@@ -5926,6 +6090,12 @@ function exportSelectedRowsXlsx() {
   return exportXlsx(rowIds);
 }
 
+function openSelectedRowsXlsx() {
+  const rowIds = affectedRowIds();
+  if (rowIds.length === 0) return openXlsx();
+  return openXlsx(rowIds);
+}
+
 function exportSelectedRowsXlsxWithSql() {
   const rowIds = affectedRowIds();
   if (rowIds.length === 0) return;
@@ -6333,6 +6503,7 @@ watch(valueEditorContainer, async (el) => {
       appPalette: editorAppPalette,
       fontSize: editorFontSize,
       fontFamily: detailEditorFontFamily,
+      lineWrapping: () => settingsStore.editorSettings.wordWrap,
     });
     const editor = valueDetailEditor;
     await editor.create(el, detailEditValue.value, activeCellDetail.value?.type);
@@ -6489,7 +6660,8 @@ function applyColumnSort(column: string, columnIndex: number, direction: "asc" |
     clearSort();
     syncOrderByInputWithSort(null, null);
   }
-  emit("sort", column, columnIndex, direction, currentWhereInput(), mode);
+  if (mode === "database") emit("sort", column, columnIndex, direction, currentWhereInput(), mode, effectiveOrderBy());
+  else emit("sort", column, columnIndex, direction, currentWhereInput(), mode);
 }
 
 function selectHeaderSort(value: string, column: string, columnIndex: number) {
@@ -6568,18 +6740,26 @@ function waitForTableMeta(timeoutMs = 2500): Promise<DataGridTableMeta | null> {
   });
 }
 
-async function applyOrderBySearch() {
-  if (!props.onExecuteSql) return;
-  const orderByClause = orderByInput.value.trim() || undefined;
+async function applyOrderBySearch(_value?: string, structuredOrderByOverride?: string): Promise<boolean> {
+  if (!props.onExecuteSql) return false;
+  const structuredOrderBy = structuredOrderByOverride === undefined ? appliedStructuredOrderByInput.value : structuredOrderByOverride;
+  const orderByClause = combineDataGridOrderByInputs(orderByInput.value, structuredOrderBy);
+  const sortScopeKey = sortBuilderScopeKey.value;
+  const sortCacheKey = structuredFilterCacheKey.value;
   emit("update:orderByInput", orderByInput.value);
-  if (orderByClause) rememberDataGridConditionHistory("orderBy", conditionHistoryScope.value, orderByClause);
+  // Mirror applyWhereFilter's push into tab state: the structured clause lives
+  // in its own tab field so store-side rebuilds keep the composite ORDER BY
+  // while the manual input stays free of the structured terms.
+  emit("update:structuredOrderByInput", structuredOrderBy ?? "");
+  const manualOrderByClause = orderByInput.value.trim();
+  if (manualOrderByClause) rememberDataGridConditionHistory("orderBy", conditionHistoryScope.value, manualOrderByClause);
   isApplyingWhere.value = true;
   queryControlError.value = "";
   currentPage.value = 1;
   clearSort();
   try {
     const tableMeta = await waitForTableMeta();
-    if (!tableMeta) return;
+    if (!tableMeta) return false;
     const sql = await buildTableSelectSql({
       databaseType: resolvedDatabaseType.value,
       driverProfile: props.connectionId ? connectionStore.getConfig(props.connectionId)?.driver_profile : undefined,
@@ -6602,8 +6782,11 @@ async function applyOrderBySearch() {
     });
     markConditionInputsApplied();
     await props.onExecuteSql(sql);
+    if (structuredOrderByOverride !== undefined && sortScopeKey === sortBuilderScopeKey.value && sortCacheKey === structuredFilterCacheKey.value) sortBuilder.markApplied(structuredOrderByOverride);
+    return true;
   } catch (e: any) {
     queryControlError.value = String(e?.message || e);
+    return false;
   } finally {
     isApplyingWhere.value = false;
   }
@@ -6634,7 +6817,7 @@ async function applyWhereFilter() {
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       primaryKeys: tableMeta.primaryKeys,
       ...tableDataLargeValuePreviewOptions(resolvedDatabaseType.value, tableMeta.columns, tableMeta.primaryKeys, pageSize.value),
-      orderBy: orderByInput.value.trim() || (sortCol.value ? `${queryColumnRef(sortCol.value)} ${sortDir.value.toUpperCase()}` : undefined),
+      orderBy: effectiveOrderBy(),
       limit: pageSize.value,
       injectDefaultTimeSeriesWhere: true,
       whereInput,
@@ -7907,7 +8090,7 @@ async function syncUserFacingSql() {
       includeDatabaseName,
       injectDefaultTimeSeriesWhere: true,
       whereInput: currentWhereInput(),
-      orderBy: currentOrderBy(),
+      orderBy: effectiveOrderBy(),
       limit: footerPage.limit,
       offset: footerPage.offset,
     });
@@ -7918,7 +8101,7 @@ async function syncUserFacingSql() {
 }
 
 watch(
-  () => [props.sql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, props.executedPageLimit, props.executedPageOffset, currentWhereInput(), currentOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
+  () => [props.sql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, props.executedPageLimit, props.executedPageOffset, currentWhereInput(), effectiveOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
   () => void syncUserFacingSql(),
   { immediate: true },
 );
@@ -7945,11 +8128,14 @@ const {
   exportHtml,
   exportCurrentPageHtml,
   exportXlsx,
+  openXlsx,
+  openBrowser,
   exportXlsxWithSql,
   exportCurrentPageXlsx,
   exportCurrentPageXlsxWithSql,
   exportAllResultsXlsx,
   exportAllResultsXlsxWithSql,
+  exportResultSheetsXlsx,
   exportSql,
   exportCurrentPageSql,
   exportTxt,
@@ -7985,7 +8171,7 @@ const {
   columnTypes: visibleColumnTypes,
   allColumnTypes,
   whereInput: computed(() => currentWhereInput()),
-  orderBy: computed(() => currentOrderBy()),
+  orderBy: computed(() => effectiveOrderBy()),
   exportBatchSize: computed(() => settingsStore.editorSettings.exportBatchSize),
   hasCellSelection,
   hasColumnSelection,
@@ -8470,6 +8656,7 @@ function batchAppendPasteError(reason: string): string {
     "target-not-empty": "grid.batchAppendPasteTargetNotEmpty",
     "empty-paste": "grid.batchAppendPasteEmpty",
     "readonly-column": "grid.batchAppendPasteReadonlyColumn",
+    "no-matching-columns": "grid.batchAppendPasteNoMatchingColumns",
   };
   return t(messages[reason] ?? "grid.batchAppendPasteInvalidTarget");
 }
@@ -8486,8 +8673,8 @@ function blankSelectionBatchAppendPasteTarget(pastedRows: readonly (readonly (st
   return { rowId: item.id, columnIndexes: visibleColumnIndexes.value.slice(range.startCol) };
 }
 
-function appendParsedRowsToBlankTarget(targetRowId: number, rows: readonly (readonly (string | null)[])[], columnIndexes: readonly number[]): boolean {
-  const result = appendPastedRowsToNewRow(targetRowId, rows, columnIndexes);
+function appendParsedRowsToBlankTarget(targetRowId: number, rows: readonly (readonly (string | null)[])[], columnIndexes: readonly number[], columnNames?: readonly string[] | null): boolean {
+  const result = appendPastedRowsToNewRow(targetRowId, rows, columnIndexes, columnNames);
   if (!result.ok) {
     if (result.reason === "invalid-target" || result.reason === "target-not-empty") {
       batchAppendPasteRowId.value = null;
@@ -8501,6 +8688,20 @@ function appendParsedRowsToBlankTarget(targetRowId: number, rows: readonly (read
 }
 
 function pasteTextIntoGrid(text: string): boolean {
+  // SQL INSERT statements are only meaningful as new rows, so they are honored
+  // on the blank-new-row targets below; any other target pastes the parsed
+  // values through the regular cell path instead of treating the whole
+  // statement as literal text.
+  const insertPaste = parseInsertStatementPaste(text);
+  if (insertPaste) {
+    const insertTargetRowId = batchAppendPasteTargetRowId();
+    if (insertTargetRowId !== null) {
+      return appendParsedRowsToBlankTarget(insertTargetRowId, insertPaste.rows, visibleColumnIndexes.value, insertPaste.columnNames);
+    }
+    const insertCellTarget = blankSelectionBatchAppendPasteTarget(insertPaste.rows);
+    if (insertCellTarget) return appendParsedRowsToBlankTarget(insertCellTarget.rowId, insertPaste.rows, insertCellTarget.columnIndexes, insertPaste.columnNames);
+    return pasteRowsIntoSelection(insertPaste.rows);
+  }
   const rows = parseDataGridClipboard(text);
   const targetRowId = batchAppendPasteTargetRowId();
   if (targetRowId !== null) {
@@ -9481,7 +9682,7 @@ async function onGridKeydown(event: KeyboardEvent) {
   if (!targetAllowsNativeClipboard && props.context === "table-data" && canOpenTableStructureEditor.value && isEditTableStructureShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
     event.stopPropagation();
-    openTableStructureEditor();
+    openTableStructureEditor("columns");
     return;
   }
   if (!targetAllowsNativeClipboard && isGoToColumnShortcut(event, settingsStore.editorSettings.shortcuts) && openGoToColumn()) {
@@ -10012,8 +10213,9 @@ const activeTransposeRecordIndexes = computed(() =>
 );
 const transposeBeforeSpacerWidth = computed(() => (multiRowTranspose.value ? transposeRecordWindow.value.beforeWidth : 0));
 const transposeAfterSpacerWidth = computed(() => (multiRowTranspose.value ? transposeRecordWindow.value.afterWidth + transposeEndSpacerWidth.value : 0));
+const transposeColumnSortDirection = ref<"asc" | "desc" | null>(null);
 const transposeRows = computed(() => {
-  return buildVisibleTransposeRows({
+  const rows = buildVisibleTransposeRows({
     columns: visibleColumns.value,
     records: displayRowRefs.value.map((_, index) => displayItemAt(index)?.data ?? []),
     recordIndexes: activeTransposeRecordIndexes.value,
@@ -10021,6 +10223,11 @@ const transposeRows = computed(() => {
     types: visibleColumnTypes.value.map((type) => (type ? shortTypeName(compactHeaderColumnType(type)) : "")),
     comments: visibleColumnComments.value,
     displayValue: (value, _column, index) => formatCellCached(value, visibleColumnIndexes.value[index]),
+  }).map((row, index) => ({ ...row, columnIndex: visibleColumnIndexes.value[index] }));
+  if (!transposeColumnSortDirection.value) return rows;
+  return [...rows].sort((left, right) => {
+    const result = left.column.localeCompare(right.column, undefined, { sensitivity: "base" });
+    return transposeColumnSortDirection.value === "asc" ? result : -result;
   });
 });
 const transposeReserveTypeLine = computed(() => showTransposeFieldMetadata.value && showColumnTypesInHeader.value && transposeRows.value.some((row) => row.type));
@@ -10043,6 +10250,10 @@ function transposeFieldTitle(item: { column: string; type: string; comment?: str
   if (showTransposeFieldMetadata.value && showColumnTypesInHeader.value && item.type) details.push(`${t("grid.columnType")}: ${item.type}`);
   if (showTransposeFieldMetadata.value && showColumnCommentsInHeader.value && item.comment) details.push(`${t("grid.columnComment")}: ${item.comment}`);
   return details.join("\n");
+}
+
+function toggleTransposeColumnSort() {
+  transposeColumnSortDirection.value = transposeColumnSortDirection.value === "asc" ? "desc" : "asc";
 }
 
 function transposeColumnIndexKind(column: string): ColumnIndexKind | undefined {
@@ -10358,9 +10569,15 @@ watch(
     preservedDetailsOnNextResult = null;
     const shouldPreserveTranspose = preserveTransposeOnNextResult.value;
     preserveTransposeOnNextResult.value = false;
+    const appendRequestedOffset = infiniteScrollRequestedOffset;
+    const appendRequestedLimit = infiniteScrollRequestedLimit;
     const appendCompletion = dataGridInfiniteScrollAppendCompletion(previousResult, result, {
       pageSize: pageSize.value,
       maxRows: infiniteScrollMaxRows.value,
+      // While a "load all" run is active the per-request row cap must not be
+      // read as the end of data — only the requested-vs-appended count and an
+      // exact known total end the run (#10752).
+      ...(loadAllRowsLoopActive && appendRequestedLimit ? { loadAll: { requestedLimit: appendRequestedLimit, totalRowCount: totalRowCountIsExact.value ? displayedTotalRowCount.value : undefined } } : {}),
     });
     if (appendCompletion) {
       if (infiniteScrollEnabled.value) {
@@ -10374,10 +10591,12 @@ watch(
       }
       // The append completion above already reset `infiniteScrollLoading`, so the
       // post-flush loading watcher cannot observe this append; a "load all" run
-      // must still reveal its last row from here.
+      // must still continue or reveal its last row from here.
       if (infiniteScrollLoadAllPending) {
         infiniteScrollLoadAllPending = false;
-        selectAndRevealLastLoadedRow();
+        if (!finishOrContinueLoadAllRun(appendRequestedOffset, appendRequestedLimit)) {
+          selectAndRevealLastLoadedRow();
+        }
       }
       return;
     }
@@ -10385,6 +10604,7 @@ watch(
     filterValueSuggestionLoader.reset({ clearCache: true });
     // A non-append result replaces the whole data set, so a running "load all" is over.
     loadAllRowsActive.value = false;
+    loadAllRowsLoopActive = false;
     // The replacement also invalidates the all-loaded marker: a filter change or
     // page jump swaps in a fresh first page whose remaining segments must be
     // re-derived instead of being silently skipped.
@@ -11571,9 +11791,9 @@ function copyDdl() {
   copyText(ddlContent.value);
 }
 
-function openTableStructureEditor() {
+function openTableStructureEditor(initialTab: TableInfoTab) {
   if (!props.connectionId || !props.database || !props.tableMeta?.tableName || !canOpenTableStructureEditor.value) return;
-  queryStore.openTableStructure(props.connectionId, props.database, props.tableMeta.schema, props.tableMeta.tableName, activeTableInfoTab.value, undefined, props.tableMeta.catalog, (props.tableMeta.tableType || "").toUpperCase() === "VIEW" ? "view" : "table");
+  queryStore.openTableStructure(props.connectionId, props.database, props.tableMeta.schema, props.tableMeta.tableName, initialTab, undefined, props.tableMeta.catalog, (props.tableMeta.tableType || "").toUpperCase() === "VIEW" ? "view" : "table");
 }
 
 function toggleDdlWrap() {
@@ -11962,6 +12182,8 @@ defineExpose({
   exportJson,
   exportSql,
   exportXlsx,
+  exportResultSheetsXlsx,
+  openXlsx,
   exportTxt,
   defaultCopyPreference: selectedCopyPreference,
   defaultCopyPreferenceLabel,
@@ -12172,7 +12394,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
       canFilter: canUseWhereSearch.value,
       hasSort: !!sortCol.value,
       sortMode: sortMode.value,
-      databaseSortEnabled: databaseSortSupportedForDatabase(resolvedDatabaseType.value),
+      databaseSortEnabled: props.databaseSortEnabled !== false && databaseSortSupportedForDatabase(resolvedDatabaseType.value),
       frozenColumnCount: frozenColumnCount.value,
       contextVisibleColIdx: contextHeaderVisibleColIdx.value ?? undefined,
       hasColumnSelection: hasColumnSelection.value,
@@ -12323,7 +12545,22 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         },
       },
     }),
-    [exportSubmenu()],
+    [
+      exportSubmenu(),
+      ...(isTauriRuntime()
+        ? [
+            {
+              label: t("tableToolbox.openWith"),
+              icon: ExternalLink,
+              children: [
+                { label: t("tableToolbox.openXlsx"), icon: FileSpreadsheet, action: openSelectedRowsXlsx },
+                { label: t("tableToolbox.browserFiltered"), icon: Globe2, action: () => openBrowser(undefined) },
+                { label: t("tableToolbox.browserSelected"), icon: Globe2, disabled: !hasRowSelection.value, action: () => openBrowser(affectedRowIds()) },
+              ],
+            },
+          ]
+        : []),
+    ],
     previewItems,
     // 右键刷新：与工具栏刷新按钮/Mod+R 走同一个 onToolbarRefresh，方便
     // 习惯 Navicat 等工具在数据页右键刷新的用户（#7273）。
@@ -12443,8 +12680,10 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   v-model:where-input="whereFilterInput"
                   v-model:order-by-input="orderByInput"
                   v-model:filter-builder-open="filterBuilderOpen"
+                  :sort-builder-open="sortBuilderOpen"
                   :filter-editor-view="filterEditorView"
                   :columns="props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns"
+                  :comment-by-column="columnCommentMap"
                   :condition-columns="conditionColumns"
                   :identifier-quote="conditionIdentifierQuote"
                   :history-scope="conditionHistoryScope"
@@ -12453,6 +12692,11 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   :leading-border="!!(useTransaction && editable && hasDataGridSaveTarget)"
                   :filter-button-active="filterButtonActive"
                   :filter-button-count="filterButtonCount"
+                  :sort-button-active="sortButtonActive"
+                  :sort-button-count="sortButtonCount"
+                  :sort-rules="structuredSortRules"
+                  :sort-builder-busy="isApplyingWhere"
+                  :sort-apply-only-busy="applyingOnlyStructuredSort"
                   :has-local-column-filters="hasLocalColumnFilters"
                   :local-filter-count="localFilterCount"
                   :local-filter-summaries="localFilterSummaries"
@@ -12464,6 +12708,15 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   :apply-where="applyWhereFilter"
                   :apply-order-by="applyOrderBySearch"
                   :clear-order-by="clearOrderByInput"
+                  @update:sort-builder-open="setSortBuilderOpen"
+                  @add-sort-rule="sortBuilder.addRule"
+                  @remove-sort-rule="sortBuilder.removeRule"
+                  @move-sort-rule="sortBuilder.moveRule"
+                  @update-sort-rule="sortBuilder.updateRule"
+                  @apply-only-sort-rule="applyOnlyStructuredSortRule"
+                  @reset-sort-rules="sortBuilder.reset"
+                  @clear-sort-rules="clearStructuredSortRules"
+                  @apply-sort-rules="applyStructuredSortRules"
                   @update:column-search="filterBuilderColumnSearch = $event"
                   @ensure-rule="ensureStructuredFilterRule"
                   @add-rule="addStructuredFilterRule"
@@ -12556,7 +12809,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                 <Tooltip>
                   <TooltipTrigger as-child>
                     <PopoverTrigger as-child>
-                      <Button data-toolbar-action="navigation" variant="ghost" size="sm" :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compact ? 'data-grid-topbar-action-button--compact' : '', goToColumnOpen ? 'text-primary bg-primary/10' : '']">
+                      <Button ref="goToColumnTriggerRef" data-toolbar-action="navigation" variant="ghost" size="sm" :class="['data-grid-topbar-action-button h-5 shrink-0 text-xs px-1.5', compact ? 'data-grid-topbar-action-button--compact' : '', goToColumnOpen ? 'text-primary bg-primary/10' : '']">
                         <Columns3 class="data-grid-topbar-action-icon w-3 h-3" />
                         <span
                           class="data-grid-topbar-action-label"
@@ -12570,7 +12823,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   </TooltipTrigger>
                   <TooltipContent side="bottom">{{ t("grid.goToColumn") }}</TooltipContent>
                 </Tooltip>
-                <PopoverContent align="end" class="w-56 p-2" @keydown="onGoToColumnKeydown">
+                <PopoverContent :reference="goToColumnTriggerElement()" align="end" class="w-56 p-2" @keydown="onGoToColumnKeydown">
                   <div class="relative mb-1">
                     <Search class="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                     <input ref="goToColumnSearchInput" v-model="goToColumnSearch" :placeholder="t('grid.searchColumn')" class="h-8 w-full rounded-md border bg-transparent pl-7 pr-6 text-xs outline-none focus-visible:border-ring/50 focus-visible:ring-1 focus-visible:ring-ring/25" />
@@ -12665,6 +12918,44 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
           @toggle-all-value-suggestions="toggleAllFilterValueSuggestions"
           @apply-value-suggestions="applyFilterValueSuggestions"
         />
+        <DataGridSortWorkbench
+          v-if="canUseWhereSearch && filterEditorView === 'conditions' && sortBuilderOpen"
+          :sql-preview="sortSqlPreview"
+          :rules="structuredSortRules"
+          :columns="filterBuilderColumnOptions"
+          :comment-by-column="columnCommentMap"
+          :busy="isApplyingWhere"
+          :apply-only-busy="applyingOnlyStructuredSort"
+          @add-rule="sortBuilder.addRule"
+          @remove-rule="sortBuilder.removeRule"
+          @move-rule="sortBuilder.moveRule"
+          @update-rule="sortBuilder.updateRule"
+          @apply-only="applyOnlyStructuredSortRule"
+          @reset="sortBuilder.reset"
+          @clear="clearStructuredSortRules"
+          @copy-sql="copySortSqlPreview"
+          @apply="applyStructuredSortRules"
+        />
+        <DataGridTextSortWorkbench
+          v-if="canUseWhereSearch && filterEditorView === 'text' && sortBuilderOpen"
+          :height="settingsStore.editorSettings.dataGridTextFilterPanelHeight"
+          :sql-preview="sortSqlPreview"
+          :rules="structuredSortRules"
+          :columns="filterBuilderColumnOptions"
+          :comment-by-column="columnCommentMap"
+          :busy="isApplyingWhere"
+          :apply-only-busy="applyingOnlyStructuredSort"
+          @update:height="updateTextFilterPanelHeight"
+          @add-rule="sortBuilder.addRule"
+          @remove-rule="sortBuilder.removeRule"
+          @move-rule="sortBuilder.moveRule"
+          @update-rule="sortBuilder.updateRule"
+          @apply-only="applyOnlyStructuredSortRule"
+          @reset="sortBuilder.reset"
+          @clear="clearStructuredSortRules"
+          @copy-sql="copySortSqlPreview"
+          @apply="applyStructuredSortRules"
+        />
         <!-- Truncation warning banner -->
         <div v-if="showTruncationWarning" class="shrink-0 px-3 py-1 bg-amber-500/10 border-b border-amber-500/20 text-xs text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
           <span>{{ t(truncationHintKey, { count: result.rows.length }) }}</span>
@@ -12728,294 +13019,282 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   <X class="w-3 h-3" />
                 </Button>
               </div>
-              <RecycleScroller
-                ref="transposeScrollRef"
-                class="transpose-grid-scroller flex-1 min-h-0 overflow-auto overscroll-none bg-background"
-                :class="{ 'is-scrolling': isScrolling }"
-                :style="{
-                  '--transpose-total-w': `${transposeTotalWidth}px`,
-                  '--transpose-field-w': `${transposePinnedWidth}px`,
-                }"
-                :items="transposeRows"
-                :item-size="transposeRowHeight"
-                :buffer="400"
-                key-field="id"
-                @scroll="onTransposeScroll"
-                @resize="updateTransposeViewport"
-              >
-                <template #before>
-                  <div class="data-grid-transpose-header data-grid-header-shell sticky top-0 z-20 flex h-7 border-b border-border font-semibold text-muted-foreground" :style="{ width: `${transposeTotalWidth}px` }">
-                    <div class="data-grid-header-cell sticky left-0 z-30 shrink-0 border-r border-border px-3 py-1.5 truncate relative" :style="{ width: `${transposePinnedWidth}px` }">
-                      {{ t("grid.columnName") }}
-                      <div class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="onTransposePinnedResizeStart" />
-                    </div>
-                    <div class="shrink-0" :style="{ width: `${transposeBeforeSpacerWidth}px` }" />
-                    <div
-                      v-for="recordIndex in activeTransposeRecordIndexes"
-                      :key="`transpose-head-${recordIndex}`"
-                      data-grid-transpose-record-header
-                      :data-grid-transpose-record-index="recordIndex"
-                      class="shrink-0 border-r border-border px-2 py-1.5 text-left tabular-nums relative"
-                      :class="{
-                        'transpose-record-header-selected text-primary font-semibold': transposeRecordUsesFramedHeader(recordIndex),
-                        'transpose-record-header-active text-primary': transposeRecordUsesActiveHighlight(recordIndex) && !transposeRecordUsesFramedHeader(recordIndex),
-                        'data-grid-header-cell': !transposeRecordUsesActiveHighlight(recordIndex) && !transposeRecordUsesFramedHeader(recordIndex),
-                        'crosshair-column': !!crosshairTarget?.rowCrosshair && crosshairTarget.rowIndex === recordIndex && !transposeRecordUsesFramedHeader(recordIndex) && !transposeRecordUsesActiveHighlight(recordIndex),
-                      }"
-                      :style="{
-                        width: `${getTransposeRecordWidth(recordIndex)}px`,
-                      }"
-                      @click="selectTransposeRecord(recordIndex, $event)"
-                      @contextmenu="selectTransposeRecord(recordIndex, $event)"
-                    >
-                      {{ rowNumberText(displayItems[recordIndex]) }}
-                      <div class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="onTransposeRecordResizeStart(recordIndex, $event)" @dblclick.stop="autoFitTransposeRecord(recordIndex)" />
-                    </div>
-                    <div class="shrink-0" :style="{ width: `${transposeAfterSpacerWidth}px` }" />
-                  </div>
-                </template>
-                <template #default="{ item, index }">
-                  <div
-                    class="data-grid-transpose-row flex border-b border-border/60"
-                    :style="{
-                      height: `${transposeRowHeight}px`,
-                      width: `${transposeTotalWidth}px`,
-                    }"
-                  >
-                    <LightTooltip :text="transposeFieldTitle(item)" side="right" :side-offset="6" :delay="250" :open-on-focus="false" surface="popover">
-                      <div
-                        data-native-clipboard
-                        :data-grid-transpose-column-index="visibleColumnIndexes[index]"
-                        class="sticky left-0 z-10 flex shrink-0 flex-col items-start justify-center overflow-hidden border-r border-border bg-background px-3 py-0"
-                        :class="{
-                          'ring-2 ring-inset ring-primary': highlightedColumnIndex === visibleColumnIndexes[index],
-                          'bg-yellow-200/60 dark:bg-yellow-500/20': transposeHeaderIsSearchMatch(visibleColumnIndexes[index]),
-                          'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': transposeHeaderIsCurrentMatch(visibleColumnIndexes[index]),
-                        }"
-                        :style="{ width: `${transposePinnedWidth}px` }"
-                      >
-                        <span class="flex w-full min-w-0 items-center gap-1 overflow-hidden pr-5">
-                          <KeyRound v-if="transposeColumnIndexKind(item.column) === 'primary'" data-grid-transpose-index-indicator class="h-3 w-3 shrink-0" :class="columnIndexColorClass('primary')" :title="transposeColumnIndexText('primary')" />
-                          <Hash v-else-if="transposeColumnIndexKind(item.column)" data-grid-transpose-index-indicator class="h-3 w-3 shrink-0" :class="columnIndexColorClass(transposeColumnIndexKind(item.column)!)" :title="transposeColumnIndexText(transposeColumnIndexKind(item.column)!)" />
-                          <span class="min-w-0 flex-1 truncate font-medium leading-4">{{ item.column }}</span>
-                        </span>
-                        <LightDropdownMenu
-                          v-if="headerColumnSortable(visibleColumnIndexes[index])"
-                          :items="sortMenuItems(item.column, visibleColumnIndexes[index])"
-                          :open="headerSortMenuOpenColumn === visibleColumnIndexes[index]"
-                          :selected-value="selectedSortMenuValue(item.column, visibleColumnIndexes[index])"
-                          check-position="none"
-                          align="end"
-                          content-class="w-max min-w-28 p-0.5"
-                          item-class="gap-1 rounded-none px-1.5 py-0.5 text-xs"
-                          item-icon-class="h-3 w-3"
-                          :match-trigger-width="false"
-                          @update:open="(value: boolean) => (headerSortMenuOpenColumn = value ? visibleColumnIndexes[index] : null)"
-                          @select="(value: string) => selectHeaderSort(value, item.column, visibleColumnIndexes[index])"
+              <div class="relative min-h-0 flex-1 overflow-hidden">
+                <ProductionWatermark v-if="productionContext.active" />
+                <RecycleScroller
+                  ref="transposeScrollRef"
+                  class="transpose-grid-scroller h-full overflow-auto overscroll-none bg-background"
+                  :class="{ 'is-scrolling': isScrolling }"
+                  :style="{
+                    '--transpose-total-w': `${transposeTotalWidth}px`,
+                    '--transpose-field-w': `${transposePinnedWidth}px`,
+                  }"
+                  :items="transposeRows"
+                  :item-size="transposeRowHeight"
+                  :buffer="400"
+                  key-field="id"
+                  @scroll="onTransposeScroll"
+                  @resize="updateTransposeViewport"
+                >
+                  <template #before>
+                    <div class="data-grid-transpose-header data-grid-header-shell sticky top-0 z-20 flex h-7 border-b border-border font-semibold text-muted-foreground" :style="{ width: `${transposeTotalWidth}px` }">
+                      <div class="data-grid-header-cell sticky left-0 z-30 flex shrink-0 items-center border-r border-border px-3 py-1.5 truncate relative" :style="{ width: `${transposePinnedWidth}px` }">
+                        <span class="min-w-0 flex-1 truncate">{{ t("grid.columnName") }}</span>
+                        <button
+                          data-grid-transpose-column-sort
+                          type="button"
+                          class="ml-1 flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                          :title="t('grid.sort')"
+                          :aria-label="t('grid.sort')"
+                          @mousedown.stop
+                          @click.stop="toggleTransposeColumnSort"
                         >
-                          <template #trigger="{ open, toggle }">
-                            <button
-                              data-grid-transpose-sort
-                              type="button"
-                              class="absolute right-1 top-1 flex h-4 w-4 shrink-0 items-center justify-center rounded"
-                              :class="columnIsSorted(item.column, visibleColumnIndexes[index]) ? 'bg-primary text-primary-foreground opacity-100 shadow-sm hover:bg-primary/90' : 'text-muted-foreground opacity-80 hover:bg-accent hover:text-foreground'"
-                              :title="t('grid.sort')"
-                              :aria-label="`${t('grid.sort')}: ${item.column}`"
-                              :aria-expanded="open"
-                              @mousedown.stop
-                              @click.stop="toggle"
-                            >
-                              <ArrowUp v-if="columnIsSorted(item.column, visibleColumnIndexes[index]) && sortDir === 'asc'" class="h-3 w-3 shrink-0" />
-                              <ArrowDown v-else-if="columnIsSorted(item.column, visibleColumnIndexes[index]) && sortDir === 'desc'" class="h-3 w-3 shrink-0" />
-                              <ArrowUpDown v-else class="h-3 w-3 shrink-0" />
-                            </button>
-                          </template>
-                        </LightDropdownMenu>
-                        <template v-if="showTransposeFieldMetadata && showColumnTypesInHeader && item.type">
-                          <span data-grid-transpose-type-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 select-none" :class="typeColorClass(item.type)" :title="item.type">
-                            {{ item.type }}
-                          </span>
-                        </template>
-                        <template v-if="showTransposeFieldMetadata && showColumnCommentsInHeader && item.comment">
-                          <span data-grid-transpose-comment-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 text-muted-foreground select-none" :title="item.comment">
-                            {{ item.comment }}
-                          </span>
-                        </template>
+                          <ArrowUp v-if="transposeColumnSortDirection === 'asc'" class="h-3 w-3" />
+                          <ArrowDown v-else-if="transposeColumnSortDirection === 'desc'" class="h-3 w-3" />
+                          <ArrowUpDown v-else class="h-3 w-3" />
+                        </button>
+                        <div class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="onTransposePinnedResizeStart" />
                       </div>
-                      <template #content>
+                      <div class="shrink-0" :style="{ width: `${transposeBeforeSpacerWidth}px` }" />
+                      <div
+                        v-for="recordIndex in activeTransposeRecordIndexes"
+                        :key="`transpose-head-${recordIndex}`"
+                        data-grid-transpose-record-header
+                        :data-grid-transpose-record-index="recordIndex"
+                        class="shrink-0 border-r border-border px-2 py-1.5 text-left tabular-nums relative"
+                        :class="{
+                          'transpose-record-header-selected text-primary font-semibold': transposeRecordUsesFramedHeader(recordIndex),
+                          'transpose-record-header-active text-primary': transposeRecordUsesActiveHighlight(recordIndex) && !transposeRecordUsesFramedHeader(recordIndex),
+                          'data-grid-header-cell': !transposeRecordUsesActiveHighlight(recordIndex) && !transposeRecordUsesFramedHeader(recordIndex),
+                          'crosshair-column': !!crosshairTarget?.rowCrosshair && crosshairTarget.rowIndex === recordIndex && !transposeRecordUsesFramedHeader(recordIndex) && !transposeRecordUsesActiveHighlight(recordIndex),
+                        }"
+                        :style="{
+                          width: `${getTransposeRecordWidth(recordIndex)}px`,
+                        }"
+                        @click="selectTransposeRecord(recordIndex, $event)"
+                        @contextmenu="selectTransposeRecord(recordIndex, $event)"
+                      >
+                        {{ rowNumberText(displayItems[recordIndex]) }}
+                        <div class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="onTransposeRecordResizeStart(recordIndex, $event)" @dblclick.stop="autoFitTransposeRecord(recordIndex)" />
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${transposeAfterSpacerWidth}px` }" />
+                    </div>
+                  </template>
+                  <template #default="{ item }">
+                    <div
+                      class="data-grid-transpose-row flex border-b border-border/60"
+                      :style="{
+                        height: `${transposeRowHeight}px`,
+                        width: `${transposeTotalWidth}px`,
+                      }"
+                    >
+                      <LightTooltip :text="transposeFieldTitle(item)" side="right" :side-offset="6" :delay="250" :open-on-focus="false" surface="popover">
                         <div
-                          data-grid-transpose-field-tooltip
-                          class="grid max-h-[min(20rem,calc(100vh-1rem))] w-[min(24rem,calc(100vw-1rem))] grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 overflow-auto rounded-md border border-border bg-popover px-3 py-2 text-left text-popover-foreground shadow-md"
+                          data-native-clipboard
+                          :data-grid-transpose-column-index="item.columnIndex"
+                          class="sticky left-0 z-10 flex shrink-0 flex-col items-start justify-center overflow-hidden border-r border-border bg-background px-3 py-0"
+                          :class="{
+                            'ring-2 ring-inset ring-primary': highlightedColumnIndex === item.columnIndex,
+                            'bg-yellow-200/60 dark:bg-yellow-500/20': transposeHeaderIsSearchMatch(item.columnIndex),
+                            'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': transposeHeaderIsCurrentMatch(item.columnIndex),
+                          }"
+                          :style="{ width: `${transposePinnedWidth}px` }"
                         >
-                          <span class="text-muted-foreground">{{ t("grid.columnName") }}</span>
-                          <span class="min-w-0 break-all font-mono select-text">{{ item.column }}</span>
+                          <span class="flex w-full min-w-0 items-center gap-1 overflow-hidden pr-5">
+                            <KeyRound v-if="transposeColumnIndexKind(item.column) === 'primary'" data-grid-transpose-index-indicator class="h-3 w-3 shrink-0" :class="columnIndexColorClass('primary')" :title="transposeColumnIndexText('primary')" />
+                            <Hash v-else-if="transposeColumnIndexKind(item.column)" data-grid-transpose-index-indicator class="h-3 w-3 shrink-0" :class="columnIndexColorClass(transposeColumnIndexKind(item.column)!)" :title="transposeColumnIndexText(transposeColumnIndexKind(item.column)!)" />
+                            <span class="min-w-0 flex-1 truncate font-medium leading-4">{{ item.column }}</span>
+                          </span>
                           <template v-if="showTransposeFieldMetadata && showColumnTypesInHeader && item.type">
-                            <span class="text-muted-foreground">{{ t("grid.columnType") }}</span>
-                            <span class="min-w-0 break-all font-mono select-text" :class="typeColorClass(item.type)">{{ item.type }}</span>
+                            <span data-grid-transpose-type-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 select-none" :class="typeColorClass(item.type)" :title="item.type">
+                              {{ item.type }}
+                            </span>
                           </template>
                           <template v-if="showTransposeFieldMetadata && showColumnCommentsInHeader && item.comment">
-                            <span class="text-muted-foreground">{{ t("grid.columnComment") }}</span>
-                            <span class="min-w-0 whitespace-pre-wrap break-words select-text">{{ item.comment }}</span>
+                            <span data-grid-transpose-comment-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 text-muted-foreground select-none" :title="item.comment">
+                              {{ item.comment }}
+                            </span>
                           </template>
                         </div>
-                      </template>
-                    </LightTooltip>
-                    <div class="shrink-0" :style="{ width: `${transposeBeforeSpacerWidth}px` }" />
-                    <div
-                      v-for="cell in item.values"
-                      :key="`${item.id}:${cell.recordIndex}`"
-                      data-grid-transpose-cell
-                      :data-grid-transpose-record-index="cell.recordIndex"
-                      class="relative flex shrink-0 items-center border-r border-border/70 px-2 py-0"
-                      :class="[
-                        transposeCellTextColorClass(cell.recordIndex, cell.valueIndex),
-                        {
-                          'overflow-visible z-20 border-r-transparent': transposeCellEditorActive(cell.recordIndex, cell.valueIndex),
-                          'overflow-hidden text-ellipsis whitespace-nowrap': !transposeCellEditorActive(cell.recordIndex, cell.valueIndex),
-                          'cell-selected': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'cell-selected-dirty': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'cell-selected--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'cell-selected-dirty--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'row-cell-selected': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'row-cell-selected-dirty': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'crosshair-row':
-                            !!crosshairTarget?.columnCrosshair && cell.valueIndex === crosshairTarget.actualColIdx && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
-                          'bg-primary/15': transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
-                          'bg-yellow-500/10 cell-dirty': displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
-                          'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(cell.recordIndex, cell.valueIndex),
-                          'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(cell.recordIndex, cell.valueIndex),
-                          'cursor-text': !isScrolling,
-                          'hover:bg-gray-200 hover:text-foreground dark:hover:bg-gray-800':
-                            !isScrolling && canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
-                        },
-                      ]"
-                      :style="{
-                        width: `${getTransposeRecordWidth(cell.recordIndex)}px`,
-                      }"
-                      :title="cell.display"
-                      @mousedown="prepareTransposeCellMouseDown(cell.recordIndex, cell.valueIndex)"
-                      @click="selectTransposeCell(cell.recordIndex, cell.valueIndex, $event)"
-                      @mouseenter="onTransposeCellMouseenter(cell.recordIndex, cell.valueIndex)"
-                      @mouseleave="onCellMouseleave(cell.recordIndex, cell.valueIndex)"
-                      @contextmenu="onTransposeCellContext(cell.recordIndex, cell.valueIndex, $event)"
-                      @dblclick.stop="onTransposeCellDblClick(cell.recordIndex, cell.valueIndex, cell.display, $event)"
-                    >
-                      <template v-if="readonlyTextCellMatches(displayItems[cell.recordIndex]?.id, cell.valueIndex)">
-                        <DataGridReadonlyTextSelection :value="readonlyTextCell!.value" :expanded="readonlyTextCell!.expanded" @close="closeReadonlyCellTextSelection" @escape="escapeReadonlyCellTextSelection" />
-                      </template>
-                      <template v-else-if="editingCell?.rowId === displayItems[cell.recordIndex]?.id && editingCell?.col === cell.valueIndex">
-                        <TemporalCellEditor
-                          v-if="temporalEditorConfigForColumn(cell.valueIndex)"
-                          v-model="editValue"
-                          :kind="temporalEditorConfigForColumn(cell.valueIndex)!.kind"
-                          :fraction-precision="temporalEditorConfigForColumn(cell.valueIndex)!.fractionPrecision"
-                          :normalize-value="(value) => normalizeTemporalCellEditorValue(value, cell.valueIndex)"
-                          cell-layout="transpose"
-                          @cancel="cancelEdit"
-                          @commit="commitGridEdit"
-                          @save="onTemporalCellEditorSave"
-                        />
-                        <EnumCellEditor
-                          v-else-if="isBooleanGridCell(displayItems[cell.recordIndex], cell.valueIndex)"
-                          v-model="booleanEditorModelValue"
-                          :values="BOOLEAN_CELL_EDITOR_VALUES"
-                          :nullable="isBooleanGridColumnNullable(cell.valueIndex)"
-                          :initial-null="isGridCellInitialNull(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
-                          cell-layout="transpose"
-                          @cancel="cancelEdit"
-                          @commit="commitBooleanGridEdit"
-                        />
-                        <EnumCellEditor
-                          v-else-if="isEnumGridColumn(cell.valueIndex)"
-                          v-model="editValue"
-                          :values="enumValuesForGridColumn(cell.valueIndex)"
-                          :nullable="isEnumGridColumnNullable(cell.valueIndex)"
-                          :initial-null="isGridCellInitialNull(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
-                          cell-layout="transpose"
-                          @cancel="cancelEdit"
-                          @commit="commitGridEdit"
-                        />
-                        <textarea
-                          v-else-if="cellUsesExpandedEditor(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
-                          v-model="editValue"
-                          data-expanded-cell-editor="true"
-                          rows="1"
-                          :inputmode="cellEditInputModeForColumn(cell.valueIndex)"
-                          autocapitalize="off"
-                          autocorrect="off"
-                          spellcheck="false"
-                          class="cell-edit-input cell-edit-input--expanded absolute left-0 top-0 min-h-full bg-background px-1.5 py-1 leading-[18px] outline-none z-10"
-                          @blur="commitEditFromCellBlur"
-                          @click.stop
-                          @focus="onCellEditTextareaInput"
-                          @input="onCellEditTextareaInput"
-                          @keydown.stop="onCellEditKeydown"
-                          @paste.stop="onCellEditTextareaPaste"
-                          @wheel.stop
-                        />
-                        <input
-                          v-else
-                          v-model="editValue"
-                          :inputmode="cellEditInputModeForColumn(cell.valueIndex)"
-                          autocapitalize="off"
-                          autocorrect="off"
-                          spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-1.5 py-0 leading-[26px] outline-none z-10"
-                          @blur="commitEditFromCellBlur"
-                          @click.stop
-                          @input="onCellEditTextareaInput"
-                          @keydown.stop="onCellEditKeydown"
-                          @paste.stop="onCellEditTextareaPaste"
-                        />
-                      </template>
-                      <template v-else>
-                        <template v-if="newRowCellPlaceholder(displayItems[cell.recordIndex], cell.valueIndex)">
-                          <span class="text-muted-foreground/70 italic">{{ firstLineCellDisplayValue(newRowCellPlaceholder(displayItems[cell.recordIndex], cell.valueIndex) ?? "", flatteningMultiLineEnabled) }}</span>
-                        </template>
-                        <template v-else>{{ gridCellDisplayValue(cell.display, flatteningMultiLineEnabled, showWhitespaceEnabled) }}</template>
-                        <div v-if="cellDetailButtonVisible(cell.recordIndex, cell.valueIndex)" class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
-                          <LightDropdownMenu
-                            v-if="canQuickDownloadCellValue(cell.recordIndex, cell.valueIndex)"
-                            :items="binaryCellDownloadMenuItems"
-                            :open="quickDownloadMenuOpenFor(cell.recordIndex, cell.valueIndex)"
-                            align="end"
-                            content-class="w-44"
-                            :match-trigger-width="false"
-                            @update:open="(value: boolean) => handleQuickDownloadMenuOpenChange(value, cell.recordIndex, cell.valueIndex)"
-                            @select="(mode: string) => downloadCellBinaryValue(cell.recordIndex, cell.valueIndex, mode as BinaryCellDownloadMode)"
+                        <template #content>
+                          <div
+                            data-grid-transpose-field-tooltip
+                            class="grid max-h-[min(20rem,calc(100vh-1rem))] w-[min(24rem,calc(100vw-1rem))] grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1.5 overflow-auto rounded-md border border-border bg-popover px-3 py-2 text-left text-popover-foreground shadow-md"
                           >
-                            <template #trigger="{ open, toggle }">
-                              <button class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground" :title="t('grid.downloadBinaryValue')" :aria-expanded="open" @mousedown.stop @click.stop="toggle">
-                                <Download class="h-3 w-3" />
-                              </button>
+                            <span class="text-muted-foreground">{{ t("grid.columnName") }}</span>
+                            <span class="min-w-0 break-all font-mono select-text">{{ item.column }}</span>
+                            <template v-if="showTransposeFieldMetadata && showColumnTypesInHeader && item.type">
+                              <span class="text-muted-foreground">{{ t("grid.columnType") }}</span>
+                              <span class="min-w-0 break-all font-mono select-text" :class="typeColorClass(item.type)">{{ item.type }}</span>
                             </template>
-                          </LightDropdownMenu>
-                          <button
-                            v-if="canOpenCellExternalUrl(cell.recordIndex, cell.valueIndex)"
-                            class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
-                            :title="t('grid.openUrl')"
-                            :aria-label="t('grid.openUrl')"
-                            @mousedown.stop
-                            @click.stop="openCellExternalUrl(cell.recordIndex, cell.valueIndex)"
-                          >
-                            <ExternalLink class="h-3 w-3" />
-                          </button>
-                          <button
-                            v-if="cellDetailButtonEnabled"
-                            class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
-                            :title="t('grid.cellDetails')"
-                            @mousedown.stop
-                            @click.stop="showTransposeCellDetails(cell.recordIndex, cell.valueIndex)"
-                          >
-                            <Info class="h-3 w-3" />
-                          </button>
-                        </div>
-                      </template>
+                            <template v-if="showTransposeFieldMetadata && showColumnCommentsInHeader && item.comment">
+                              <span class="text-muted-foreground">{{ t("grid.columnComment") }}</span>
+                              <span class="min-w-0 whitespace-pre-wrap break-words select-text">{{ item.comment }}</span>
+                            </template>
+                          </div>
+                        </template>
+                      </LightTooltip>
+                      <div class="shrink-0" :style="{ width: `${transposeBeforeSpacerWidth}px` }" />
+                      <div
+                        v-for="cell in item.values"
+                        :key="`${item.id}:${cell.recordIndex}`"
+                        data-grid-transpose-cell
+                        :data-grid-transpose-record-index="cell.recordIndex"
+                        class="relative flex shrink-0 items-center border-r border-border/70 px-2 py-0"
+                        :class="[
+                          transposeCellTextColorClass(cell.recordIndex, cell.valueIndex),
+                          {
+                            'overflow-visible z-20 border-r-transparent': transposeCellEditorActive(cell.recordIndex, cell.valueIndex),
+                            'overflow-hidden text-ellipsis whitespace-nowrap': !transposeCellEditorActive(cell.recordIndex, cell.valueIndex),
+                            'cell-selected': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'cell-selected-dirty': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'cell-selected--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'cell-selected-dirty--sparse': transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'row-cell-selected': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'row-cell-selected-dirty': transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex) && displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'crosshair-row':
+                              !!crosshairTarget?.columnCrosshair &&
+                              cell.valueIndex === crosshairTarget.actualColIdx &&
+                              !transposeRecordUsesSelectionVisual(cell.recordIndex) &&
+                              !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] &&
+                              !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
+                            'bg-primary/15': transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex] && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
+                            'bg-yellow-500/10 cell-dirty': displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                            'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(cell.recordIndex, cell.valueIndex),
+                            'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(cell.recordIndex, cell.valueIndex),
+                            'cursor-text': !isScrolling,
+                            'hover:bg-gray-200 hover:text-foreground dark:hover:bg-gray-800':
+                              !isScrolling && canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex) && !transposeRecordUsesSelectionVisual(cell.recordIndex) && !transposeRecordUsesActiveHighlight(cell.recordIndex) && !transposeCellIsSelected(cell.recordIndex, cell.valueIndex),
+                          },
+                        ]"
+                        :style="{
+                          width: `${getTransposeRecordWidth(cell.recordIndex)}px`,
+                        }"
+                        :title="cell.display"
+                        @mousedown="prepareTransposeCellMouseDown(cell.recordIndex, cell.valueIndex)"
+                        @click="selectTransposeCell(cell.recordIndex, cell.valueIndex, $event)"
+                        @mouseenter="onTransposeCellMouseenter(cell.recordIndex, cell.valueIndex)"
+                        @mouseleave="onCellMouseleave(cell.recordIndex, cell.valueIndex)"
+                        @contextmenu="onTransposeCellContext(cell.recordIndex, cell.valueIndex, $event)"
+                        @dblclick.stop="onTransposeCellDblClick(cell.recordIndex, cell.valueIndex, cell.display, $event)"
+                      >
+                        <template v-if="readonlyTextCellMatches(displayItems[cell.recordIndex]?.id, cell.valueIndex)">
+                          <DataGridReadonlyTextSelection :value="readonlyTextCell!.value" :expanded="readonlyTextCell!.expanded" @close="closeReadonlyCellTextSelection" @escape="escapeReadonlyCellTextSelection" />
+                        </template>
+                        <template v-else-if="editingCell?.rowId === displayItems[cell.recordIndex]?.id && editingCell?.col === cell.valueIndex">
+                          <TemporalCellEditor
+                            v-if="temporalEditorConfigForColumn(cell.valueIndex)"
+                            v-model="editValue"
+                            :kind="temporalEditorConfigForColumn(cell.valueIndex)!.kind"
+                            :fraction-precision="temporalEditorConfigForColumn(cell.valueIndex)!.fractionPrecision"
+                            :normalize-value="(value) => normalizeTemporalCellEditorValue(value, cell.valueIndex)"
+                            cell-layout="transpose"
+                            @cancel="cancelEdit"
+                            @commit="commitGridEdit"
+                            @save="onTemporalCellEditorSave"
+                          />
+                          <EnumCellEditor
+                            v-else-if="isBooleanGridCell(displayItems[cell.recordIndex], cell.valueIndex)"
+                            v-model="booleanEditorModelValue"
+                            :values="BOOLEAN_CELL_EDITOR_VALUES"
+                            :nullable="isBooleanGridColumnNullable(cell.valueIndex)"
+                            :initial-null="isGridCellInitialNull(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
+                            cell-layout="transpose"
+                            @cancel="cancelEdit"
+                            @commit="commitBooleanGridEdit"
+                          />
+                          <EnumCellEditor
+                            v-else-if="isEnumGridColumn(cell.valueIndex)"
+                            v-model="editValue"
+                            :values="enumValuesForGridColumn(cell.valueIndex)"
+                            :nullable="isEnumGridColumnNullable(cell.valueIndex)"
+                            :initial-null="isGridCellInitialNull(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
+                            cell-layout="transpose"
+                            @cancel="cancelEdit"
+                            @commit="commitGridEdit"
+                          />
+                          <textarea
+                            v-else-if="cellUsesExpandedEditor(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
+                            v-model="editValue"
+                            data-expanded-cell-editor="true"
+                            rows="1"
+                            :inputmode="cellEditInputModeForColumn(cell.valueIndex)"
+                            autocapitalize="off"
+                            autocorrect="off"
+                            spellcheck="false"
+                            class="cell-edit-input cell-edit-input--expanded absolute left-0 top-0 min-h-full bg-background px-1.5 py-1 leading-[18px] outline-none z-10"
+                            @blur="commitEditFromCellBlur"
+                            @click.stop
+                            @focus="onCellEditTextareaInput"
+                            @input="onCellEditTextareaInput"
+                            @keydown.stop="onCellEditKeydown"
+                            @paste.stop="onCellEditTextareaPaste"
+                            @wheel.stop
+                          />
+                          <input
+                            v-else
+                            v-model="editValue"
+                            :inputmode="cellEditInputModeForColumn(cell.valueIndex)"
+                            autocapitalize="off"
+                            autocorrect="off"
+                            spellcheck="false"
+                            class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-1.5 py-0 leading-[26px] outline-none z-10"
+                            @blur="commitEditFromCellBlur"
+                            @click.stop
+                            @input="onCellEditTextareaInput"
+                            @keydown.stop="onCellEditKeydown"
+                            @paste.stop="onCellEditTextareaPaste"
+                          />
+                        </template>
+                        <template v-else>
+                          <template v-if="newRowCellPlaceholder(displayItems[cell.recordIndex], cell.valueIndex)">
+                            <span class="text-muted-foreground/70 italic">{{ firstLineCellDisplayValue(newRowCellPlaceholder(displayItems[cell.recordIndex], cell.valueIndex) ?? "", flatteningMultiLineEnabled) }}</span>
+                          </template>
+                          <template v-else>{{ gridCellDisplayValue(cell.display, flatteningMultiLineEnabled, showWhitespaceEnabled) }}</template>
+                          <div v-if="cellDetailButtonVisible(cell.recordIndex, cell.valueIndex)" class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
+                            <LightDropdownMenu
+                              v-if="canQuickDownloadCellValue(cell.recordIndex, cell.valueIndex)"
+                              :items="binaryCellDownloadMenuItems"
+                              :open="quickDownloadMenuOpenFor(cell.recordIndex, cell.valueIndex)"
+                              align="end"
+                              content-class="w-44"
+                              :match-trigger-width="false"
+                              @update:open="(value: boolean) => handleQuickDownloadMenuOpenChange(value, cell.recordIndex, cell.valueIndex)"
+                              @select="(mode: string) => downloadCellBinaryValue(cell.recordIndex, cell.valueIndex, mode as BinaryCellDownloadMode)"
+                            >
+                              <template #trigger="{ open, toggle }">
+                                <button class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground" :title="t('grid.downloadBinaryValue')" :aria-expanded="open" @mousedown.stop @click.stop="toggle">
+                                  <Download class="h-3 w-3" />
+                                </button>
+                              </template>
+                            </LightDropdownMenu>
+                            <button
+                              v-if="canOpenCellExternalUrl(cell.recordIndex, cell.valueIndex)"
+                              class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
+                              :title="t('grid.openUrl')"
+                              :aria-label="t('grid.openUrl')"
+                              @mousedown.stop
+                              @click.stop="openCellExternalUrl(cell.recordIndex, cell.valueIndex)"
+                            >
+                              <ExternalLink class="h-3 w-3" />
+                            </button>
+                            <button
+                              v-if="cellDetailButtonEnabled"
+                              class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
+                              :title="t('grid.cellDetails')"
+                              @mousedown.stop
+                              @click.stop="showTransposeCellDetails(cell.recordIndex, cell.valueIndex)"
+                            >
+                              <Info class="h-3 w-3" />
+                            </button>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="shrink-0" :style="{ width: `${transposeAfterSpacerWidth}px` }" />
                     </div>
-                    <div class="shrink-0" :style="{ width: `${transposeAfterSpacerWidth}px` }" />
-                  </div>
-                </template>
-              </RecycleScroller>
+                  </template>
+                </RecycleScroller>
+              </div>
             </div>
             <template v-else>
               <!-- Sticky header -->
@@ -13533,6 +13812,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                    `top`/`inset` offsets are measured from the body instead of from the
                    grid's outer relative container (which starts at the header row). -->
               <div class="relative min-h-0 flex-1 flex flex-col overflow-hidden">
+                <ProductionWatermark v-if="productionContext.active" />
                 <div v-if="!hasVisibleRows" class="relative min-h-0 flex-1">
                   <div class="data-grid-scroller h-full overflow-x-auto overflow-y-hidden overscroll-none" :class="{ 'is-scrolling': isScrolling }" @scroll="onScrollerScroll" @wheel="onDomGridWheel">
                     <div class="h-full min-h-[220px]" :style="{ width: 'max(100%, var(--total-w))' }" />
@@ -13999,7 +14279,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   <span class="table-info-action-label">{{ t("contextMenu.dropAllIndexes") }}</span>
                 </Button>
               </div>
-              <Button v-if="canOpenTableStructureEditor" variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('contextMenu.editStructure')" :aria-label="t('contextMenu.editStructure')" @click="openTableStructureEditor">
+              <Button v-if="canOpenTableStructureEditor" variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('contextMenu.editStructure')" :aria-label="t('contextMenu.editStructure')" @click="openTableStructureEditor(activeTableInfoTab)">
                 <PencilRuler class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("contextMenu.editStructure") }}</span>
               </Button>

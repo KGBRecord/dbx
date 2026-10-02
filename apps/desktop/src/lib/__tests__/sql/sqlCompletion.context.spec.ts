@@ -51,6 +51,34 @@ describe("SQL completion replacement", () => {
 });
 
 describe("sqlCompletion keyword snippets", () => {
+  it.each(["mysql", "postgres", "oracle"] as const)("offers the REPLACE keyword in %s CREATE OR statements", (databaseType) => {
+    for (const text of ["CREATE OR ", "CREATE OR r", "CREATE OR repla", "-- heading\nCREATE /* comment */ OR repla"]) {
+      const items = buildSqlCompletionItems(text, text.length, { tables: [], columnsByTable: new Map(), databaseType });
+      expect(items[0], text).toMatchObject({ label: "REPLACE", type: "keyword" });
+      expect(items[0].apply ?? items[0].label).toBe("REPLACE");
+    }
+  });
+
+  it("preserves REPLACE function completion in SELECT expressions", () => {
+    const text = "SELECT repla";
+    const items = buildSqlCompletionItems(text, text.length, { tables: [], columnsByTable: new Map(), databaseType: "mysql" });
+    expect(items[0]).toMatchObject({ label: "REPLACE", type: "function" });
+    expect(items[0]?.apply).toMatch(/^REPLACE\(/);
+  });
+
+  it.each(["sqlserver", "sqlite"] as const)("does not suggest unsupported CREATE OR REPLACE syntax on %s", (databaseType) => {
+    const text = "CREATE OR repla";
+    const items = buildSqlCompletionItems(text, text.length, { tables: [], columnsByTable: new Map(), databaseType });
+    expect(items.some((item) => item.type === "keyword" && item.label === "REPLACE")).toBe(false);
+  });
+
+  it("honors lower-case keyword preferences for CREATE OR REPLACE", () => {
+    const text = "create or repla";
+    const items = buildSqlCompletionItems(text, text.length, { tables: [], columnsByTable: new Map(), databaseType: "postgres", keywordCase: "lower" });
+    expect(items[0]).toMatchObject({ label: "replace", type: "keyword" });
+    expect(items[0].apply ?? items[0].label).toBe("replace");
+  });
+
   it("auto-opens and suggests SELECT when typing sel", () => {
     const sql = "sel";
     const items = buildSqlCompletionItems(sql, sql.length, {
@@ -601,6 +629,39 @@ describe("sqlCompletion database functions", () => {
       columnsByTable: new Map(),
     });
     expect(ntileItems.find((item) => item.label === "ntile")?.apply).toBe("ntile(${buckets})");
+  });
+
+  it("suggests ClickHouse FINAL and query modifiers as keywords", () => {
+    const sql = "SELECT * FROM events FI";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "clickhouse",
+      tables: [{ name: "events", type: "table" }],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.find((item) => item.label === "FINAL")).toMatchObject({ type: "keyword" });
+  });
+
+  it("suggests ClickHouse PREWHERE and SETTINGS as keywords", () => {
+    const sql = "SELECT * FROM events SETT";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "clickhouse",
+      tables: [{ name: "events", type: "table" }],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.find((item) => item.label === "SETTINGS")).toMatchObject({ type: "keyword" });
+  });
+
+  it("does not leak ClickHouse FINAL to MySQL", () => {
+    const sql = "SELECT * FROM events FI";
+    const items = buildSqlCompletionItems(sql, sql.length, {
+      databaseType: "mysql",
+      tables: [{ name: "events", type: "table" }],
+      columnsByTable: new Map(),
+    });
+
+    expect(items.some((item) => item.label === "FINAL")).toBe(false);
   });
 
   it("does not leak ClickHouse-only functions to MySQL", () => {

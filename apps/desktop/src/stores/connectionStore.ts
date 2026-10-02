@@ -12,6 +12,7 @@ import type {
   CompletionAssistantObjectKind,
   CompletionAssistantRequest,
   ConnectionConfig,
+  ConnectionLivenessMessage,
   DatabaseType,
   DatabaseConnectionInfo,
   DatabaseStorageInfo,
@@ -165,7 +166,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { decorateDatabaseSavedSqlTreeNodes, indexSavedSqlFilesByDatabase, stripDatabaseSavedSqlTreeNodes, withDatabaseSavedSqlRoot } from "@/lib/savedSql/savedSqlDatabaseTree";
 import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/database/sqlServerLinkedServers";
-import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mongo/mongoCompletion";
+import { formatMongoIndexKeyPattern, inferMongoCompletionFields, type MongoCompletionField, type MongoCompletionIndex } from "@/lib/mongo/mongoCompletion";
 import type { SoqlCompletionField, SoqlCompletionObject } from "@/lib/soql/soqlCompletion";
 import type { SalesforceCurrentUser } from "@/types/salesforce";
 import { flattenElasticsearchMappingFields, type ElasticsearchCompletionField } from "@/lib/elasticsearch/elasticsearchCompletion";
@@ -536,6 +537,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const redisCommandDocsCacheGeneration = new Map<string, number>();
   const mongoCompletionCollectionsCache = ref<Record<string, string[]>>({});
   const mongoCompletionFieldsCache = ref<Record<string, MongoCompletionField[]>>({});
+  const mongoCompletionIndexesCache = ref<Record<string, MongoCompletionIndex[]>>({});
   const soqlCompletionObjectsCache = ref<Record<string, SoqlCompletionObject[]>>({});
   const soqlCompletionFieldsCache = ref<Record<string, SoqlCompletionField[]>>({});
   // One entry per connection: the authenticated Salesforce user never changes for
@@ -2248,7 +2250,12 @@ export const useConnectionStore = defineStore("connection", () => {
     return parts.map((part) => encodeURIComponent(part)).join(":");
   }
 
-  function ownerAwareMetadataCacheVersion(config: ConnectionConfig | undefined, version: string): string {
+  function ownerAwareMetadataCacheVersion(config: ConnectionConfig | undefined, version: string, schema?: string): string {
+    if (schema && config?.db_type === "jdbc" && connectionShouldDiscoverJdbcSchemas(config)) {
+      // Older caches contain unrestricted objects and children without schemas.
+      // Keep catalog-only JDBC caches and recognized dialects on their old keys.
+      return `${version}-jdbc-schema-v1`;
+    }
     return config?.db_type === "informix" ? `${version}-informix-owner-v2` : version;
   }
 
@@ -2272,7 +2279,7 @@ export const useConnectionStore = defineStore("connection", () => {
     if (config?.db_type === "opengauss" && databaseCompatibilityMode(config.id, database)?.trim().toUpperCase() === "A") {
       scopedVersion = `${scopedVersion}-a-packages-v1`;
     }
-    return ownerAwareMetadataCacheVersion(config, scopedVersion);
+    return ownerAwareMetadataCacheVersion(config, scopedVersion, schema);
   }
 
   /**
@@ -3077,7 +3084,7 @@ export const useConnectionStore = defineStore("connection", () => {
     if (parent.type === "group-tables") return objectGroupCacheKey(parent);
     if (parent.type !== "database" && parent.type !== "schema" && parent.type !== "linked-server-schema") return null;
     const simpleObjectDisplay = useSettingsStore().editorSettings.sidebarObjectDisplay === "simple";
-    const cacheVersion = ownerAwareMetadataCacheVersion(getConfig(parent.connectionId), simpleObjectDisplay ? "objects-simple-v9" : "objects-grouped-v9");
+    const cacheVersion = ownerAwareMetadataCacheVersion(getConfig(parent.connectionId), simpleObjectDisplay ? "objects-simple-v9" : "objects-grouped-v9", parent.schema);
     return schemaCacheKey(parent.connectionId, parent.database, parent.schema || "", cacheVersion);
   }
 
@@ -3939,6 +3946,9 @@ export const useConnectionStore = defineStore("connection", () => {
     for (const key of Object.keys(mongoCompletionFieldsCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete mongoCompletionFieldsCache.value[key];
     }
+    for (const key of Object.keys(mongoCompletionIndexesCache.value)) {
+      if (key === exactCacheKey || key.startsWith(cachePrefix)) delete mongoCompletionIndexesCache.value[key];
+    }
     for (const key of Object.keys(soqlCompletionObjectsCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete soqlCompletionObjectsCache.value[key];
     }
@@ -4674,6 +4684,60 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     clearConnectionHealthCheck(connectionId);
     clearConnectionPrewarmState(connectionId);
+  }
+
+  /**
+   * Re-check one connection against the backend and grey it out when it has no pool left.
+   *
+   * The confirmation is the read-only `api.connectionIsOpen`, never `checkConnectionHealth`:
+   * the latter removes unhealthy pools and is the path `ensureConnected` uses to reconnect, so
+   * confirming with it would turn a background probe into a reconnect and an error banner.
+   *
+   * A failed confirm says nothing about the connection, so it leaves the sidebar untouched.
+   */
+  async function confirmConnectionLiveness(connectionId: string): Promise<void> {
+    if (!connectionId || !connectedIds.value.has(connectionId)) return;
+    const stateRevision = connectionStateRevision(connectionId);
+    let open: boolean;
+    try {
+      open = await api.connectionIsOpen(connectionId);
+    } catch (error) {
+      console.warn("[DBX] connection liveness confirm failed:", error);
+      return;
+    }
+    if (open) return;
+    // A late confirm must not undo an explicit disconnect or a newer reconnect.
+    if (!isCurrentConnectionStateRevision(connectionId, stateRevision)) return;
+    if (!connectedIds.value.has(connectionId)) return;
+    markConnectionOffline(connectionId);
+  }
+
+  /**
+   * Apply a message from the backend connection-liveness channel (#4339).
+   *
+   * `lost` is published only once the connection has no pools left, but it is asynchronous, so
+   * it is confirmed before the sidebar changes: a message generated before a reconnect but
+   * delivered after it confirms as "open" and is dropped.
+   *
+   * `resync` is sent when the transport skipped messages. Those are gone for good, so every
+   * connection this frontend still shows as connected is re-checked. Without it a dropped loss
+   * would leave its sidebar green until the user happened to touch that connection — the very
+   * bug this channel exists to fix.
+   */
+  async function handleConnectionLivenessMessage(message: ConnectionLivenessMessage): Promise<void> {
+    if (!message) return;
+    if (message.kind === "resync") {
+      // Sequential on purpose: resync only happens after a transport lag, and one probe in
+      // flight at a time keeps a large connected set from stampeding the backend.
+      // Snapshot the ids: the confirm below removes entries from this set as it flips them.
+      for (const connectionId of Array.from(connectedIds.value)) {
+        await confirmConnectionLiveness(connectionId);
+      }
+      return;
+    }
+    // Defensive against a newer backend sending a kind this build does not know.
+    if (message.kind !== "lost") return;
+    await confirmConnectionLiveness(message.connectionId);
   }
 
   /**
@@ -6763,7 +6827,7 @@ export const useConnectionStore = defineStore("connection", () => {
             targetParent.objectCount = mergedChildren.length;
             setChildren(targetParent, nextChildren);
             if (!options?.searchFilter) {
-              await savePersistedTreeChildren(schemaCacheKey(parentConnectionId, parentDatabase, parent.schema || "", ownerAwareMetadataCacheVersion(config, "objects-simple-v9")), nextChildren);
+              await savePersistedTreeChildren(schemaCacheKey(parentConnectionId, parentDatabase, parent.schema || "", ownerAwareMetadataCacheVersion(config, "objects-simple-v9", parent.schema)), nextChildren);
             }
             // 该分支只服务 simple 库/模式表列表；搜索分页结果不是全量，不能作为成员依据。
             if (!page.hasMore && !options?.searchFilter) pruneTableVGroupStaleMembers(targetParent, nextChildren, true);
@@ -7846,7 +7910,7 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!normalizedKey.startsWith(prefix)) return false;
     const tableToken = `:${tableName.toLowerCase()}`;
     const tableOffset = normalizedKey.lastIndexOf(tableToken);
-    if (tableOffset < prefix.length) return false;
+    if (tableOffset < prefix.length - 1) return false;
     const trailing = normalizedKey.slice(tableOffset + tableToken.length);
     if (trailing && !trailing.startsWith(":")) return false;
     const normalizedSchema = schema?.trim().toLowerCase();
@@ -7864,7 +7928,7 @@ export const useConnectionStore = defineStore("connection", () => {
     bumpCompletionCacheRevision(connectionId, database);
     const matches = (key: string) => completionTableCacheKeyMatches(key, connectionId, database, tableName, schema, catalog);
     let removed = 0;
-    for (const cache of [completionColumnsCache.value, completionForeignKeysCache.value]) {
+    for (const cache of [completionColumnsCache.value, completionForeignKeysCache.value, mongoCompletionFieldsCache.value, mongoCompletionIndexesCache.value]) {
       for (const key of Object.keys(cache)) {
         if (!matches(key)) continue;
         delete cache[key];
@@ -8704,11 +8768,34 @@ export const useConnectionStore = defineStore("connection", () => {
     if (cached) return cached;
     return withCompletionInFlight(`${cacheKey}:mongo-fields`, async () => {
       await ensureConnected(connectionId);
-      const result = await api.mongoFindDocuments(connectionId, database, collection, 0, 20, "{}");
+      let result;
+      try {
+        result = await api.mongoAggregateDocuments(connectionId, database, collection, '[{"$sample":{"size":100}}]', 100, JSON.stringify({ maxTimeMS: 5000 }));
+      } catch {
+        result = await api.mongoFindDocuments(connectionId, database, collection, 0, 100, "{}");
+      }
       const fields = inferMongoCompletionFields(result.documents ?? []);
       mongoCompletionFieldsCache.value[cacheKey] = fields;
       evictOldestCacheEntries(mongoCompletionFieldsCache.value, COMPLETION_CACHE_MAX);
       return fields;
+    });
+  }
+
+  async function listMongoCompletionIndexes(connectionId: string, database: string, collection: string): Promise<MongoCompletionIndex[]> {
+    if (!database || !collection) return [];
+    const cacheKey = `${connectionId}:${database}:${collection}`;
+    const cached = mongoCompletionIndexesCache.value[cacheKey];
+    if (cached) return cached;
+    return withCompletionInFlight(`${cacheKey}:mongo-indexes`, async () => {
+      await ensureConnected(connectionId);
+      const specs = (await api.mongoListIndexSpecs(connectionId, database, collection)) ?? [];
+      const indexes = specs.map((spec) => ({
+        name: spec.name,
+        keyPattern: formatMongoIndexKeyPattern(spec.keys),
+      }));
+      mongoCompletionIndexesCache.value[cacheKey] = indexes;
+      evictOldestCacheEntries(mongoCompletionIndexesCache.value, COMPLETION_CACHE_MAX);
+      return indexes;
     });
   }
 
@@ -9870,14 +9957,18 @@ export const useConnectionStore = defineStore("connection", () => {
 
     if (isTauriRuntime()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
-      const { readTextFile } = await import("@tauri-apps/plugin-fs");
+      const { readFile } = await import("@tauri-apps/plugin-fs");
+      const { decodeImportFileText } = await import("@/lib/common/decodeText");
       const path = await open({
         filters: source === "navicat" ? [{ name: "Navicat Connection Export", extensions: ["ncx", "xml"] }] : [{ name: "DBX JSON", extensions: ["json"] }],
         multiple: false,
       });
       if (!path) return null;
-      content = await readTextFile(path as string);
+      // Raw bytes: Navicat 17 macOS exports can be UTF-16 (#10666), which
+      // readTextFile would reject as invalid UTF-8.
+      content = decodeImportFileText(await readFile(path as string));
     } else {
+      const { decodeImportFileText } = await import("@/lib/common/decodeText");
       content = await new Promise<string>((resolve, reject) => {
         const input = document.createElement("input");
         input.type = "file";
@@ -9888,10 +9979,10 @@ export const useConnectionStore = defineStore("connection", () => {
             reject(new Error("No file selected"));
             return;
           }
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = () => reject(reader.error);
-          reader.readAsText(file);
+          file
+            .arrayBuffer()
+            .then((buffer) => resolve(decodeImportFileText(buffer)))
+            .catch(reject);
         };
         input.click();
       });
@@ -10177,6 +10268,7 @@ export const useConnectionStore = defineStore("connection", () => {
     disconnect,
     hasDisconnectInFlight,
     markConnectionOffline,
+    handleConnectionLivenessMessage,
     metadataGenerationFor,
     disconnectAndForgetConnectionPassword,
     hasSessionCredential,
@@ -10265,6 +10357,7 @@ export const useConnectionStore = defineStore("connection", () => {
     listRedisCompletionCommandDocs,
     listMongoCompletionCollections,
     listMongoCompletionFields,
+    listMongoCompletionIndexes,
     listSoqlCompletionObjects,
     listSoqlCompletionFields,
     loadSalesforceCurrentUser,

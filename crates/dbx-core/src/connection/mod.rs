@@ -33,7 +33,8 @@ use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_tunnel::TunnelManager;
 use crate::models::connection::{
     database_info_from_protocol_value, parse_jdbc_host_port, parse_mongo_first_host, rewrite_jdbc_url_host,
-    ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, TransportLayerConfig,
+    ConnectionConfig, ConnectionLivenessFailureKind, ConnectionLivenessMessage, ConnectionTestResult,
+    DatabaseConnectionInfo, DatabaseType, TransportLayerConfig,
 };
 use crate::mongo_oidc::MongoOidcBrowserOpener;
 use crate::nacos::config::{NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD};
@@ -151,6 +152,7 @@ impl PoolKind {
     fn is_available_for_routing(&self) -> bool {
         match self {
             Self::Agent(client) => client.is_runtime_available(),
+            Self::ExternalDriver { session, .. } => session.is_available(),
             _ => true,
         }
     }
@@ -428,6 +430,10 @@ pub struct AppState {
     /// In-memory, never-persisted 1/5 minute write overrides for read-only connections.
     pub write_unlock_windows: crate::write_unlock::WriteUnlockWindows,
     metadata_gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Backend-confirmed liveness losses plus resync requests (#4339). The keepalive task
+    /// publishes here once a connection has no pools left; each shell relays it to its own
+    /// frontend, so DBX core never needs a UI handle of its own.
+    connection_liveness: tokio::sync::broadcast::Sender<ConnectionLivenessMessage>,
     mongo_oidc_browser_opener: std::sync::RwLock<Option<MongoOidcBrowserOpener>>,
     salesforce_browser_opener: std::sync::RwLock<Option<SfBrowserOpener>>,
     #[cfg(feature = "mq-admin")]
@@ -1314,6 +1320,25 @@ fn mysql_metadata_fallback_url(
     Some(connection_url_for_endpoint(config, host, port))
 }
 
+/// Global Oracle OCI defaults pulled from editor settings.
+#[derive(Default)]
+struct OracleOciDefaults {
+    nls_lang: Option<String>,
+    client_path: Option<String>,
+    tns_admin: Option<String>,
+}
+
+/// Trims an optional setting, treating whitespace-only input as unset.
+fn oracle_oci_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Reads a trimmed non-empty string out of the editor settings blob.
+fn json_trimmed_string(settings: &serde_json::Value, key: &str) -> Option<String> {
+    let text = settings.get(key)?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 impl AppState {
     pub fn shared_resource_budget(&self, name: &str, capacity: usize) -> Result<Arc<Semaphore>, String> {
         if capacity == 0 {
@@ -1429,6 +1454,15 @@ impl AppState {
         self.connections.read().await.keys().any(|key| pool_key_belongs_to_connection(key, connection_id))
     }
 
+    /// Subscribe to backend-confirmed connection liveness messages (#4339).
+    ///
+    /// Each shell relays these to its own frontend. A fresh receiver only sees messages
+    /// published after it subscribed, so shells subscribe once at startup and keep the
+    /// receiver alive rather than re-subscribing per request.
+    pub fn subscribe_connection_liveness(&self) -> tokio::sync::broadcast::Receiver<ConnectionLivenessMessage> {
+        self.connection_liveness.subscribe()
+    }
+
     /// Find an already-registered metadata/workload pool for a metadata read.
     /// Unlike `get_or_create_metadata_pool_for_session`, this is a pure lookup:
     /// it never validates credentials, starts an agent, or opens a transport.
@@ -1542,11 +1576,55 @@ impl AppState {
         error.message
     }
 
+    /// Resolves the agent-process environment a connection needs.
+    ///
+    /// Only Oracle OCI ("thick") connections declare one today. The Oracle
+    /// Client is a process-scoped C library: `NLS_LANG` is read once when the
+    /// client initialises and the Instant Client is located through the platform
+    /// loader path, so neither can travel as a connection parameter — they have
+    /// to be baked into the agent process. Because the environment is part of
+    /// the launch fingerprint, a non-empty result also gives the connection its
+    /// own process instead of sharing one with other Oracle connections.
+    pub async fn agent_launch_env(&self, config: &ConnectionConfig) -> Vec<(String, String)> {
+        if config.driver_profile.as_deref() != Some(crate::oracle_oci::ORACLE_OCI_DRIVER_PROFILE) {
+            return Vec::new();
+        }
+        let defaults = self.oracle_oci_defaults().await;
+        let nls_lang = oracle_oci_trimmed(config.oracle_oci_nls_lang.as_deref())
+            .or_else(|| oracle_oci_trimmed(defaults.nls_lang.as_deref()));
+        // TNS_ADMIN 的解析顺序：连接级字段 > TNS 连接串里打包的目录 > 全局默认。
+        // 钱包（ADB）与 sqlnet.ora 都依赖这个目录，任何 OCI 连接都可以不经过
+        // TNS 连接方式直接使用它们；目录同样无法在连接建立后更改。
+        let tns_admin = crate::oracle_oci::resolve_oci_tns_admin(
+            config.oracle_oci_tns_admin.as_deref(),
+            config.connection_string.as_deref(),
+            defaults.tns_admin.as_deref(),
+        );
+        crate::oracle_oci::oracle_oci_launch_env(nls_lang, defaults.client_path.as_deref(), tns_admin.as_deref())
+    }
+
+    /// Reads the global Oracle OCI defaults from editor settings.
+    ///
+    /// Editor settings are one opaque JSON blob owned by the frontend, so a
+    /// missing or malformed value degrades to "unset" rather than failing the
+    /// connection.
+    async fn oracle_oci_defaults(&self) -> OracleOciDefaults {
+        let Ok(Some(settings)) = self.storage.load_editor_settings().await else {
+            return OracleOciDefaults::default();
+        };
+        OracleOciDefaults {
+            nls_lang: json_trimmed_string(&settings, "oracleOciNlsLang"),
+            client_path: json_trimmed_string(&settings, "oracleOciClientPath"),
+            tns_admin: json_trimmed_string(&settings, "oracleOciTnsAdmin"),
+        }
+    }
+
     async fn spawn_routed_shared_agent_client(
         &self,
         db_type: &DatabaseType,
         driver_profile: Option<&str>,
         extra_java_args: &[String],
+        agent_env: &[(String, String)],
         agent_session_id: String,
         connect_params: serde_json::Value,
         connect_timeout: Duration,
@@ -1557,6 +1635,7 @@ impl AppState {
                 db_type,
                 driver_profile,
                 extra_java_args,
+                agent_env,
                 agent_session_id,
                 connect_params,
                 connect_timeout,
@@ -1623,6 +1702,10 @@ impl AppState {
             session_credentials: SessionCredentialStore::new(),
             write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
             metadata_gates: Arc::new(Mutex::new(HashMap::new())),
+            // Bounded so a shell that stops draining cannot grow memory without bound. A
+            // lagged receiver re-syncs from the read-only status check on its next use, so
+            // dropping events here is safe.
+            connection_liveness: tokio::sync::broadcast::Sender::new(64),
             mongo_oidc_browser_opener: std::sync::RwLock::new(None),
             salesforce_browser_opener: std::sync::RwLock::new(None),
             #[cfg(feature = "mq-admin")]
@@ -1778,6 +1861,23 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<ConnectionTestResult, String> {
         let params = serde_json::json!({ "connection": config });
+        if driver_id == "jdbc" && is_embedded_h2_jdbc(config) {
+            let PoolKind::ExternalDriver { session, .. } = self.external_driver_pool(driver_id, config).await? else {
+                unreachable!();
+            };
+            let result = session
+                .invoke_with_timeout::<serde_json::Value>(
+                    "testConnection",
+                    params,
+                    Some(external_driver_connect_timeout(config)),
+                )
+                .await;
+            session.shutdown().await;
+            return result.map(|response| {
+                ConnectionTestResult::success("Connection successful")
+                    .with_database_info(database_info_from_protocol_value(&response))
+            });
+        }
         let env = self.external_driver_runtime_env(driver_id)?;
         let response = self
             .plugins
@@ -1795,12 +1895,32 @@ impl AppState {
 
     pub async fn external_driver_pool(&self, driver_id: &str, config: &ConnectionConfig) -> Result<PoolKind, String> {
         let env = self.external_driver_runtime_env(driver_id)?;
-        let session = self.plugins.start_driver_session_for_connection(driver_id, env, &config.name).await?;
+        let session = if driver_id == "jdbc" && is_embedded_h2_jdbc(config) {
+            let runtime_key = serde_json::to_string(&(
+                &config.jdbc_driver_class,
+                &config.jdbc_driver_paths,
+                &config.agent_java_options,
+            ))
+            .map_err(|error| error.to_string())?;
+            self.plugins.start_shared_jdbc_session_for_connection(&runtime_key, env, &config.name).await?
+        } else {
+            self.plugins.start_driver_session_for_connection(driver_id, env, &config.name).await?
+        };
         let params = serde_json::json!({ "connection": config });
-        session
+        let result = session
             .invoke_with_timeout::<serde_json::Value>("connect", params, Some(external_driver_connect_timeout(config)))
-            .await?;
-        Ok(PoolKind::ExternalDriver { driver_id: driver_id.to_string(), config: Arc::new(config.clone()), session })
+            .await;
+        match result {
+            Ok(_) => Ok(PoolKind::ExternalDriver {
+                driver_id: driver_id.to_string(),
+                config: Arc::new(config.clone()),
+                session,
+            }),
+            Err(error) => {
+                session.shutdown().await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn test_sqlserver_connection(
@@ -2157,6 +2277,10 @@ impl AppState {
         let routing = self.pool_routing_control();
         let connections = self.connections.clone();
         let running_queries = self.running_queries.clone();
+        let liveness = self.connection_liveness.clone();
+        // Liveness is keyed by connection, not by pool: pool keys are per session/role/
+        // database derived, so only the connection id identifies "this connection is gone".
+        let connection_id = config.id.clone();
         // MQ pool markers are empty; close_pool_kind is a no-op, so keepalive must
         // drop the registry adapter or reconnect would reuse a dead agent.
         #[cfg(feature = "mq-admin")]
@@ -2199,22 +2323,25 @@ impl AppState {
                             }
                             #[cfg(feature = "mq-admin")]
                             let drop_mq = matches!(target, KeepaliveTarget::MessageQueue(_));
-                            if !detach_keepalive_target_if_current(
+                            // Only a pool we actually detached may report liveness loss; a
+                            // probe failure on an already-replaced pool must not.
+                            let detached = detach_and_report_keepalive_loss(
                                 &routing,
                                 &connections,
+                                &liveness,
                                 &key,
                                 target,
+                                &connection_id,
+                                ConnectionLivenessFailureKind::ProbeFailed,
                                 replace_runtime,
                             )
-                            .await
-                            {
-                                log::debug!("Skipping stale keepalive result for replaced pool '{key}'");
-                            } else {
-                                #[cfg(feature = "mq-admin")]
-                                if drop_mq {
-                                    mq_registry.drop_connection(&mq_connection_id).await;
-                                }
+                            .await;
+                            #[cfg(feature = "mq-admin")]
+                            if detached && drop_mq {
+                                mq_registry.drop_connection(&mq_connection_id).await;
                             }
+                            #[cfg(not(feature = "mq-admin"))]
+                            let _ = detached;
                             break;
                         }
                         Err(_) => {
@@ -2231,14 +2358,26 @@ impl AppState {
                             }
                             #[cfg(feature = "mq-admin")]
                             let drop_mq = matches!(target, KeepaliveTarget::MessageQueue(_));
-                            if !detach_keepalive_target_if_current(&routing, &connections, &key, target, false).await {
-                                log::debug!("Skipping stale keepalive timeout for replaced pool '{key}'");
-                            } else {
-                                #[cfg(feature = "mq-admin")]
-                                if drop_mq {
-                                    mq_registry.drop_connection(&mq_connection_id).await;
-                                }
+                            // The pool is torn down either way, so a timed-out probe is reported
+                            // too: staying silent would keep the sidebar claiming the connection
+                            // is usable.
+                            let detached = detach_and_report_keepalive_loss(
+                                &routing,
+                                &connections,
+                                &liveness,
+                                &key,
+                                target,
+                                &connection_id,
+                                ConnectionLivenessFailureKind::TimedOut,
+                                false,
+                            )
+                            .await;
+                            #[cfg(feature = "mq-admin")]
+                            if detached && drop_mq {
+                                mq_registry.drop_connection(&mq_connection_id).await;
                             }
+                            #[cfg(not(feature = "mq-admin"))]
+                            let _ = detached;
                             break;
                         }
                     }
@@ -2971,11 +3110,13 @@ impl AppState {
                 )?;
                 if db_config.db_type != DatabaseType::ZooKeeper {
                     let agent_session_id = uuid::Uuid::new_v4().simple().to_string();
+                    let agent_env = self.agent_launch_env(&db_config).await;
                     let mut initial_result = self
                         .spawn_routed_shared_agent_client(
                             &db_config.db_type,
                             db_config.driver_profile.as_deref(),
                             &db_config.agent_java_options,
+                            &agent_env,
                             agent_session_id.clone(),
                             connect_params,
                             agent_connect_timeout(&db_config),
@@ -2996,6 +3137,7 @@ impl AppState {
                                     &db_config.db_type,
                                     db_config.driver_profile.as_deref(),
                                     &db_config.agent_java_options,
+                                    &agent_env,
                                     agent_session_id.clone(),
                                     agent_connect_params_with_role(
                                         &db_config,
@@ -3059,11 +3201,13 @@ impl AppState {
                                         alternate_config.effective_database().unwrap_or(""),
                                         session_role,
                                     )?;
+                                    let alternate_env = self.agent_launch_env(&alternate_config).await;
                                     match self
                                         .spawn_routed_shared_agent_client(
                                             &alternate_config.db_type,
                                             alternate_config.driver_profile.as_deref(),
                                             &alternate_config.agent_java_options,
+                                            &alternate_env,
                                             agent_session_id.clone(),
                                             alternate_params,
                                             agent_connect_timeout(&alternate_config),
@@ -4399,9 +4543,9 @@ impl AppState {
                     }
                 }
                 PoolKind::PluginConnection(handle) => !handle.is_running(),
+                PoolKind::ExternalDriver { session, .. } => !session.is_available(),
                 PoolKind::Sqlite(_)
                 | PoolKind::DuckDbWorker(_)
-                | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
                 | PoolKind::Nacos
                 | PoolKind::Consul(_) => false,
@@ -5955,6 +6099,50 @@ fn keepalive_failure_proves_pool_dead(error: &str) -> bool {
     !crate::query::is_pool_saturation_error(error)
 }
 
+/// Tells the shells that `connection_id` has no pools left, so the frontend can stop
+/// claiming the connection is connected (#4339).
+///
+/// Pool keys are per session/role/database derived, so one dying derived pool says nothing
+/// about the connection root: only the last pool to go makes the connection really unusable.
+/// Gating on "no pools left" is also what collapses N per-pool keepalive failures into one
+/// logical disconnect. Two pools of the same connection can both finish detaching before
+/// either evaluates this, publishing twice; the frontend path is idempotent.
+async fn report_connection_liveness_lost(
+    connections: &Arc<RwLock<ConnectionPoolRegistry>>,
+    liveness: &tokio::sync::broadcast::Sender<ConnectionLivenessMessage>,
+    connection_id: &str,
+    failure_kind: ConnectionLivenessFailureKind,
+) {
+    if connections.read().await.keys().any(|key| pool_key_belongs_to_connection(key, connection_id)) {
+        return;
+    }
+    // A missing subscriber (headless shell) is not an error worth reporting.
+    let _ = liveness.send(ConnectionLivenessMessage::Lost { connection_id: connection_id.to_string(), failure_kind });
+}
+
+/// Detaches a probe's pool when it is still the current one and reports the loss if the
+/// connection has nothing left (#4339).
+///
+/// Returns whether this probe's pool was still current and was detached. A stale probe (its
+/// pool was already replaced) reports nothing: its result says nothing about the connection.
+async fn detach_and_report_keepalive_loss(
+    routing: &PoolRoutingControl,
+    connections: &Arc<RwLock<ConnectionPoolRegistry>>,
+    liveness: &tokio::sync::broadcast::Sender<ConnectionLivenessMessage>,
+    pool_key: &str,
+    target: &KeepaliveTarget,
+    connection_id: &str,
+    failure_kind: ConnectionLivenessFailureKind,
+    replace_agent_runtime: bool,
+) -> bool {
+    if !detach_keepalive_target_if_current(routing, connections, pool_key, target, replace_agent_runtime).await {
+        log::debug!("Skipping stale keepalive {failure_kind:?} result for replaced pool '{pool_key}'");
+        return false;
+    }
+    report_connection_liveness_lost(connections, liveness, connection_id, failure_kind).await;
+    true
+}
+
 impl KeepaliveTarget {
     fn matches_pool(&self, pool: &PoolKind) -> bool {
         match (self, pool) {
@@ -6271,6 +6459,22 @@ fn parse_mqtt_broker_host_port(config: &ConnectionConfig) -> Option<(String, u16
 fn normalize_client_session_id(client_session_id: Option<&str>) -> Option<String> {
     client_session_id.map(str::trim).filter(|session| !session.is_empty()).map(|session| session.replace(':', "_"))
 }
+
+fn is_embedded_h2_jdbc(config: &ConnectionConfig) -> bool {
+    if config.db_type != DatabaseType::Jdbc {
+        return false;
+    }
+    let Some(url) = config.connection_string.as_deref() else { return false };
+    let normalized = url.trim().to_ascii_lowercase();
+    let Some(location) = normalized.strip_prefix("jdbc:h2:") else { return false };
+    !location.starts_with("tcp:")
+        && !location.starts_with("ssl:")
+        && !location.starts_with("mem:")
+        && !location.is_empty()
+}
+
+#[cfg(all(test, unix))]
+mod h2_jdbc_tests;
 
 pub fn task_client_session_id(task_kind: &str, task_id: &str) -> String {
     format!("{task_kind}:{task_id}")
@@ -6935,11 +7139,11 @@ mod tests {
         kafka_single_loopback_bootstrap_endpoint, keepalive_failure_proves_pool_dead, metadata_connection_config,
         metadata_pool_database, mysql_metadata_fallback_url, mysql_pool_setup_queries, oceanbase_mysql_setup_queries,
         prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint, redis_sentinel_transport_id,
-        redis_sentinel_transport_prefix, sqlserver_legacy_agent_config, sqlserver_legacy_driver_error,
-        sqlserver_uses_legacy_driver, task_client_session_id, transport_layers_through_last_ssh,
-        upsert_connection_url_param, uses_bare_mysql_pool, uses_tcp_probe, validate_connection_url_params,
-        validate_h2_database_path, AppState, MysqlMode, PoolKind, TxnConnection, GAUSSDB_M_JDBC_DRIVER_CLASS,
-        GAUSSDB_M_JDBC_DRIVER_PROFILE, PRESTOSQL_JDBC_DRIVER_CLASS,
+        redis_sentinel_transport_prefix, report_connection_liveness_lost, sqlserver_legacy_agent_config,
+        sqlserver_legacy_driver_error, sqlserver_uses_legacy_driver, task_client_session_id,
+        transport_layers_through_last_ssh, upsert_connection_url_param, uses_bare_mysql_pool, uses_tcp_probe,
+        validate_connection_url_params, validate_h2_database_path, AppState, MysqlMode, PoolKind, TxnConnection,
+        GAUSSDB_M_JDBC_DRIVER_CLASS, GAUSSDB_M_JDBC_DRIVER_PROFILE, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -6950,15 +7154,18 @@ mod tests {
     use crate::db;
     use crate::models::connection::{
         default_connect_timeout_secs, default_redis_key_separator, AttachedDatabaseConfig, ConnectionConfig,
-        DatabaseType, HttpTunnelConfig, ProxyTunnelConfig, ProxyType, SshTunnelConfig, TransportLayerConfig,
+        ConnectionLivenessFailureKind, ConnectionLivenessMessage, DatabaseType, HttpTunnelConfig, ProxyTunnelConfig,
+        ProxyType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::query;
     use crate::schema;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    fn mysql_config(database: Option<&str>) -> ConnectionConfig {
+    pub(super) fn mysql_config(database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
             docs_notes_path: None,
             id: "conn".to_string(),
             name: "MySQL".to_string(),
@@ -7856,7 +8063,7 @@ mod tests {
         assert_eq!(params["connection_string"], "jdbc:sap://hana.example.com:30013/?databaseName=TENANT1&encrypt=true");
     }
 
-    async fn test_app_state() -> (AppState, std::path::PathBuf) {
+    pub(super) async fn test_app_state() -> (AppState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("dbx-core-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let storage = crate::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
@@ -8097,6 +8304,17 @@ mod tests {
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    fn plugin_process_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     #[tokio::test]
@@ -8379,6 +8597,89 @@ mod tests {
         assert!(keepalive_failure_proves_pool_dead(
             "MySQL connection pool checkout timed out [stage=create, timeout_ms=10000]"
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_driver_pool_shuts_down_sidecar_when_connect_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("sample.jdbc");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let executable = plugin_dir.join("plugin.sh");
+        let pid_file = dir.path().join("plugin.pid");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > '{}'
+IFS= read -r connect
+connect_id=$(printf '%s' "$connect" | sed -E 's/.*"id":([0-9]+).*/\1/')
+printf '{{"jsonrpc":"2.0","id":%s,"error":{{"message":"fake connect failed"}}}}\n' "$connect_id"
+sleep 30
+"#,
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::json!({
+                "id": "sample.jdbc",
+                "name": "Sample JDBC",
+                "version": "1.0.0",
+                "protocol_version": 1,
+                "executable": "plugin.sh",
+                "drivers": [{
+                    "id": "jdbc",
+                    "label": "JDBC",
+                    "kind": "external",
+                    "database_type": "jdbc"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let storage = crate::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir_and_app_version(storage, dir.path().join("plugins"), "0.6.0");
+        let mut config = mysql_config(None);
+        config.name = "Fake JDBC".to_string();
+        config.db_type = DatabaseType::Jdbc;
+        config.connection_string = Some("jdbc:fake://127.0.0.1/example".to_string());
+
+        let error = match state.external_driver_pool("jdbc", &config).await {
+            Ok(_) => panic!("fake connect should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "fake connect failed");
+
+        let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = contents.parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake sidecar should write its pid");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !plugin_process_exists(pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed external-driver connect must terminate its sidecar");
     }
 
     #[tokio::test]
@@ -9324,6 +9625,305 @@ mod tests {
             .await;
         assert!(!state.is_connection_open("conn").await);
         assert!(state.is_connection_open("conn-2").await);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Minimal `ConnectionConfig` for driving `start_keepalive_task` directly.
+    ///
+    /// The keepalive path only reads `id`, the effective timeouts and
+    /// `keepalive_interval_secs`; the rest is filler so the struct can be built without a
+    /// live database. `connect_timeout_secs` is 1 so a failing probe resolves fast.
+    fn keepalive_test_config(id: &str, interval_secs: u64) -> ConnectionConfig {
+        ConnectionConfig {
+            docs_notes_path: None,
+            id: id.to_string(),
+            name: id.to_string(),
+            note: String::new(),
+            db_type: DatabaseType::Oracle,
+            driver_profile: None,
+            driver_label: None,
+            url_params: None,
+            agent_java_options: Vec::new(),
+            host: "127.0.0.1".to_string(),
+            port: 1521,
+            username: "dbx".to_string(),
+            password: "dbx".to_string(),
+            database: None,
+            default_schema: None,
+            visible_databases: None,
+            visible_database_patterns: None,
+            visible_schemas: None,
+            attached_databases: Vec::new(),
+            init_script: None,
+            color: None,
+            transport_layers: Vec::new(),
+            connect_timeout_secs: 1,
+            query_timeout_secs: 30,
+            idle_timeout_secs: 60,
+            keepalive_interval_secs: interval_secs,
+            ssl: false,
+            ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
+            sysdba: false,
+            oracle_connection_type: None,
+            oracle_oci_nls_lang: None,
+            oracle_oci_tns_admin: None,
+            connection_string: None,
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
+            redis_cluster_nodes: String::new(),
+            redis_key_separator: crate::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
+            redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
+            etcd_endpoints: String::new(),
+            gbase_server: String::new(),
+            informix_server: String::new(),
+            external_config: None,
+            plugin_id: None,
+            plugin_connection_provider: None,
+            plugin_connection_type: None,
+            connection_secrets: Default::default(),
+            jdbc_driver_class: None,
+            jdbc_driver_paths: Vec::new(),
+            one_time: false,
+            save_password: true,
+            read_only: false,
+            is_production: false,
+            production_databases: vec![],
+            show_system_schemas: false,
+            sidebar_auto_load_all_tables: false,
+            database_info: None,
+        }
+    }
+
+    /// Fake agent whose `validate_connection` reports a real failure.
+    ///
+    /// It must NOT answer with an unsupported-method error: `ping_keepalive_target` treats that
+    /// as a healthy connection (`is_agent_validate_connection_unsupported`), which would make
+    /// this fixture silently green.
+    const KEEPALIVE_FAILING_AGENT: &str = r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+        print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+    elif 'validate_connection' in req['method']:
+        print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -32000, 'message': 'connection refused by keepalive fixture'}}), flush=True)
+    else:
+        print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': {}}), flush=True)
+"#;
+
+    async fn spawn_keepalive_agent(
+        dir: &std::path::Path,
+        name: &str,
+    ) -> std::sync::Arc<crate::db::agent_driver::PooledAgentClient> {
+        let script_path = dir.join(name);
+        std::fs::write(&script_path, KEEPALIVE_FAILING_AGENT).unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runtime = crate::db::agent_driver::AgentRuntimeClient::spawn(
+            crate::db::agent_driver::AgentLaunchSpec::new(python)
+                .with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        runtime.increment_session_count();
+        std::sync::Arc::new(crate::db::agent_driver::PooledAgentClient::new(
+            crate::db::agent_driver::AgentDriverClient::shared_session(runtime, format!("{name}-session")),
+        ))
+    }
+
+    /// A failing probe on the connection's current pool must reach the UI (#4339). This drives
+    /// the real keepalive task rather than the publish helper, so it pins the wiring between
+    /// the probe's failure branch and the report.
+    #[tokio::test]
+    async fn keepalive_probe_failure_reports_a_lost_connection() {
+        let (state, dir) = test_app_state().await;
+        let config = keepalive_test_config("conn", 1);
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let client = spawn_keepalive_agent(&dir, "failing-keepalive-agent.py").await;
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Agent(std::sync::Arc::clone(&client)));
+        let pool = PoolKind::Agent(client);
+        let mut events = state.subscribe_connection_liveness();
+
+        state.start_keepalive_task(
+            "conn",
+            &pool,
+            &config,
+            #[cfg(feature = "mq-admin")]
+            None,
+        );
+
+        let message = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("a failing probe must report a liveness loss")
+            .expect("the channel must stay open");
+        assert_eq!(
+            message,
+            ConnectionLivenessMessage::Lost {
+                connection_id: "conn".to_string(),
+                failure_kind: ConnectionLivenessFailureKind::ProbeFailed,
+            }
+        );
+        state.stop_keepalive_task("conn").await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A pool that is busy with a running query is not evidence of a dead connection: the probe
+    /// is skipped entirely, so nothing may be reported (#4339).
+    #[tokio::test]
+    async fn keepalive_busy_pool_reports_nothing() {
+        let (state, dir) = test_app_state().await;
+        let config = keepalive_test_config("conn", 1);
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let client = spawn_keepalive_agent(&dir, "busy-keepalive-agent.py").await;
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Agent(std::sync::Arc::clone(&client)));
+        let pool = PoolKind::Agent(client);
+
+        // `is_pool_active` is true whenever a registered execution owns this pool key.
+        let registered = state.running_queries.register("keepalive-busy-exec".to_string());
+        state.running_queries.set_pool_key("keepalive-busy-exec", "conn");
+        assert!(state.running_queries.is_pool_active("conn"));
+
+        let mut events = state.subscribe_connection_liveness();
+        state.start_keepalive_task(
+            "conn",
+            &pool,
+            &config,
+            #[cfg(feature = "mq-admin")]
+            None,
+        );
+
+        // Long enough for more than one interval to elapse.
+        let outcome = tokio::time::timeout(Duration::from_millis(1500), events.recv()).await;
+        assert!(outcome.is_err(), "a busy pool must not report a liveness loss: {outcome:?}");
+
+        state.stop_keepalive_task("conn").await;
+        drop(registered);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A probe whose pool was already replaced reports nothing: its result says nothing about
+    /// the connection that is live now (#4339).
+    #[tokio::test]
+    async fn keepalive_stale_target_reports_nothing() {
+        let (state, dir) = test_app_state().await;
+        let config = keepalive_test_config("conn", 1);
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        // The registry holds `current`, but the keepalive task is started for a different client,
+        // so the detach cannot match the live pool and must stay silent.
+        let current = spawn_keepalive_agent(&dir, "stale-current-agent.py").await;
+        let stale = spawn_keepalive_agent(&dir, "stale-replaced-agent.py").await;
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Agent(current));
+
+        let mut events = state.subscribe_connection_liveness();
+        state.start_keepalive_task(
+            "conn",
+            &PoolKind::Agent(stale),
+            &config,
+            #[cfg(feature = "mq-admin")]
+            None,
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_millis(1500), events.recv()).await;
+        assert!(outcome.is_err(), "a stale probe must not report a liveness loss: {outcome:?}");
+
+        state.stop_keepalive_task("conn").await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Stopping the keepalive task (explicit disconnect / reconnect) must not report a loss for
+    /// a pool that was never detached (#4339).
+    #[tokio::test]
+    async fn keepalive_stop_reports_nothing() {
+        let (state, dir) = test_app_state().await;
+        let config = keepalive_test_config("conn", 1);
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let client = spawn_keepalive_agent(&dir, "stopped-keepalive-agent.py").await;
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Agent(std::sync::Arc::clone(&client)));
+        let pool = PoolKind::Agent(client);
+
+        let mut events = state.subscribe_connection_liveness();
+        state.start_keepalive_task(
+            "conn",
+            &pool,
+            &config,
+            #[cfg(feature = "mq-admin")]
+            None,
+        );
+        state.stop_keepalive_task("conn").await;
+
+        let outcome = tokio::time::timeout(Duration::from_millis(1500), events.recv()).await;
+        assert!(outcome.is_err(), "a stopped keepalive must not report a liveness loss: {outcome:?}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The sidebar must not grey out a connection because one derived pool died: pool keys
+    /// are per session/role/database derived, so only the last pool going makes the
+    /// connection really unusable. This gate is also what collapses N per-pool keepalive
+    /// failures into a single logical disconnect (#4339).
+    #[tokio::test]
+    async fn liveness_is_published_only_after_the_connections_last_pool_is_gone() {
+        let (state, dir) = test_app_state().await;
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        let mut events = state.subscribe_connection_liveness();
+
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("conn".to_string(), PoolKind::Sqlite(pool.clone()));
+                connections.insert("conn:analytics:session:tab-1".to_string(), PoolKind::Sqlite(pool.clone()));
+                // A sibling id sharing the prefix is a different connection and must not
+                // keep "conn" alive.
+                connections.insert("conn-2".to_string(), PoolKind::Sqlite(pool));
+            })
+            .await;
+
+        // A derived pool dying while another pool of the same connection survives says
+        // nothing about the connection root.
+        state.update_connection_pools(|connections| connections.remove("conn:analytics:session:tab-1")).await;
+        report_connection_liveness_lost(
+            &state.connections,
+            &state.connection_liveness,
+            "conn",
+            ConnectionLivenessFailureKind::ProbeFailed,
+        )
+        .await;
+        assert!(
+            matches!(events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+            "a surviving pool must suppress the liveness message"
+        );
+
+        // The last pool going is a real disconnect, and only then is it reported.
+        state.update_connection_pools(|connections| connections.remove("conn")).await;
+        report_connection_liveness_lost(
+            &state.connections,
+            &state.connection_liveness,
+            "conn",
+            ConnectionLivenessFailureKind::TimedOut,
+        )
+        .await;
+        let message = events.try_recv().expect("the last pool going must report a liveness loss");
+        assert_eq!(
+            message,
+            ConnectionLivenessMessage::Lost {
+                connection_id: "conn".to_string(),
+                failure_kind: ConnectionLivenessFailureKind::TimedOut,
+            }
+        );
+        assert!(
+            matches!(events.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+            "one outage publishes exactly one message"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

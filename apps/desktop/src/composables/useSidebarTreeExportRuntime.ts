@@ -16,7 +16,7 @@ import { joinExportedDdls } from "@/lib/export/ddlExport";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { sidebarStructureExportTargets, sidebarTableDataExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
 import { fetchTableDataForExport } from "@/lib/table/tableDataExport";
-import { forceCsvTextForTemporalColumns } from "@/lib/dataGrid/columnFormatter";
+import { dropsSchemaQualifier } from "@/lib/table/tableSelectSql";
 import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
 import { buildXlsxHeaderOverrides, hasXlsxHeaderComments, type XlsxExportOptions, type XlsxHeaderMode } from "@/lib/export/xlsxHeader";
 import {
@@ -476,7 +476,7 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
           executePage: (sql) => api.executeQuery(connectionId, database, sql),
         });
         if (format === "csv") {
-          await api.exportQueryResultCsv(outputPath, result.columns, forceCsvTextForTemporalColumns(result.rows, result.column_types ?? []), target.csvQuoteMode, target.nullLiteral);
+          await api.exportQueryResultCsv(outputPath, result.columns, result.rows, target.csvQuoteMode, target.nullLiteral);
         } else {
           const comments = result.columns.map((name) => exportColumnInfos?.find((column) => column.name.toLocaleLowerCase() === name.toLocaleLowerCase())?.comment);
           const headerOverrides = buildXlsxHeaderOverrides(result.columns, comments, headerMode);
@@ -505,7 +505,12 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
         tableName: target.tableName,
         filePath: outputPath,
         format,
-        ...(format === "sql" ? { insertDialect } : {}),
+        ...(format === "sql"
+          ? {
+              insertDialect,
+              omitDatabaseQualifier: dropsSchemaQualifier(target.databaseType, settingsStore.editorSettings.generateSqlIncludeDatabaseName, target.catalog),
+            }
+          : {}),
         csvQuoteMode: target.csvQuoteMode,
         nullLiteral: target.nullLiteral,
         columns: queryColumns,

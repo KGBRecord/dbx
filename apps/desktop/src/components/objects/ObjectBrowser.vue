@@ -81,7 +81,7 @@ import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionTableSq
 import { getTableMetadataCapabilities, type TableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { findTableStatistics } from "@/lib/dataGrid/tableInfoOverview";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
-import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
+import { buildTableSelectSql, dropsSchemaQualifier } from "@/lib/table/tableSelectSql";
 import { PARTITION_TREE_INDENT_PX } from "@/lib/table/pgPartitionPresentation";
 import {
   buildDropObjectSql,
@@ -118,7 +118,6 @@ import {
 } from "@/lib/table/tableClipboard";
 import { buildSingleDdlExportFileContent } from "@/lib/export/ddlExport";
 import { fetchTableDataForExport } from "@/lib/table/tableDataExport";
-import { forceCsvTextForTemporalColumns } from "@/lib/dataGrid/columnFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { treeNodePinIdentity, type PinnedTreeNodeIdentity } from "@/lib/app/pinnedItems";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
@@ -2423,7 +2422,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
         executePage: (sql) => api.executeQuery(props.connection.id, props.database, sql),
       });
       if (format === "csv") {
-        await api.exportQueryResultCsv(filePath, result.columns, forceCsvTextForTemporalColumns(result.rows, result.column_types ?? []), settingsStore.editorSettings.csvQuoteMode, csvNullLiteralForMode(settingsStore.editorSettings.csvNullMode));
+        await api.exportQueryResultCsv(filePath, result.columns, result.rows, settingsStore.editorSettings.csvQuoteMode, csvNullLiteralForMode(settingsStore.editorSettings.csvNullMode));
       } else {
         const comments = result.columns.map((name) => columnInfos?.find((column) => column.name.toLocaleLowerCase() === name.toLocaleLowerCase())?.comment);
         const headerOverrides = buildXlsxHeaderOverrides(result.columns, comments, headerMode);
@@ -2461,7 +2460,14 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
       tableName: row.name,
       filePath,
       format,
-      ...(format === "sql" ? { insertMode, insertDialect, splitMaxMb } : {}),
+      ...(format === "sql"
+        ? {
+            insertMode,
+            insertDialect,
+            splitMaxMb,
+            omitDatabaseQualifier: dropsSchemaQualifier(effectiveDatabaseType.value, settingsStore.editorSettings.generateSqlIncludeDatabaseName, props.catalog),
+          }
+        : {}),
       csvQuoteMode: settingsStore.editorSettings.csvQuoteMode,
       nullLiteral: csvNullLiteralForMode(settingsStore.editorSettings.csvNullMode),
       columns,
