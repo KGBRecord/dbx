@@ -757,6 +757,10 @@ fn quote_export_sql_string_for_database(text: &str, database_type: Option<Databa
         database_type if is_mysql_compatible_export_literal_target(database_type) => {
             quote_mysql_compatible_export_sql_string(text)
         }
+        // Not MySQL-wire targets, but both engines interpret backslash escape
+        // sequences in string literals, so they must keep MySQL-style escaping
+        // for round-trip correctness.
+        Some(DatabaseType::ClickHouse | DatabaseType::Snowflake) => quote_mysql_compatible_export_sql_string(text),
         _ => quote_standard_export_sql_string(text),
     }
 }
@@ -5686,6 +5690,59 @@ mod tests {
                 "INSERT INTO \"public\".\"flags\" (\"enabled\", \"disabled\", \"unknown\") VALUES (TRUE, FALSE, NULL);"
             ]
         );
+    }
+
+    #[test]
+    fn ansi_export_keeps_backslashes_literal_and_doubles_quotes() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
+            schema: None,
+            table_name: Some("t".to_string()),
+            qualified_table_name: None,
+            columns: vec!["note".to_string()],
+            column_types: vec![Some("nvarchar(255)".to_string())],
+            column_extras: Vec::new(),
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![vec![json!(r"C:\new\it's")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO [t] ([note]) VALUES (N'C:\\new\\it''s');"]);
+    }
+
+    #[test]
+    fn clickhouse_and_snowflake_export_escape_backslashes() {
+        for database_type in [DatabaseType::ClickHouse, DatabaseType::Snowflake] {
+            let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+                database_type: Some(database_type),
+                identifier_quote: None,
+                schema: None,
+                table_name: Some("t".to_string()),
+                qualified_table_name: None,
+                columns: vec!["note".to_string()],
+                column_types: vec![Some("String".to_string())],
+                column_extras: Vec::new(),
+                spatial_columns: Vec::new(),
+                spatial_values: Vec::new(),
+                rows: vec![vec![json!(r"C:\new\it's")]],
+                batch_size: Some(10),
+            })
+            .unwrap();
+
+            let expected = match database_type {
+                DatabaseType::ClickHouse => r"INSERT INTO `t` (`note`) VALUES ('C:\\new\\it''s');",
+                DatabaseType::Snowflake => r#"INSERT INTO "t" ("note") VALUES ('C:\\new\\it''s');"#,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                statements,
+                vec![expected],
+                "backslash-escaping dialect {database_type:?} must double backslashes"
+            );
+        }
     }
 
     #[test]
