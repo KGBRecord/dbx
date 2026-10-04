@@ -2776,6 +2776,7 @@ fn write_database_export_rows<W: Write>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_database_export_rows_with_mode<W: Write>(
     file: &mut W,
     rows: &[Vec<Value>],
