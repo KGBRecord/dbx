@@ -551,7 +551,11 @@ pub struct BuildExportInsertStatementsOptions {
     /// Unicode in a TEXT column (see `decode_unicode_escapes_for_export`), and
     /// the default export keeps that exact byte-for-byte round trip. Enable
     /// this only to make the `.sql` file itself readable in the original
-    /// language; it does not change what is stored when re-imported.
+    /// language. Re-importing such an export stores the decoded literal
+    /// characters rather than the original ASCII-escaped form, so it is not a
+    /// byte-faithful backup; any `\uXXXX`-shaped run forming a valid hex code
+    /// point (e.g. `\uface`) is decoded as well, including text that merely
+    /// documents such escapes.
     #[serde(default)]
     pub preserve_original_language: bool,
 }
