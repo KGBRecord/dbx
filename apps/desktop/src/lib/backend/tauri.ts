@@ -36,7 +36,7 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
 
 import type { MigrationPreflight, MigrationReport } from "./migration";
 export type { MigrationPreflight, MigrationReport } from "./migration";
-export const migrationStatus = (): Promise<MigrationPreflight> => invoke("migration_status");
+export const migrationStatus = (retry = false): Promise<MigrationPreflight> => invoke("migration_status", { retry });
 export const migrationStart = (): Promise<MigrationReport> => invoke("migration_start");
 export const migrationRetry = (): Promise<MigrationReport> => invoke("migration_retry");
 export const migrationCleanupBackups = (): Promise<void> => invoke("migration_cleanup_backups");
@@ -539,6 +539,7 @@ export interface QueryPaginationExecutionPlan {
   exactQueryRowBound?: number;
   useAgentResultSession: boolean;
   paginationRowNumberColumn?: string;
+  paginationError?: string;
 }
 
 export type QuerySortDirection = "asc" | "desc";
@@ -5449,13 +5450,32 @@ export interface TransferRequest {
   dropTargetConfirmed: boolean;
 }
 
+export interface TransferStructurePreviewTable {
+  sourceTable: string;
+  targetTable: string;
+  /** The target table already exists, so this transfer plans no structure DDL for it. */
+  preexisting: boolean;
+  sql: string;
+}
+
+export interface TransferStructurePreview {
+  sql: string;
+  tables: TransferStructurePreviewTable[];
+}
+
 export interface TransferOwnershipPreview {
   missingOwners: string[];
   targetOwner: string;
   rebuild?: {
     sql: string;
     tables: Array<{ sourceTable: string; targetTable: string; backupTable?: string }>;
+    /** The rename phase on its own, so the structure plan can sit between rename and cleanup. */
+    backupSql?: string;
+    /** The drop-backups phase on its own. */
+    cleanupSql?: string;
   };
+  /** Structure-plan preview: present for structure-only transfers. */
+  structure?: TransferStructurePreview;
 }
 
 export interface TransferProgress {
@@ -5897,6 +5917,7 @@ export interface DatabaseExportRequest {
   includeCreateDatabase?: boolean;
   dropTableIfExists?: boolean;
   omitAutoIncrement?: boolean;
+  preserveOriginalLanguage?: boolean;
   failOnError?: boolean;
   preventOverwrite?: boolean;
   outputCompression?: "none" | "gzip";

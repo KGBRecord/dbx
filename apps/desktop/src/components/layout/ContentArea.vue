@@ -36,6 +36,7 @@ import {
   X,
   Pin,
   Pencil,
+  PencilRuler,
   Rows3,
   Hash,
   SquareDashed,
@@ -64,6 +65,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
+import HelpTooltip from "@/components/ui/tooltip/HelpTooltip.vue";
 import ColumnInfoPanel from "@/components/editor/ColumnInfoPanel.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import QueryErrorActions from "@/components/common/QueryErrorActions.vue";
@@ -123,6 +125,7 @@ const NacosAdminConsole = defineAsyncComponent(() => import("@/components/nacos/
 const NacosAccessControlConsole = defineAsyncComponent(() => import("@/components/nacos/NacosAccessControlConsole.vue"));
 const NacosDashboard = defineAsyncComponent(() => import("@/components/nacos/NacosDashboard.vue"));
 const DoltVersionControl = defineAsyncComponent(() => import("@/components/dolt/DoltVersionControl.vue"));
+const DatabaseSearchPanel = defineAsyncComponent(() => import("@/components/search/DatabaseSearchPanel.vue"));
 const DatabaseBrowser = defineAsyncComponent(() => import("@/components/objects/DatabaseBrowser.vue"));
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
@@ -179,12 +182,13 @@ import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elastics
 import { elasticsearchProfileBodyForResult, parseElasticsearchProfile } from "@/lib/elasticsearch/elasticsearchProfile";
 import * as api from "@/lib/backend/api";
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
+import { promptExportSavePath } from "@/lib/export/exportPath";
 import { queryResultExportBaseName } from "@/lib/export/saveTextFile";
 import { applyMongoGridChangesToDocument, applyMongoGridChangesToDocumentBaseline, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import { buildMongoQueryResultOperations, formatMongoQueryResultOperationPreview } from "@/lib/mongo/mongoQueryResultEditing";
 import { buildInfluxDbV1DeleteStatements, canDeleteInfluxDbV1Row, resolveInfluxDbV1DeleteTarget } from "@/lib/influxdb/influxDbV1Delete";
 import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
-import { isDataGridToolbarCompact, type DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
+import { isDataGridToolbarCompact, type DataGridReloadIntent, type DataGridToolbarActionCapability } from "@/lib/dataGrid/dataGridToolbar";
 import { useTabScroll } from "@/composables/useTabScroll";
 import { useToolbarOverflow } from "@/composables/useToolbarOverflow";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
@@ -202,6 +206,7 @@ import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAcc
 import { isAiRedisConsoleTarget, type AiConversationBinding } from "@/lib/ai/aiConversationBinding";
 
 type DataGridHandle = DataGridColumnLayoutHandle & {
+  tableInfoToolbarCapability: DataGridToolbarActionCapability;
   onToolbarRefresh: () => Promise<void> | void;
   focusSearch: (target?: Element | null) => boolean;
   focusWhere: () => boolean;
@@ -218,6 +223,8 @@ type DataGridHandle = DataGridColumnLayoutHandle & {
   openExtractorConfiguration: () => void;
   showDdl: boolean;
   toggleDdl: (tab?: TableInfoTab) => void;
+  canOpenTableStructureEditor: boolean;
+  openTableStructureEditor: (tab?: TableInfoTab) => boolean;
   multiRowTranspose: boolean;
   setMultiRowTranspose: (value: boolean) => void;
   exportCsv: () => Promise<void>;
@@ -361,6 +368,7 @@ const etcdDashboardRef = ref<{ refresh?: () => boolean }>();
 const zookeeperKeyBrowserRef = ref<SearchableBrowserHandle>();
 const consulOverviewRef = ref<{ refresh?: () => boolean }>();
 const consulWorkspaceRef = ref<SearchableBrowserHandle>();
+const databaseSearchPanelRef = ref<{ focusSearch: () => boolean }>();
 const databaseBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
 const pluginFilesystemTabRef = ref<{ refresh: () => Promise<unknown> }>();
@@ -1139,6 +1147,22 @@ function onHandleClickTable(target: SqlObjectNavigationTarget) {
   emit("clickTable", props.activeTab.id, target);
 }
 
+function onLocateObjectTable(target: ContentAreaSurfaceEmits["openObjectTable"][1]) {
+  const isMongo = props.activeConnection?.db_type === "mongodb";
+  emit("locate-tab", {
+    id: props.activeTab.id,
+    title: target.tableName,
+    connectionId: props.activeTab.connectionId,
+    database: props.activeTab.database,
+    schema: target.schema,
+    catalog: target.catalog,
+    mode: isMongo ? "mongo" : "data",
+    sql: isMongo ? target.tableName : "",
+    isExecuting: false,
+    tableMeta: { ...target, columns: [], primaryKeys: [] },
+  });
+}
+
 function onHandleViewTableData(target: SqlObjectNavigationTarget) {
   emit("viewTableData", props.activeTab.id, target);
 }
@@ -1258,6 +1282,7 @@ function focusSearch(target: Element | null = null): boolean {
   if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "consul") return consulWorkspaceRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "databases") return databaseBrowserRef.value?.focusSearch() ?? false;
+  if (props.activeTab.mode === "database-search") return databaseSearchPanelRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "objects") return objectBrowserRef.value?.focusSearch(target) ?? false;
   if (props.activeTab.mode === "structure") return tableStructureEditorRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "query") {
@@ -1279,6 +1304,11 @@ function openGoToColumn(): boolean {
   return dataGridRef.value?.openGoToColumn() ?? false;
 }
 
+function openTableStructureEditor(initialTab: TableInfoTab = "columns"): boolean {
+  if (props.activeTab.mode !== "data") return false;
+  return dataGridRef.value?.openTableStructureEditor?.(initialTab) ?? false;
+}
+
 function refreshQueryEditorCompletionCache(): boolean {
   if (props.activeTab.mode !== "query" || !queryEditorRef.value) return false;
   queryEditorRef.value.refreshCompletionCache();
@@ -1289,6 +1319,15 @@ function reloadUnavailableDataTab() {
   const { whereInput, orderBy } = restoredDataTabReloadFilters(props.activeTab);
   emit("reload", props.activeTab.id, undefined, undefined, whereInput, orderBy);
 }
+
+watch(
+  () => props.activeTab.id,
+  () => {
+    if (!settingsStore.editorSettings.autoReloadRestoredDataTabsOnOpen) return;
+    if (canReloadUnavailableDataTab(props.activeTab)) reloadUnavailableDataTab();
+  },
+  { immediate: true },
+);
 
 function refreshData(): boolean {
   // Reuse ObjectBrowser's reload path so schema reloads and stale object-response guards stay intact.
@@ -1353,13 +1392,19 @@ function openPluginResultView(pluginId: string, contributionId: string, label: s
   // bounded snapshot — plugins that need more rows re-run the statement through
   // `host.queryData` (host.data:read, with the user's consent).
   const cappedRows = result.rows.slice(0, 500);
+  const connectionId = activeResultConnectionId.value || "";
+  const database = activeResultDatabase.value || "";
+  const schema = activeResultSchema.value || "";
   queryStore.openPluginWorkbench(pluginId, contributionId, {
     title: label,
-    connectionId: props.activeTab.connectionId || "",
-    database: props.activeTab.database || "",
+    connectionId,
+    database,
     context: {
-      connectionId: props.activeTab.connectionId || "",
-      database: props.activeTab.database || "",
+      connectionId,
+      database,
+      // The plugin re-runs `sql` through `host.queryData`, whose backend sets
+      // search_path from this; without it unqualified table names miss.
+      schema,
       sql: resultSqlForGrid(props.activeTab),
       result: { columns: result.columns, rows: cappedRows, truncated: result.rows.length > cappedRows.length },
     },
@@ -1615,16 +1660,27 @@ function cancelQueryEditorExecutionViewport(requestId: number) {
   return queryEditorRef.value?.cancelGutterExecutionViewport(requestId) ?? false;
 }
 
+function foldAll(): boolean {
+  return queryEditorRef.value?.foldAll?.() ?? false;
+}
+
+function unfoldAll(): boolean {
+  return queryEditorRef.value?.unfoldAll?.() ?? false;
+}
+
 async function handleExportQuery(payload: { sql: string; format: "csv" | "xlsx" | "txt"; columnComments?: (string | null)[] }) {
   const tab = props.activeTab;
   if (!tab || tab.mode !== "query") return;
   let filePath = `query-result.${payload.format}`;
   if (isTauriRuntime()) {
-    const { save } = await import("@tauri-apps/plugin-dialog");
     const filterName = payload.format === "csv" ? "CSV" : payload.format === "xlsx" ? "Excel" : "Text";
-    const picked = await save({ defaultPath: filePath, filters: [{ name: filterName, extensions: [payload.format] }] });
+    const picked = await promptExportSavePath({
+      defaultFileName: filePath,
+      filters: [{ name: filterName, extensions: [payload.format] }],
+      preferredPath: settingsStore.editorSettings.preferredExportPath,
+    });
     if (!picked) return;
-    filePath = picked as string;
+    filePath = picked;
   }
   await queryStore.exportQuerySqlDirect(tab.id, payload.sql, payload.format, filePath, payload.columnComments);
 }
@@ -1740,6 +1796,7 @@ defineExpose({
   focusSearch,
   focusWhere,
   openGoToColumn,
+  openTableStructureEditor,
   refreshData,
   toggleResultsPane,
   refreshQueryEditorCompletionCache,
@@ -1760,6 +1817,8 @@ defineExpose({
   focusStatementRange,
   focusErrorPosition,
   locateActiveResultError,
+  foldAll,
+  unfoldAll,
 });
 </script>
 
@@ -1992,6 +2051,24 @@ defineExpose({
                 />
               </template>
               <div class="ml-auto flex shrink-0 items-center gap-1">
+                <template v-if="activeOutputView === 'result' && redisResultViewMode === 'grid' && activeTab.result && hasTabularResult && !activeElasticsearchJsonResponse && !showElasticsearchRawJson">
+                  <DataGridColumnLayoutPopover :grid="dataGridRef" trigger-class="px-1.5" />
+                  <LightTooltip v-if="dataGridRef?.tableInfoToolbarCapability?.visible" :text="t('contextMenu.viewDdl')" side="bottom" nowrap>
+                    <Button
+                      data-query-result-ddl
+                      variant="ghost"
+                      size="sm"
+                      class="h-6 shrink-0 gap-1 px-1.5 text-xs"
+                      :class="{ 'bg-accent': dataGridRef.tableInfoToolbarCapability.active }"
+                      :aria-label="t('contextMenu.viewDdl')"
+                      :aria-pressed="dataGridRef.tableInfoToolbarCapability.active"
+                      @click="dataGridRef.tableInfoToolbarCapability.onTrigger()"
+                    >
+                      <TableProperties class="h-3.5 w-3.5" />
+                      DDL
+                    </Button>
+                  </LightTooltip>
+                </template>
                 <Popover v-if="activeOutputView === 'result' && redisResultViewMode === 'grid' && activeTab.result && hasTabularResult && !activeElasticsearchJsonResponse" v-model:open="dataGridViewOptionsOpen">
                   <PopoverTrigger as-child>
                     <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-foreground hover:bg-accent" :title="t('grid.viewOptions')" :aria-label="t('grid.viewOptions')">
@@ -2309,6 +2386,7 @@ defineExpose({
               :explain-sql="activeTab.explainSql"
               :table-result="activeTab.explainTableResult"
               :table-error="activeTab.explainTableError"
+              :default-view="settingsStore.editorSettings.defaultExplainView"
             />
 
             <ElasticsearchProfilePanel v-else-if="activeOutputView === 'profile' && canShowProfile" class="flex-1 min-h-0" :body="activeElasticsearchProfileBody ?? ''" />
@@ -2453,10 +2531,12 @@ defineExpose({
                 :initial-order-by-input="activeTab.orderByInput"
                 :sql="activeResultSql"
                 :export-sql="activeResultExportSql"
+                :page-sql="activeTab.resultPageSql"
                 :loading="activeResultIsLoading"
                 :editable="!hasNeo4jNodes && (!!activeTab.queryAnalysis || !!mongoQueryResultSaveHandler)"
                 :source-columns="hasNeo4jNodes ? undefined : activeTab.querySourceColumns"
                 :joined-write-targets="hasNeo4jNodes ? undefined : activeTab.queryWriteTargets"
+                :query-multi-source="(activeTab.queryWriteTargets?.length ?? 0) > 1"
                 :readonly-column-indexes="hasNeo4jNodes ? undefined : groupedQueryReadonlyColumnIndexes(activeTab)"
                 :result-column-comments="hasNeo4jNodes ? undefined : activeTab.resultColumnComments"
                 :query-display-source-columns="hasNeo4jNodes ? undefined : activeTab.queryDisplaySourceColumns"
@@ -2469,6 +2549,7 @@ defineExpose({
                 :allow-insert-rows="activeTab.queryAnalysis?.allowInsert ?? activeTab.queryAnalysis?.allowInsertDelete !== false"
                 :allow-delete-rows="activeTab.queryAnalysis?.allowDelete ?? activeTab.queryAnalysis?.allowInsertDelete !== false"
                 context="results"
+                :reveal-column-request="activeTab.gridRevealColumnRequest"
                 :auto-transpose-single-row="settingsStore.editorSettings.dataGridAutoTransposeSingleRow"
                 :database-type="activeEffectiveDatabaseType"
                 :connection-id="activeResultConnectionId"
@@ -2556,7 +2637,6 @@ defineExpose({
                   </template>
                 </template>
                 <template #result-toolbar-actions="{ compact }">
-                  <DataGridColumnLayoutPopover :grid="dataGridRef" :compact="compact" />
                   <QueryResultToolbarActions
                     :active-view="activeOutputView"
                     :can-show-explain="canShowExplainOutput"
@@ -2645,6 +2725,12 @@ defineExpose({
           </button>
           <span v-if="showDataColumnsChip && activeDataTabTableMeta" class="inline-flex shrink-0 items-center rounded border border-border bg-muted/30 px-2 py-0.5 font-medium text-muted-foreground tabular-nums"> {{ activeDataTabTableMeta.columns.length }} {{ t("tree.columns") }} </span>
           <span class="ml-auto" />
+          <LightTooltip v-if="dataGridRef?.canOpenTableStructureEditor" :text="t('contextMenu.editStructure')" side="bottom" nowrap>
+            <Button data-edit-table-structure variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :aria-label="t('contextMenu.editStructure')" @click="dataGridRef?.openTableStructureEditor('columns')">
+              <PencilRuler class="h-3.5 w-3.5" />
+              <span v-if="!dataToolbarCompact">{{ t("contextMenu.editStructure") }}</span>
+            </Button>
+          </LightTooltip>
           <DataGridColumnLayoutPopover v-if="activeTab.result?.columns.length" :grid="dataGridRef" trigger-class="px-1.5" />
           <Button v-if="activeTab.result && activeDataTabTableMeta && activeTab.connectionId" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :class="{ 'bg-accent': dataGridRef?.showDdl }" :title="dataToolbarCompact ? t('grid.tableInfo') : undefined" @click="dataGridRef?.toggleDdl()"
             ><TableProperties class="h-3.5 w-3.5" /><span v-if="!dataToolbarCompact">{{ t("grid.tableInfo") }}</span></Button
@@ -2933,6 +3019,7 @@ defineExpose({
           :sort-mode="activeTab.resultSortMode"
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
+          :page-sql="activeTab.resultPageSql || activeTab.sql"
           :loading="activeTab.isExecuting"
           :editable="!activeTab.tableMetaPending && (isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType) || !!influxDbV1DeleteSaveHandler)"
           :custom-save-handler="influxDbV1DeleteSaveHandler"
@@ -2958,6 +3045,7 @@ defineExpose({
           :show-cancel="shouldShowCancelAction(activeTab)"
           :cancelling="activeTab.isCancelling"
           :cancel-disabled="!canCancelQueryExecution(activeTab)"
+          :reveal-column-request="activeTab.gridRevealColumnRequest"
           @cancel="emit('cancel', activeTab.id)"
           @update:where-input="(v: string) => (activeTab.whereInput = v)"
           @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
@@ -2998,6 +3086,9 @@ defineExpose({
             <span>{{ t("grid.dataUnavailableHintPrefix") }}</span>
             <kbd v-for="key in modRKeys" :key="key" class="min-w-5 rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 text-center font-mono text-[12px] leading-none text-muted-foreground shadow-xs">{{ key }}</kbd>
             <span>{{ t("grid.dataUnavailableHintSuffix") }}</span>
+            <HelpTooltip :label="t('settings.autoReloadRestoredDataTabsOnOpen')">
+              {{ t("grid.dataUnavailableAutoReloadHint", { setting: t("settings.autoReloadRestoredDataTabsOnOpen"), section: t("settings.navigationTab") }) }}
+            </HelpTooltip>
           </div>
           <Button variant="outline" size="sm" class="h-7 gap-1.5" @click="reloadUnavailableDataTab()">
             <RefreshCcw class="h-3.5 w-3.5" />
@@ -3171,6 +3262,26 @@ defineExpose({
         />
       </div>
     </template>
+    <!-- Database Search mode -->
+    <template v-else-if="activeTab.mode === 'database-search'">
+      <div class="min-w-0 flex-1 min-h-0">
+        <DatabaseSearchPanel
+          ref="databaseSearchPanelRef"
+          :key="activeTab.id"
+          :connection-id="activeTab.connectionId"
+          :database="activeTab.database"
+          :schema="activeTab.schema"
+          :initial-state="activeTab.databaseSearchState"
+          @update:state="
+            (state) => {
+              activeTab.databaseSearchState = state;
+              queryStore.updateDatabaseSearchState(activeTab.id, state);
+            }
+          "
+          @open-target="(target) => emit('openDatabaseSearchTarget', activeTab.id, target)"
+        />
+      </div>
+    </template>
     <template v-else-if="activeTab.mode === 'databases' && activeConnection">
       <div class="min-w-0 flex-1 min-h-0">
         <DatabaseBrowser ref="databaseBrowserRef" :key="activeTab.id" :connection="activeConnection" />
@@ -3196,6 +3307,7 @@ defineExpose({
           :initial-search-query="activeTab.objectBrowser?.searchQuery"
           :viewport="activeTab.objectBrowser?.viewport"
           @open-table="emit('openObjectTable', activeTab.id, $event)"
+          @locate-table="onLocateObjectTable"
           @schema-change="emit('objectSchemaChange', activeTab.id, $event)"
           @viewport-change="emit('objectBrowserViewportChange', activeTab.id, $event)"
           @search-change="emit('objectBrowserSearchChange', activeTab.id, $event)"

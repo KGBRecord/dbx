@@ -14,6 +14,7 @@ import type {
   BatchSqlExecution,
   BatchStatementExecutionItem,
   ConnectionConfig,
+  DatabaseSearchTabState,
   DatabaseType,
   IndexInfo,
   NacosConfigEditorViewport,
@@ -76,7 +77,7 @@ import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
 import { formatRedisConsoleValue } from "@/lib/redis/redisValuePresentation";
 import { usesAgentCursorForQuery, usesAgentCursorForTableData } from "@/lib/database/databaseDriverManifest";
 import { connectionIsDorisFamilyCatalogCapable, defaultAutoCommitForDbType, supportsClearableQuerySchema, supportsTransaction, usesOracleStickyTransactionState, usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
-import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, editablePrimaryKeys, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
 import { repairRestoredDataTabTableIdentity, tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { isDataTabMetadataLifecycleStale } from "@/lib/sidebar/dataTabOpenPolicy";
@@ -94,7 +95,7 @@ import { queryResultNameFromPreamble, queryResultSourceLabel, queryResultSourceN
 import { sqlServerCountUsesLocalTempTable } from "@/lib/query/queryResultCountSession";
 import { stripPaginationRowNumber } from "@/lib/query/queryPaginationResult";
 import { beginDataGridNativeSelectionBlock, finishDataGridNativeSelectionBlock } from "@/lib/dataGrid/dataGridNativeSelection";
-import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValueCells, tableDataLargeValuePreviewOptions, TABLE_DATA_RESULT_MAX_BYTES } from "@/lib/dataGrid/dataGridLargeValues";
+import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValueCells, supportsTableDataLargeValuePreview, tableDataLargeValuePreviewOptions, TABLE_DATA_RESULT_MAX_BYTES } from "@/lib/dataGrid/dataGridLargeValues";
 import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { agentProtocolQueryResultMaxRows, capQueryResultTotal, effectiveQueryResultMaxRows, limitQueryPagination, queryResultLimitReached } from "@/lib/dataGrid/queryResultRowLimit";
@@ -139,6 +140,7 @@ import type { SavedSqlFile } from "@/types/database";
 import i18n, { currentLocale } from "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import type { SqlExecutionTargetContext } from "@/lib/database/sqlExecutionTargetRegistry";
+import { targetDefaultDatabase } from "@/lib/database/sqlExecutionTargetCapabilities";
 import type { DriverProfileWorkspaceScope } from "@/lib/database/driverProfileExtensions";
 import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/sqlExecution";
 
@@ -146,6 +148,7 @@ const QUERY_SURFACE_ACTIVATION_EVENT = "dbx:activate-query-surface";
 
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
 const ORACLE_DEFERRED_LOB_TYPES = new Set<string>(["CLOB", "NCLOB", "BLOB", "BFILE", "XMLTYPE", "SYS.XMLTYPE"]);
+const DB2_DEFERRED_LOB_TYPES = new Set<string>(["CLOB", "DBCLOB", "BLOB"]);
 
 // Bounded concurrency for grouped-query display column loads, scoped per
 // connection so different connections never block each other. Matches the
@@ -161,13 +164,13 @@ const UPPERCASE_FOLDED_METADATA_TYPES = new Set<string>([...ORACLE_LIKE_METADATA
 // OceanBase Oracle mode ride the Oracle adapter and HighGo rides the PostgreSQL one
 // (issue #10233: without this, a query that omits the primary key stays read-only
 // even though the table has one).
-const HIDDEN_QUERY_KEY_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle", "xugu", "dameng", "highgo", "oceanbase-oracle"]);
+const HIDDEN_QUERY_KEY_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle", "xugu", "dameng", "highgo", "oceanbase-oracle", "db2"]);
 const QUERY_RESULT_EXPORT_UNSUPPORTED_ERROR = "Streaming export is unsupported for this query. Simplify it or use a supported driver.";
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
 const CANCEL_QUERY_TIMEOUT_MS = 10_000;
 const CANCEL_ACK_SETTLE_TIMEOUT_MS = 2_000;
-const ORACLE_QUERY_METADATA_PREFLIGHT_BUDGET_MS = 1_000;
-const ORACLE_QUERY_METADATA_PREFLIGHT_TIMEOUT = Symbol("oracle-query-metadata-preflight-timeout");
+const QUERY_METADATA_PREFLIGHT_BUDGET_MS = 1_000;
+const QUERY_METADATA_PREFLIGHT_TIMEOUT = Symbol("query-metadata-preflight-timeout");
 const SAVED_SQL_EDITOR_POSITION_PERSIST_DELAY_MS = 500;
 type CloseConfirmContext = "tab" | "batch" | "app";
 
@@ -778,13 +781,13 @@ async function withCancelQueryTimeout<T>(promise: Promise<T>): Promise<T> {
   }
 }
 
-async function waitForOracleQueryMetadataPreflight<T>(promise: Promise<T>): Promise<T | typeof ORACLE_QUERY_METADATA_PREFLIGHT_TIMEOUT> {
+async function waitForQueryMetadataPreflight<T>(promise: Promise<T>): Promise<T | typeof QUERY_METADATA_PREFLIGHT_TIMEOUT> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
-      new Promise<typeof ORACLE_QUERY_METADATA_PREFLIGHT_TIMEOUT>((resolve) => {
-        timer = setTimeout(() => resolve(ORACLE_QUERY_METADATA_PREFLIGHT_TIMEOUT), ORACLE_QUERY_METADATA_PREFLIGHT_BUDGET_MS);
+      new Promise<typeof QUERY_METADATA_PREFLIGHT_TIMEOUT>((resolve) => {
+        timer = setTimeout(() => resolve(QUERY_METADATA_PREFLIGHT_TIMEOUT), QUERY_METADATA_PREFLIGHT_BUDGET_MS);
       }),
     ]);
   } finally {
@@ -836,14 +839,23 @@ function projectsAllColumnsForSource(analysis: EditableQueryInfo, sourceKey: str
   return analysis.selectStar || analysis.columns.some((column) => column.star && (!column.sourceKey || column.sourceKey === sourceKey));
 }
 
-function oracleQueryProjectsDeferredLob(analysis: EditableQueryInfo, sourceKey: string, columns: readonly { name: string; data_type: string }[]): boolean {
-  const deferredColumns = new Set(columns.filter((column) => ORACLE_DEFERRED_LOB_TYPES.has(column.data_type.trim().toUpperCase())).map((column) => column.name.toLowerCase()));
+function queryProjectsDeferredLob(databaseType: DatabaseType, analysis: EditableQueryInfo, sourceKey: string, columns: readonly { name: string; data_type: string }[]): boolean {
+  const deferredTypes = databaseType === "oracle" ? ORACLE_DEFERRED_LOB_TYPES : databaseType === "db2" ? DB2_DEFERRED_LOB_TYPES : undefined;
+  if (!deferredTypes) return false;
+  const deferredColumns = new Set(
+    columns
+      .filter((column) => {
+        const normalized = column.data_type.trim().toUpperCase();
+        return deferredTypes.has(normalized) || deferredTypes.has(normalized.split("(", 1)[0]!.trim());
+      })
+      .map((column) => column.name.toLowerCase()),
+  );
   if (deferredColumns.size === 0) return false;
   if (projectsAllColumnsForSource(analysis, sourceKey)) return true;
   return analysis.columns.some((column) => column.sourceName && column.sourceKey === sourceKey && deferredColumns.has(column.sourceName.toLowerCase()));
 }
 
-function oracleColumnsAllowDeferredLobMarkers(columns: readonly { name: string }[]): boolean {
+function columnsAllowDeferredLobMarkers(columns: readonly { name: string }[]): boolean {
   return !columns.some((column) => column.name.toUpperCase().startsWith("__DBX_LARGE_VALUE_BYTES_"));
 }
 
@@ -933,6 +945,8 @@ let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistGeneration = 0;
 /** Monotonic id for content-search jump requests; lets repeated clicks on the same result re-trigger the editor reveal. */
 let contentRevealSeq = 0;
+/** Monotonic id for data-grid column reveal requests; lets repeated clicks on the same column re-trigger grid scroll and highlight. */
+let gridRevealColumnSeq = 0;
 
 function saveTabs(tabs: QueryTab[], activeTabId: string | null, workspace?: EditorWorkspacePersistState): Promise<void> {
   if (isDetachedWindow()) return Promise.resolve();
@@ -3318,6 +3332,36 @@ export const useQueryStore = defineStore("query", () => {
     return registerOpenTab(tab);
   }
 
+  function openDatabaseSearch(connectionId: string, database: string, schema?: string, initialState?: DatabaseSearchTabState) {
+    const existing = tabs.value.find((tab) => tab.mode === "database-search" && tab.connectionId === connectionId && tab.database === database && (tab.schema || "") === (schema || ""));
+    if (existing) {
+      if (initialState) {
+        existing.databaseSearchState = {
+          ...existing.databaseSearchState,
+          ...initialState,
+        };
+      }
+      switchTab(existing.id);
+      return existing.id;
+    }
+
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: "Database Search",
+      connectionId,
+      database,
+      schema,
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "database-search",
+      databaseSearchState: initialState,
+    };
+    return registerOpenTab(tab);
+  }
+
   function openDatabaseBrowser(connectionId: string) {
     const existing = tabs.value.find((tab) => tab.mode === "databases" && tab.connectionId === connectionId);
     if (existing) {
@@ -3372,6 +3416,17 @@ export const useQueryStore = defineStore("query", () => {
     activeTabId.value = tabId;
     settingsStore.settingsPageActive = false;
     if (typeof window !== "undefined") window.dispatchEvent(new Event(QUERY_SURFACE_ACTIVATION_EVENT));
+  }
+
+  function requestGridRevealColumn(tabId: string, columnName: string) {
+    const tab = tabs.value.find((t) => t.id === tabId);
+    if (!tab) return;
+    tab.gridRevealColumnRequest = { id: ++gridRevealColumnSeq, columnName };
+  }
+
+  function revealColumnInDataGrid(tabId: string, columnName: string) {
+    requestGridRevealColumn(tabId, columnName);
+    switchTab(tabId);
   }
 
   function openUserAdmin(connectionId: string) {
@@ -4713,7 +4768,14 @@ export const useQueryStore = defineStore("query", () => {
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
       sourceView: original.sourceView,
-      tableMeta: original.tableMeta ? { ...original.tableMeta, columns: [...original.tableMeta.columns], primaryKeys: [...original.tableMeta.primaryKeys] } : undefined,
+      tableMeta: original.tableMeta
+        ? {
+            ...original.tableMeta,
+            columns: [...original.tableMeta.columns],
+            primaryKeys: [...original.tableMeta.primaryKeys],
+            ...(original.tableMeta.virtualPrimaryKeys ? { virtualPrimaryKeys: [...original.tableMeta.virtualPrimaryKeys] } : {}),
+          }
+        : undefined,
       tableMetaGeneration: original.mode === "data" ? original.tableMetaGeneration : undefined,
       tableMetaUpdatedAt: original.mode === "data" ? original.tableMetaUpdatedAt : undefined,
       queryAnalysis: original.queryAnalysis ? { ...original.queryAnalysis, sources: original.queryAnalysis.sources?.map((source) => ({ ...source })), columns: original.queryAnalysis.columns.map((c) => ({ ...c })) } : undefined,
@@ -5333,6 +5395,12 @@ export const useQueryStore = defineStore("query", () => {
     tab.objectBrowser = { ...tab.objectBrowser, filter };
   }
 
+  function updateDatabaseSearchState(id: string, state: DatabaseSearchTabState) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "database-search") return;
+    tab.databaseSearchState = state;
+  }
+
   function updateNacosConfigEditorViewport(connectionId: string, namespace: string, viewport: NacosConfigEditorViewport) {
     if (!Number.isFinite(viewport.scrollTop) || !Number.isFinite(viewport.scrollLeft)) return;
     const tab = tabs.value.find((candidate) => candidate.mode === "nacos" && candidate.connectionId === connectionId && (candidate.nacosNamespace || "") === namespace);
@@ -5420,8 +5488,12 @@ export const useQueryStore = defineStore("query", () => {
 
   function openSavedSql(file: SavedSqlFile, options: OpenSavedSqlOptions = {}) {
     const targetMode = options.targetMode ?? useSettingsStore().editorSettings.savedSqlOpenTargetMode;
-    const currentTarget = targetMode === "current" ? currentSavedSqlExecutionTarget() : undefined;
-    const target = resolveSavedSqlExecutionTarget(file, targetMode, currentTarget);
+    const currentTarget = currentSavedSqlExecutionTarget();
+    const resolvedCurrent = targetMode === "current" ? currentTarget : undefined;
+    const effectiveConnectionId = file.connectionId || resolvedCurrent?.connectionId || currentTarget?.connectionId || "";
+    const connection = effectiveConnectionId ? useConnectionStore().getConfig(effectiveConnectionId) : undefined;
+    const fallbackDb = connection ? targetDefaultDatabase(connection) || connection.database : undefined;
+    const target = resolveSavedSqlExecutionTarget(file, targetMode, resolvedCurrent ?? currentTarget, fallbackDb);
     const existing = tabs.value.find((tab) => tab.savedSqlId === file.id);
     if (existing) {
       persistSavedSqlEditorPosition(existing);
@@ -5919,7 +5991,7 @@ export const useQueryStore = defineStore("query", () => {
     sql: string;
     metadataSql: string;
     hiddenPrimaryKeys: HiddenPrimaryKeyProjection[];
-    oracleLobPreview: boolean;
+    largeValuePreview: boolean;
   }
 
   function oracleCompletionTableType(tab: QueryTab, metadataDbType: string, database: string, schema: string, tableName: string, catalog?: string): string | undefined {
@@ -6061,6 +6133,7 @@ export const useQueryStore = defineStore("query", () => {
         tableType: metadata.tableType,
         columns: metadata.columns,
         primaryKeys: metadata.primaryKeys,
+        ...(metadata.virtualPrimaryKeys?.length ? { virtualPrimaryKeys: metadata.virtualPrimaryKeys } : {}),
       },
     };
   }
@@ -6173,8 +6246,9 @@ export const useQueryStore = defineStore("query", () => {
 
   function buildHiddenPrimaryKeyPreparation(tab: QueryTab, sql: string, databaseType: DatabaseType, loaded: LoadedEditableSource, primaryKeys: string[], declaredPrimaryKeys: string[], traceId: string, elapsed: () => string): EditableQueryExecutionPreparation {
     const metadataAnalysis = expandStarProjectionColumnsForSource(bindColumnsForSource(databaseType, loaded.analysis, loaded.source, loaded.tableMeta.columns), loaded.source, loaded.tableMeta.columns);
-    const oracleLobPreview = databaseType === "oracle" && primaryKeys.length > 0 && oracleRowIdIsSafeForQuery(tab, loaded) && oracleColumnsAllowDeferredLobMarkers(loaded.tableMeta.columns) && oracleQueryProjectsDeferredLob(metadataAnalysis, loaded.source.key, loaded.tableMeta.columns);
-    const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], oracleLobPreview };
+    const stableLobSource = databaseType === "oracle" ? oracleRowIdIsSafeForQuery(tab, loaded) : databaseType === "db2";
+    const largeValuePreview = (databaseType === "oracle" || databaseType === "db2") && primaryKeys.length > 0 && stableLobSource && columnsAllowDeferredLobMarkers(loaded.tableMeta.columns) && queryProjectsDeferredLob(databaseType, metadataAnalysis, loaded.source.key, loaded.tableMeta.columns);
+    const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], largeValuePreview };
     const missingPrimaryKeys =
       declaredPrimaryKeys.length === 0
         ? primaryKeys.filter((primaryKey) => !(databaseType === "oracle" && primaryKey === DBX_ROWID_COLUMN && metadataAnalysis.columns.some((column) => column.sourceKey === loaded.source.key && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID")))
@@ -6198,11 +6272,11 @@ export const useQueryStore = defineStore("query", () => {
       keyCount: rewritten.projections.length,
       elapsed: elapsed(),
     });
-    return { sql: rewritten.sql, metadataSql: rewritten.sql, hiddenPrimaryKeys: rewritten.projections, oracleLobPreview };
+    return { sql: rewritten.sql, metadataSql: rewritten.sql, hiddenPrimaryKeys: rewritten.projections, largeValuePreview };
   }
 
   async function prepareEditableQueryExecution(tab: QueryTab, sql: string, conn: ConnectionConfig | undefined, databaseType: DatabaseType | undefined, executionDatabase: string, traceId: string, elapsed: () => string): Promise<EditableQueryExecutionPreparation> {
-    const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], oracleLobPreview: false };
+    const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], largeValuePreview: false };
     if (!databaseType || !HIDDEN_QUERY_KEY_DATABASE_TYPES.has(databaseType) || !tab.connectionId) return unchanged;
 
     try {
@@ -6215,10 +6289,10 @@ export const useQueryStore = defineStore("query", () => {
       const wholeSourceProjected = projectsAllColumnsForSource(analysis, source.key);
       const hasDirectSourceProjection = analysis.columns.some((column) => Boolean(column.sourceName) && (!column.sourceKey || column.sourceKey === source.key));
       if (!wholeSourceProjected && !hasDirectSourceProjection) return unchanged;
-      // Whole-source projections already include declared primary keys. Only
-      // Oracle and Xugu need preflight metadata here to add their synthetic
-      // row key for a keyless base table.
-      if (databaseType !== "oracle" && databaseType !== "xugu" && wholeSourceProjected) return unchanged;
+      // Whole-source projections already include declared primary keys. Oracle
+      // and Xugu may need a synthetic key, while DB2 needs column metadata to
+      // decide whether LOB materialization can be deferred safely.
+      if (databaseType !== "oracle" && databaseType !== "xugu" && databaseType !== "db2" && wholeSourceProjected) return unchanged;
 
       const target = resolveEditableSourceMetadataTarget(tab, analysis, source, conn, databaseType, executionDatabase);
       const cached = getCachedTableMetadata(target.request);
@@ -6234,12 +6308,12 @@ export const useQueryStore = defineStore("query", () => {
         void fullMetadataPromise.catch((error) => queryExecutionLog("warn", "metadata:table-prefetch:failed", { traceId, error, elapsed: elapsed() }));
         const wholeSourceAutoCommit = projectsAllColumnsForSource(target.analysis, target.source.key) && tab.autoCommit !== false;
         if (wholeSourceAutoCommit) {
-          const indexes = await waitForOracleQueryMetadataPreflight(loadTableIndexes(target.request));
-          if (indexes === ORACLE_QUERY_METADATA_PREFLIGHT_TIMEOUT) {
+          const indexes = await waitForQueryMetadataPreflight(loadTableIndexes(target.request));
+          if (indexes === QUERY_METADATA_PREFLIGHT_TIMEOUT) {
             queryExecutionLog("info", "metadata:preflight:timeout", {
               traceId,
               table: target.request.tableName,
-              budgetMs: ORACLE_QUERY_METADATA_PREFLIGHT_BUDGET_MS,
+              budgetMs: QUERY_METADATA_PREFLIGHT_BUDGET_MS,
               elapsed: elapsed(),
             });
             return unchanged;
@@ -6249,17 +6323,32 @@ export const useQueryStore = defineStore("query", () => {
         loaded = loadedEditableSourceFromMetadata(target, (await fullMetadataPromise).metadata);
       }
 
-      loaded ??= await loadEditableQuerySource(tab, analysis, source, conn, databaseType, executionDatabase, traceId, elapsed);
+      if (!loaded) {
+        // 可编辑性所需的源表元数据加载，对所有数据库统一施加预算上限：慢元数据
+        // （如 SQLServer 只读账号、宽表、跨 schema 同义词）超时则先显示查询结果、
+        // 放弃本次结果可编辑；loadEditableQuerySource 仍在后台完成加载并写入缓存，
+        // 下次打开同一查询即可编辑（原先仅 Oracle/Xugu 有预算，其它库会被慢元数据阻塞）。
+        const loadedOrTimeout = await waitForQueryMetadataPreflight(loadEditableQuerySource(tab, analysis, source, conn, databaseType, executionDatabase, traceId, elapsed));
+        if (loadedOrTimeout === QUERY_METADATA_PREFLIGHT_TIMEOUT) {
+          queryExecutionLog("info", "metadata:preflight:timeout", {
+            traceId,
+            table: target.request.tableName,
+            budgetMs: QUERY_METADATA_PREFLIGHT_BUDGET_MS,
+            elapsed: elapsed(),
+          });
+          return unchanged;
+        }
+        loaded = loadedOrTimeout;
+      }
       if (loaded.tableMeta.columns.length === 0) return unchanged;
       if (loaded.tableMeta.tableType?.toUpperCase().includes("VIEW")) return unchanged;
-      const columnPrimaryKeys = loaded.tableMeta.columns.filter((column) => column.is_primary_key).map((column) => column.name);
-      const primaryKeys = databaseType === "oracle" ? loaded.tableMeta.primaryKeys : editablePrimaryKeys(databaseType, loaded.tableMeta.columns, loaded.tableMeta.tableType);
+      const primaryKeys = loaded.tableMeta.primaryKeys;
       const syntheticRowId = (databaseType === "oracle" || databaseType === "xugu") && usesSyntheticRowIdKey(databaseType, primaryKeys, loaded.tableMeta.tableType);
       // Base tables without a natural identifier use the same ROWID identity
       // as table-data tabs (Oracle and Xugu). Confirm the object is a base
       // table because selecting ROWID from a view can fail with ORA-01445.
       if (syntheticRowId && !(await resolveOracleRowIdSafety(tab, loaded, databaseType))) return unchanged;
-      const declaredPrimaryKeys = databaseType === "oracle" && !syntheticRowId ? primaryKeys : columnPrimaryKeys;
+      const declaredPrimaryKeys = syntheticRowId ? [] : primaryKeys;
       return buildHiddenPrimaryKeyPreparation(tab, sql, databaseType, loaded, primaryKeys, declaredPrimaryKeys, traceId, elapsed);
     } catch (error) {
       // Metadata enrichment is optional. Query execution must retain its prior
@@ -6893,7 +6982,7 @@ export const useQueryStore = defineStore("query", () => {
     let resultSortedSql = options?.resultSortedSql;
     let queryMetadataSql = queryBaseSql;
     let hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = [];
-    let useOracleLobPreview = false;
+    let useLargeValuePreview = false;
     let pageSql: string | undefined;
     let requestedPageLimit: number | undefined;
     let pageLimit: number | undefined;
@@ -7645,7 +7734,7 @@ export const useQueryStore = defineStore("query", () => {
         // does not turn an otherwise editable result into a complex read-only one.
         queryMetadataSql = options?.resultSortedSql && !options?.querySort ? queryBaseSql : prepared.metadataSql;
         hiddenPrimaryKeys = prepared.hiddenPrimaryKeys;
-        useOracleLobPreview = prepared.oracleLobPreview;
+        useLargeValuePreview = prepared.largeValuePreview;
         if (options?.querySort) {
           const sorted = await api.buildSortedQuerySql({
             originalSql: sqlToExecute,
@@ -7673,6 +7762,10 @@ export const useQueryStore = defineStore("query", () => {
           firstPageUsesActualSql: hiddenPrimaryKeys.length > 0,
         });
         const canPaginateSqlServerUseScript = !!sqlServerUseScript && !!plan.pageSql && typeof plan.pageLimit === "number" && typeof plan.pageOffset === "number";
+        if (plan.paginationError) throw new Error(plan.paginationError);
+        if (effectiveDbType === "oceanbase-oracle" && tab.autoCommit === false && plan.useAgentResultSession && !plan.pageSql && pagination.offset > 0 && !pagination.sessionId) {
+          throw new Error("This query requires an existing result session for offset pagination in a manual transaction");
+        }
         if (sqlServerUseScript && !canPaginateSqlServerUseScript) {
           sqlToExecute = sqlBeforePagination;
         } else {
@@ -7754,14 +7847,14 @@ export const useQueryStore = defineStore("query", () => {
             : { maxRows: agentProtocolQueryResultMaxRows(queryResultMaxRows) }),
           ...(useJdbcDriverRowOffset && typeof pageOffset === "number" && pageOffset > 0 ? { rowOffset: pageOffset } : {}),
           ...(executionClientSessionId ? { clientSessionId: executionClientSessionId } : {}),
-          ...(tab.mode === "data" && (effectiveDbType === "mysql" || effectiveDbType === "postgres")
+          ...(tab.mode === "data" && supportsTableDataLargeValuePreview(effectiveDbType)
             ? {
                 maxResultBytes: TABLE_DATA_RESULT_MAX_BYTES,
                 resultKeyColumns: dataTabMeta?.primaryKeys ?? [],
                 tableDataPreview: useTableDataPreview,
               }
             : {}),
-          ...(useOracleLobPreview ? { tableDataPreview: true } : {}),
+          ...(useLargeValuePreview ? { tableDataPreview: true } : {}),
           timeoutSecs: queryTimeoutSecs,
           catalog: executionCatalog,
           continueOnError: continueOnBatchError,
@@ -7891,8 +7984,8 @@ export const useQueryStore = defineStore("query", () => {
             // strand it after returning the first page.
             const executeInTransaction = (sessionId: string) =>
               useAgentResultSession && !isOffsetJumpPage
-                ? api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, pageLimit, options?.pagination?.sessionId, classificationSql)
-                : api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows), useOracleLobPreview, undefined, undefined, classificationSql);
+                ? api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, agentProtocolQueryResultMaxRows(queryResultMaxRows), useLargeValuePreview, pageLimit, options?.pagination?.sessionId, classificationSql)
+                : api.executeInManualTransaction(sessionId, sqlToExecute, executionDatabase, executionSchema, pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows), useLargeValuePreview, undefined, undefined, classificationSql);
             try {
               return await executeInTransaction(txnSessionId);
             } catch (error) {
@@ -9514,6 +9607,8 @@ export const useQueryStore = defineStore("query", () => {
     moveTabToGroup,
     unsplitTab,
     switchTab,
+    requestGridRevealColumn,
+    revealColumnInDataGrid,
     closeTab,
     forceClosePendingTab,
     forceCloseAllPendingTabs,
@@ -9571,6 +9666,7 @@ export const useQueryStore = defineStore("query", () => {
     updateObjectBrowserViewport,
     updateObjectBrowserSearch,
     updateObjectBrowserFilter,
+    updateDatabaseSearchState,
     updateNacosConfigEditorViewport,
     setAutoCommit,
     markManualTransactionDirty,
@@ -9579,6 +9675,7 @@ export const useQueryStore = defineStore("query", () => {
     ensureManualTransactionSession,
     renameTab,
     openDatabaseBrowser,
+    openDatabaseSearch,
     openDriverProfileWorkspace,
     openObjectBrowser,
     openMongoGridFs,

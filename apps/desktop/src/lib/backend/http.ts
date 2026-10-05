@@ -205,7 +205,7 @@ import type { PluginToolPreview } from "@/types/pluginAiTools";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import type { MigrationPreflight, MigrationReport } from "./migration";
 export type { MigrationPreflight, MigrationReport } from "./migration";
-export const migrationStatus = (): Promise<MigrationPreflight> => get("/api/migration/status");
+export const migrationStatus = (retry = false): Promise<MigrationPreflight> => get(`/api/migration/status${retry ? "?retry=true" : ""}`);
 export const migrationStart = (): Promise<MigrationReport> => post("/api/migration/start", {});
 export const migrationRetry = (): Promise<MigrationReport> => post("/api/migration/retry", {});
 export const migrationCleanupBackups = (): Promise<void> => post("/api/migration/cleanup-backups", {});
@@ -3513,7 +3513,7 @@ export async function exportQueryResultsXlsx(
   _dateTimeFormat?: string,
 ): Promise<void> {
   const { buildXlsxWorkbookMulti } = await import("@/lib/export/xlsxExport");
-  const workbook = buildXlsxWorkbookMulti(autoFilter === undefined ? worksheets : worksheets.map((worksheet) => ({ ...worksheet, autoFilter })));
+  const workbook = buildXlsxWorkbookMulti(autoFilter === undefined ? worksheets : worksheets.map((worksheet) => ({ ...worksheet, autoFilter: worksheet.autoFilter ?? autoFilter })));
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
   const blob = new Blob([new Uint8Array(workbook)], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

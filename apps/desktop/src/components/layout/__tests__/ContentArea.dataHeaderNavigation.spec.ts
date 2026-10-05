@@ -1,13 +1,22 @@
 // @vitest-environment happy-dom
 
-import { createApp, h, nextTick, reactive, type App } from "vue";
+import { createApp, h, nextTick, reactive, ref, type App } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
 vi.mock("@/components/editor/QueryEditor.vue", () => ({ default: { render: () => null } }));
-vi.mock("@/components/grid/DataGrid.vue", () => ({ default: { render: () => null } }));
+const mocks = vi.hoisted(() => ({ openTableStructureEditor: vi.fn(() => true) }));
+vi.mock("@/components/grid/DataGrid.vue", () => ({
+  __esModule: true,
+  default: {
+    setup(_props: unknown, { expose }: { expose: (value: unknown) => void }) {
+      expose({ canOpenTableStructureEditor: true, openTableStructureEditor: mocks.openTableStructureEditor });
+      return () => null;
+    },
+  },
+}));
 
 import ContentArea from "../ContentArea.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -53,9 +62,11 @@ async function mountDataTab() {
   store.switchTab(tab.id);
   const host = document.createElement("div");
   document.body.appendChild(host);
+  const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
   const app = createApp({
     setup: () => () =>
       h(ContentArea, {
+        ref: contentAreaRef,
         activeTab: tab,
         activeConnection: connection,
         activeOutputView: "result",
@@ -72,10 +83,31 @@ async function mountDataTab() {
   app.mount(host);
   mounted.push({ app, host });
   await nextTick();
-  return { host, store, tab };
+  return { host, store, tab, contentAreaRef };
 }
 
 describe("table data header navigation", () => {
+  it("delegates openTableStructureEditor to the data grid for active table data tabs", async () => {
+    const { contentAreaRef, tab } = await mountDataTab();
+    tab.result = { columns: [], rows: [], affected_rows: 0, execution_time_ms: 0 };
+    await vi.waitFor(() => expect(contentAreaRef.value?.openTableStructureEditor()).toBe(true));
+    expect(mocks.openTableStructureEditor).toHaveBeenCalledWith("columns");
+
+    tab.mode = "query";
+    await nextTick();
+    expect(contentAreaRef.value?.openTableStructureEditor()).toBe(false);
+  });
+
+  it("opens the columns editor from the header beside the table controls", async () => {
+    const { host, tab } = await mountDataTab();
+    tab.result = { columns: [], rows: [], affected_rows: 0, execution_time_ms: 0 };
+    await vi.waitFor(() => expect(host.querySelector("[data-edit-table-structure]")).not.toBeNull());
+    const button = host.querySelector<HTMLButtonElement>("[data-edit-table-structure]")!;
+    expect(button.closest("[data-grid-root]")).toBeNull();
+    button.click();
+    expect(mocks.openTableStructureEditor).toHaveBeenCalledWith("columns");
+  });
+
   it.each([false, true])("opens the connection browser, reusing an existing tab: %s", async (alreadyOpen) => {
     const { host, store, tab } = await mountDataTab();
     const existingId = alreadyOpen ? store.openDatabaseBrowser(connection.id) : undefined;

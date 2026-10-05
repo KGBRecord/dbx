@@ -392,7 +392,7 @@ test("treats -- as a line comment, matching the editor's SQL language mode", () 
   assert.deepEqual(labels("db.users.find({ -- fi", { fields }), []);
   assert.deepEqual(labels("db.users.find({ age: { -- $", { fields }), []);
   // Code after a closed `--` line still completes.
-  assert.deepEqual(labels("db.users.find({ name: 1, -- note\n  na", { fields }), ["name"]);
+  assert.deepEqual(labels("db.users.find({ createdAt: 1, -- note\n  na", { fields }), ["name"]);
   // A double dash inside a string value is not a comment.
   assert.deepEqual(labels('db.users.find({ note: "a--b", na', { fields }), ["name"]);
 });
@@ -437,14 +437,42 @@ test("offers whole-filter operators at the top level and field operators under a
   assert.ok(bare.includes("$or"));
 });
 
-test("treats $and / $or sub-filters, $elemMatch bodies and $match as filters", () => {
-  for (const text of ["db.users.find({ $or: [{ $", "db.users.find({ items: { $elemMatch: { $", "db.users.aggregate([{ $match: { $"]) {
+test("treats $and / $or sub-filters and $match as filters", () => {
+  for (const text of ["db.users.find({ $or: [{ $", "db.users.aggregate([{ $match: { $"]) {
     const items = labels(text, { fields });
     assert.ok(items.includes("$or"), text);
     assert.equal(items.includes("$gte"), false, text);
   }
   assert.ok(labels("db.users.find({ $or: [{ ", { fields }).includes("name"));
   assert.ok(labels("db.users.find({ $or: [{ age: { $", { fields }).includes("$gte"));
+});
+
+test("completes $elemMatch body with field names, field query operators and logical operators", () => {
+  const findItems = labels("db.users.find({ tags: { $elemMatch: { $", { fields });
+  for (const op of ["$gte", "$lt", "$in", "$regex", "$exists", "$and", "$or", "$nor"]) {
+    assert.ok(findItems.includes(op), `find $elemMatch must include ${op}`);
+  }
+  for (const op of ["$expr", "$text", "$where", "$jsonSchema"]) {
+    assert.equal(findItems.includes(op), false, `find $elemMatch must exclude ${op}`);
+  }
+
+  const bare = labels("db.users.find({ tags: { $elemMatch: { ", { fields });
+  assert.ok(
+    bare.slice(0, fields.length).every((label) => !label.startsWith("$")),
+    `fields first: ${bare.join(", ")}`,
+  );
+  assert.deepEqual(bare.slice(0, fields.length), ["_id", "createdAt", "name", "profile.email"]);
+
+  assert.ok(labels("db.users.find({ tags: { $elemMatch: { qty: { $", { fields }).includes("$gte"));
+  assert.ok(labels("db.users.find({ tags: { $elemMatch: { $or: [{ ", { fields }).includes("name"));
+
+  const aggItems = labels("db.users.aggregate([{ $match: { tags: { $elemMatch: { $", { fields });
+  for (const op of ["$gte", "$lt", "$in", "$regex", "$exists", "$and", "$or", "$nor"]) {
+    assert.ok(aggItems.includes(op), `aggregate $elemMatch must include ${op}`);
+  }
+  for (const op of ["$expr", "$text", "$where", "$jsonSchema"]) {
+    assert.equal(aggItems.includes(op), false, `aggregate $elemMatch must exclude ${op}`);
+  }
 });
 
 test("does not offer filter operators in update or insert documents", () => {
@@ -1016,6 +1044,10 @@ test("suggests projection operators in find projections", () => {
   assert.deepEqual(labels("db.users.find({}, { tags: { $elemMatch: { ", { fields }).slice(0, 3), ["_id", "createdAt", "name"]);
   assert.ok(labels("db.users.find({}, { tags: { $elemMatch: { score: { ", { fields }).includes("$gt"));
   assert.ok(labels("db.users.find({}, { tags: { $elemMatch: { score: { $gt: ", { fields }).includes("NumberInt"));
+  const projElemMatch = labels("db.users.find({}, { tags: { $elemMatch: { $", { fields });
+  assert.ok(projElemMatch.includes("$gte"));
+  assert.ok(projElemMatch.includes("$or"));
+  assert.equal(projElemMatch.includes("$expr"), false);
 });
 
 test("every suggested projection operator parses", () => {
@@ -1595,8 +1627,9 @@ test("completes runCommand command names and their collection arguments", () => 
   assert.deepEqual(labels('db.runCommand({ collStats: "', { collections }), collections);
   assert.deepEqual(labels('db.runCommand({ find: "us', { collections }), ["users", "user_events"]);
   assert.deepEqual(labels('db.runCommand({ ping: "', { collections }), []);
-  // A second key still completes commands, and `db.` offers the helper.
-  assert.ok(labels('db.runCommand({ find: "users", ').includes("find"));
+  // A second key still completes commands (and drops the used command), and `db.` offers the helper.
+  assert.ok(labels('db.runCommand({ find: "users", ').includes("ping"));
+  assert.equal(labels('db.runCommand({ find: "users", ').includes("find"), false);
   assert.ok(labels("db.").includes("runCommand"));
 });
 
@@ -1745,6 +1778,35 @@ test("treats extended JSON wrappers as scalars, not subdocuments", () => {
   assert.ok(inferred.find((field) => field.name === "raw" && field.type === "binary"));
   // Genuine subdocuments are still walked.
   assert.ok(inferred.find((field) => field.name === "profile.email" && field.type === "string"));
+});
+
+test("infers BSON types from extended JSON values and legacy ISODate strings", () => {
+  const inferred = inferMongoCompletionFields([
+    {
+      createdAt: { $date: "2026-01-01T00:00:00Z" },
+      ref: { $oid: "65f0c0ffee0000000000abcd" },
+      price: { $numberDecimal: "1.5" },
+    },
+  ]);
+
+  for (const phantom of ["createdAt.$date", "ref.$oid", "price.$numberDecimal"]) {
+    assert.equal(
+      inferred.some((field) => field.name === phantom),
+      false,
+      phantom,
+    );
+  }
+
+  assert.equal(inferred.find((field) => field.name === "createdAt")?.type, "date");
+  assert.equal(inferred.find((field) => field.name === "ref")?.type, "objectId");
+  assert.equal(inferred.find((field) => field.name === "price")?.type, "decimal128");
+
+  const legacyInferred = inferMongoCompletionFields([
+    {
+      createdAt: 'ISODate("2026-01-01T00:00:00Z")',
+    },
+  ]);
+  assert.equal(legacyInferred.find((field) => field.name === "createdAt")?.type, "date");
 });
 
 test("infers dotted MongoDB fields from sampled documents", () => {
@@ -1963,4 +2025,393 @@ test("handles from values containing commas or braces without confusing scan", (
 
   const braceFrom = getMongoCompletionContext('db.users.aggregate([{ $lookup: { from: "orders{2024}", foreignField: "', 'db.users.aggregate([{ $lookup: { from: "orders{2024}", foreignField: "'.length);
   assert.equal(braceFrom.collection, "orders{2024}");
+});
+
+// A `db.other.` inside a string or a comment is literal content. Reading it as the command under
+// the cursor loads the wrong collection's fields, and — when the literal happens to be preceded
+// by a space — even swaps the whole method list to that collection.
+test("reads the active collection from code, not from string or comment contents", () => {
+  const comment = "db.users.find({ /* db.orders. */ na";
+  const string = 'db.users.find({ note: "db.orders." }, na';
+  const singleQuoted = "db.users.find({ note: 'db.orders.' , na";
+
+  assert.equal(getMongoCompletionContext(comment, comment.length).collection, "users");
+  assert.equal(getMongoCompletionContext(string, string.length).collection, "users");
+  assert.equal(getMongoCompletionContext(singleQuoted, singleQuoted.length).collection, "users");
+
+  // An unterminated string whose contents start with a space must not look like a `db.` root.
+  for (const text of ['db.users.find({ note: " db.orders.', "db.users.find({ note: ' x db.orders.", 'db.users.find({ a: "x" }, { b: " db.orders.']) {
+    const context = getMongoCompletionContext(text, text.length);
+    assert.equal(context.collection, "users", text);
+    assert.notEqual(context.mode, "collectionOrMethod", text);
+    assert.deepEqual(labels(text, { collections }), [], text);
+  }
+
+  // A quoted name in a real root still resolves, even though the same regexes match it.
+  const dotted = 'db.getCollection("audit.logs").find({ na';
+  const sibling = 'db.getSiblingDB("analytics").users.find({ na';
+  assert.equal(getMongoCompletionContext(dotted, dotted.length).collection, "audit.logs");
+  assert.equal(getMongoCompletionContext(sibling, sibling.length).collection, "users");
+});
+
+// `findMatchingParen` walks the find() chain, so a comment in the arguments must not unbalance it:
+// an unmatched parenthesis in a comment there used to hide the call's own `)`.
+test("keeps the find chain completable when a comment holds an unbalanced parenthesis", () => {
+  const open = "db.users.find({ /* ( */ status: 1 }).li";
+  const close = "db.users.find({ /* ) */ status: 1 }).li";
+  const balanced = "db.users.find({ /* (legacy) */ status: 1 }).li";
+  const lineComment = "db.users.find({\n  // filter by (legacy) status\n  status: 1\n}).li";
+
+  assert.equal(getMongoCompletionContext(open, open.length).mode, "cursorMethod");
+  assert.equal(getMongoCompletionContext(close, close.length).mode, "cursorMethod");
+  assert.deepEqual(labels(open, { fields }), ["limit"]);
+  assert.deepEqual(labels(close, { fields }), ["limit"]);
+  // Balanced parentheses, line comments and strings were already handled; keep them working.
+  assert.deepEqual(labels(balanced, { fields }), ["limit"]);
+  assert.deepEqual(labels(lineComment, { fields }), ["limit"]);
+  assert.deepEqual(labels('db.users.find({ note: "(x" }).li', { fields }), ["limit"]);
+});
+
+test("replaces typed new keyword when completing new Date", () => {
+  // Bad case 1: cursor after `new D`
+  const text1 = "db.users.find({ name: new D";
+  const cursor1 = text1.length;
+  const context1 = getMongoCompletionContext(text1, cursor1);
+  const items1 = buildMongoCompletionItems(text1, cursor1, { fields });
+  const item1 = items1.find((candidate) => candidate.label === "new Date");
+  assert.ok(item1);
+  assert.equal(context1.from, text1.indexOf("new D"));
+  assert.equal(context1.prefix, "new D");
+  assert.equal(item1.apply, 'new Date("${date}")');
+  const inserted1 = text1.slice(0, context1.from) + item1.apply + text1.slice(cursor1);
+  assert.equal(inserted1, 'db.users.find({ name: new Date("${date}")');
+  // Every shell constructor accepts `new`, so matching the part after `new `
+  // keeps the other `…d…` constructors alongside `new Date`.
+  assert.deepEqual(
+    items1.map((candidate) => candidate.label),
+    ["ISODate", "ObjectId", "BinData", "new Date", "NumberDecimal", "UUID"],
+  );
+
+  // Bad case 2: cursor after `new ` (trailing space)
+  const text2 = "db.users.find({ name: new ";
+  const cursor2 = text2.length;
+  const context2 = getMongoCompletionContext(text2, cursor2);
+  const items2 = buildMongoCompletionItems(text2, cursor2, { fields });
+  const item2 = items2.find((candidate) => candidate.label === "new Date");
+  assert.ok(item2);
+  assert.equal(context2.from, text2.indexOf("new "));
+  assert.equal(context2.prefix, "new ");
+  assert.equal(item2.apply, 'new Date("${date}")');
+  const inserted2 = text2.slice(0, context2.from) + item2.apply + text2.slice(cursor2);
+  assert.equal(inserted2, 'db.users.find({ name: new Date("${date}")');
+  const labels2 = items2.map((candidate) => candidate.label);
+  assert.ok(labels2.includes("new Date"));
+  assert.ok(labels2.includes("ObjectId"));
+  assert.ok(labels2.includes("NumberLong"));
+  assert.equal(labels2.includes("null"), false, "literals are not constructible");
+  assert.equal(labels2.includes("true"), false);
+  assert.equal(labels2.includes("false"), false);
+
+  // `new O` finds the other constructible constructors (mongosh BSON classes accept `new`)
+  const text2b = "db.users.find({ name: new O";
+  const cursor2b = text2b.length;
+  const context2b = getMongoCompletionContext(text2b, cursor2b);
+  const items2b = buildMongoCompletionItems(text2b, cursor2b, { fields });
+  const item2b = items2b.find((candidate) => candidate.label === "ObjectId");
+  assert.ok(item2b);
+  assert.equal(context2b.from, text2b.indexOf("new O"));
+  assert.equal(item2b.apply, 'ObjectId("${id}")');
+  const inserted2b = text2b.slice(0, context2b.from) + item2b.apply + text2b.slice(cursor2b);
+  assert.equal(inserted2b, 'db.users.find({ name: ObjectId("${id}")');
+
+  // ValidFor regex allows typing after new in value mode
+  const pattern = getMongoCompletionResultValidFor(context1);
+  const isValid = (typed: string) => new RegExp(`^(?:${pattern.source})$`).test(typed);
+  assert.equal(isValid("new "), true);
+  assert.equal(isValid("new D"), true);
+  assert.equal(isValid("new Date"), true);
+  assert.equal(isValid("new Date("), false);
+
+  // Document query completion in filter mode
+  const docText = "{ name: new D";
+  const docCursor = docText.length;
+  const docContext = getMongoDocumentQueryCompletionContext(docText, docCursor, "filter");
+  assert.equal(docContext.from, docText.indexOf("new D"));
+  assert.equal(docContext.prefix, "new D");
+
+  // `ne` case unchanged
+  const text3 = "db.users.find({ name: ne";
+  const cursor3 = text3.length;
+  const context3 = getMongoCompletionContext(text3, cursor3);
+  const items3 = buildMongoCompletionItems(text3, cursor3, { fields });
+  const item3 = items3.find((candidate) => candidate.label === "new Date");
+  assert.ok(item3);
+  assert.equal(context3.from, text3.indexOf("ne"));
+  assert.equal(context3.prefix, "ne");
+  assert.equal(item3.apply, 'new Date("${date}")');
+  const inserted3 = text3.slice(0, context3.from) + item3.apply + text3.slice(cursor3);
+  assert.equal(inserted3, 'db.users.find({ name: new Date("${date}")');
+
+  // `{ name: "new D` (inside a string) unchanged
+  const text4 = 'db.users.find({ name: "new D';
+  const cursor4 = text4.length;
+  const context4 = getMongoCompletionContext(text4, cursor4);
+  const items4 = buildMongoCompletionItems(text4, cursor4, { fields });
+  assert.equal(context4.mode, "none");
+  assert.equal(context4.prefix, '"new D');
+  assert.deepEqual(items4, []);
+});
+
+test("offers $comment as a top-level query operator", () => {
+  const items = labels("db.users.find({ $c", { fields });
+  assert.ok(items.includes("$comment"), "db.users.find({ $c should offer $comment");
+
+  const snippet = buildMongoCompletionItems("db.users.find({ $comment", "db.users.find({ $comment".length, { fields }).find((item) => item.label === "$comment");
+  assert.equal(snippet?.apply, '$comment: "${comment}"');
+  assert.ok(parseMongoCommand('db.users.find({ status: "A", $comment: "audit" })'));
+});
+
+test("skips keys already present in the same object", () => {
+  // Query operator keys
+  const queryOps = labels("db.users.find({ age: { $gt: 1, $g", { fields });
+  assert.equal(queryOps.includes("$gt"), false, "expected no $gt in second operator position");
+  assert.ok(queryOps.includes("$gte"), "expected $gte to be offered");
+
+  // Filter fields
+  const filterKeys = labels('db.users.find({ name: "a", n', { fields });
+  assert.equal(filterKeys.includes("name"), false, "expected no `name` when name already present");
+
+  // Update operators
+  const updateOps = labels("db.users.updateOne({}, { $set: { a: 1 }, $s", { fields });
+  assert.equal(updateOps.includes("$set"), false, "expected no $set when $set already present");
+  assert.ok(updateOps.includes("$setOnInsert"), "expected $setOnInsert to remain available");
+
+  // Guards:
+  // find({ still lists all fields
+  assert.ok(labels("db.users.find({ ", { fields }).includes("name"));
+  // find({ age: { $ still lists $gt
+  assert.ok(labels("db.users.find({ age: { $", { fields }).includes("$gt"));
+
+  // Key after the cursor is also excluded
+  const textWithKeyAfterCursor = "db.users.find({ n , name: 1 })";
+  const cursor = textWithKeyAfterCursor.indexOf("n") + 1;
+  const itemsAfterCursor = buildMongoCompletionItems(textWithKeyAfterCursor, cursor, { fields }).map((item) => item.label);
+  assert.equal(itemsAfterCursor.includes("name"), false, "expected key after cursor to be excluded");
+});
+
+test("withholds scalar values in value position right after a top-level update operator", () => {
+  // At the root of an update document, $set: requires an object, so value position must be quiet (mode none)
+  const context = getMongoCompletionContext("db.users.updateOne({}, { $set: ", "db.users.updateOne({}, { $set: ".length);
+  assert.equal(context.mode, "none");
+  assert.deepEqual(labels("db.users.updateOne({}, { $set: ", { fields }), []);
+
+  // Applies to every UPDATE_OPERATORS key at the root of updateOne / updateMany / findOneAndUpdate and bulkWrite
+  assert.equal(getMongoCompletionContext("db.users.updateMany({}, { $inc: ", "db.users.updateMany({}, { $inc: ".length).mode, "none");
+  assert.equal(getMongoCompletionContext("db.users.findOneAndUpdate({}, { $unset: ", "db.users.findOneAndUpdate({}, { $unset: ".length).mode, "none");
+  assert.equal(getMongoCompletionContext("db.users.bulkWrite([{ updateOne: { filter: {}, update: { $set: ", "db.users.bulkWrite([{ updateOne: { filter: {}, update: { $set: ".length).mode, "none");
+
+  // Guard: values INSIDE the operator object ($set: { name: ) must keep the value list unchanged
+  const insideOperatorValues = labels("db.users.updateOne({}, { $set: { name: ", { fields });
+  assert.ok(insideOperatorValues.includes("ObjectId"));
+  assert.ok(insideOperatorValues.includes("ISODate"));
+  assert.ok(insideOperatorValues.includes("true"));
+
+  // Guard: pipeline-style updates are unaffected
+  assert.ok(labels("db.users.updateOne({}, [{ $", { fields }).includes("$set"));
+  assert.deepEqual(labels("db.users.updateOne({}, [{ $set: { ", { fields }), ["_id", "createdAt", "name", "profile.email"]);
+});
+
+test("completes bracket collection references db['name'] and db[\"name\"]", () => {
+  // Case 1: db["orders-2024"]. -> method mode, collection methods
+  const afterBracketDot = 'db["orders-2024"].';
+  const ctx1 = getMongoCompletionContext(afterBracketDot, afterBracketDot.length);
+  assert.equal(ctx1.mode, "method");
+  assert.equal(ctx1.collection, "orders-2024");
+  const labels1 = labels(afterBracketDot);
+  assert.ok(labels1.includes("find"));
+  assert.ok(labels1.includes("findOne"));
+  assert.ok(labels1.includes("aggregate"));
+
+  // Case 2: db['users'].fi (single quotes, prefix) -> method mode, filtered collection methods
+  const prefixedSingleQuote = "db['users'].fi";
+  const ctx2 = getMongoCompletionContext(prefixedSingleQuote, prefixedSingleQuote.length);
+  assert.equal(ctx2.mode, "method");
+  assert.equal(ctx2.collection, "users");
+  assert.equal(ctx2.prefix, "fi");
+  const labels2 = labels(prefixedSingleQuote);
+  assert.ok(labels2.includes("find"));
+  assert.ok(labels2.includes("findOne"));
+  assert.ok(labels2.includes("findOneAndUpdate"));
+  assert.equal(labels2.includes("db.collection.find"), false);
+
+  // Case 3: db["orders-2024"].find({ -> filterField mode, collection resolved for field completion
+  const findFilter = 'db["orders-2024"].find({';
+  const ctx3 = getMongoCompletionContext(findFilter, findFilter.length);
+  assert.equal(ctx3.mode, "filterField");
+  assert.equal(ctx3.collection, "orders-2024");
+  const labels3 = labels(findFilter, { fields });
+  assert.ok(labels3.includes("name"));
+  assert.ok(labels3.includes("createdAt"));
+
+  // Case 4: db["orders-2024"].find({}). -> cursor methods
+  const cursorChain = 'db["orders-2024"].find({}).';
+  const ctx4 = getMongoCompletionContext(cursorChain, cursorChain.length);
+  assert.equal(ctx4.mode, "cursorMethod");
+  assert.equal(ctx4.collection, "orders-2024");
+  const labels4 = labels(cursorChain);
+  assert.ok(labels4.includes("limit"));
+  assert.ok(labels4.includes("sort"));
+  assert.ok(labels4.includes("skip"));
+  assert.ok(labels4.includes("count"));
+  assert.ok(labels4.includes("toArray"));
+
+  // Case 5: db["orders-2024"].aggregate([{ $ -> aggregation stages with active collection
+  const aggStage = 'db["orders-2024"].aggregate([{ $';
+  const ctx5 = getMongoCompletionContext(aggStage, aggStage.length);
+  assert.equal(ctx5.mode, "stage");
+  assert.equal(ctx5.collection, "orders-2024");
+  const labels5 = labels(aggStage);
+  assert.ok(labels5.includes("$match"));
+  assert.ok(labels5.includes("$group"));
+  assert.ok(labels5.includes("$project"));
+
+  // Case 6: db[" -> collectionRef mode, quoted collection names
+  const bracketOpen = 'db["';
+  const ctx6 = getMongoCompletionContext(bracketOpen, bracketOpen.length);
+  assert.equal(ctx6.mode, "collectionRef");
+  assert.equal(ctx6.prefix, '"');
+  const items6 = buildMongoCompletionItems(bracketOpen, bracketOpen.length, { collections });
+  assert.ok(items6.some((item) => item.label === "users" && item.apply === '"users"'));
+  assert.ok(items6.some((item) => item.label === "order-items" && item.apply === '"order-items"'));
+
+  // Case 6b: db[""] with cursor between quotes consumes closing quote
+  const textQuoted = 'db[""]';
+  const cursorQuoted = textQuoted.indexOf('""') + 1;
+  const ctxQuoted = getMongoCompletionContext(textQuoted, cursorQuoted);
+  assert.equal(ctxQuoted.mode, "collectionRef");
+  assert.equal(ctxQuoted.replaceClosingQuote, '"');
+  const itemQuoted = buildMongoCompletionItems(textQuoted, cursorQuoted, { collections }).find((c) => c.label === "users");
+  assert.equal(itemQuoted?.replaceClosingQuote, '"');
+
+  // Case 7 & 8: Name containing '.' and '-' with both quote styles
+  const dottedName = "db['audit.logs'].find({";
+  const ctxDot = getMongoCompletionContext(dottedName, dottedName.length);
+  assert.equal(ctxDot.mode, "filterField");
+  assert.equal(ctxDot.collection, "audit.logs");
+  const dottedMethod = "db['audit.logs'].";
+  const ctxDotMethod = getMongoCompletionContext(dottedMethod, dottedMethod.length);
+  assert.equal(ctxDotMethod.mode, "method");
+  assert.equal(ctxDotMethod.collection, "audit.logs");
+  assert.ok(labels(dottedMethod).includes("find"));
+
+  // Case 9: db.getSiblingDB("shop")["orders"].find({ -> database "shop", collection "orders"
+  const siblingText = 'db.getSiblingDB("shop")["orders"].find({';
+  const ctxSibling = getMongoCompletionContext(siblingText, siblingText.length);
+  assert.equal(ctxSibling.mode, "filterField");
+  assert.equal(ctxSibling.collection, "orders");
+  assert.equal(ctxSibling.database, "shop");
+
+  const siblingMethod = 'db.getSiblingDB("shop")["orders"].';
+  const ctxSiblingMethod = getMongoCompletionContext(siblingMethod, siblingMethod.length);
+  assert.equal(ctxSiblingMethod.mode, "method");
+  assert.equal(ctxSiblingMethod.collection, "orders");
+  assert.equal(ctxSiblingMethod.database, "shop");
+  assert.ok(labels(siblingMethod).includes("find"));
+});
+
+test("suppresses completion after a dot following findOne", () => {
+  const text = "db.users.findOne({}).";
+  const context = getMongoCompletionContext(text, text.length);
+  assert.equal(context.mode, "none");
+  assert.deepEqual(labels(text, { collections, fields }), []);
+  assert.equal(shouldAutoOpenMongoCompletion(text, text.length), false);
+});
+
+test("suppresses completion after a dot following countDocuments", () => {
+  const text = "db.users.countDocuments({}).";
+  const context = getMongoCompletionContext(text, text.length);
+  assert.equal(context.mode, "none");
+  assert.deepEqual(labels(text, { collections, fields }), []);
+  assert.equal(shouldAutoOpenMongoCompletion(text, text.length), false);
+});
+
+test("suppresses completion after a dot following explain", () => {
+  const text = "db.users.explain().";
+  const context = getMongoCompletionContext(text, text.length);
+  assert.equal(context.mode, "none");
+  assert.deepEqual(labels(text, { collections, fields }), []);
+  assert.equal(shouldAutoOpenMongoCompletion(text, text.length), false);
+});
+
+test("suppresses completion after a dot and typed prefix following findOne", () => {
+  const text = "db.users.findOne({}).na";
+  const context = getMongoCompletionContext(text, text.length);
+  assert.equal(context.mode, "none");
+  assert.deepEqual(labels(text, { collections, fields }), []);
+});
+
+test("suppresses completion after a dot following a non-cursor call with masked parens in literals", () => {
+  for (const text of ['db.users.findOne({ note: "(x)" }).', "db.users.findOne({ /* ) */ }).", "db.users.findOne({}) ."]) {
+    const context = getMongoCompletionContext(text, text.length);
+    assert.equal(context.mode, "none", text);
+    assert.deepEqual(labels(text, { collections, fields }), [], text);
+    assert.equal(shouldAutoOpenMongoCompletion(text, text.length), false, text);
+  }
+  const typed = "db.users.findOne({}) .na";
+  assert.equal(getMongoCompletionContext(typed, typed.length).mode, "none");
+  assert.deepEqual(labels(typed, { collections, fields }), []);
+});
+
+test("preserves completion behavior for cursor chains, root triggers, and multiline statements", () => {
+  // cursor methods
+  assert.equal(getMongoCompletionContext("db.users.find({}).", "db.users.find({}).".length).mode, "cursorMethod");
+  assert.ok(labels("db.users.find({}).", { fields }).includes("sort"));
+
+  assert.equal(getMongoCompletionContext("db.users.find({}).sort({ name: 1 }).", "db.users.find({}).sort({ name: 1 }).".length).mode, "cursorMethod");
+  assert.ok(labels("db.users.find({}).sort({ name: 1 }).", { fields }).includes("limit"));
+
+  // aggregate cursor methods
+  assert.equal(getMongoCompletionContext("db.users.aggregate([]).", "db.users.aggregate([]).".length).mode, "cursorMethod");
+  assert.deepEqual(labels("db.users.aggregate([]).").sort(), ["pretty", "toArray"]);
+
+  // terminal cursor method count()
+  assert.equal(getMongoCompletionContext("db.users.find({}).count().", "db.users.find({}).count().".length).mode, "none");
+  assert.deepEqual(labels("db.users.find({}).count()."), []);
+
+  // db root dot / collection prefix / use / show / sh / empty doc
+  assert.equal(getMongoCompletionContext("db.", "db.".length).mode, "collection");
+  assert.ok(labels("db.", { collections }).includes("users"));
+
+  assert.equal(getMongoCompletionContext("db.us", "db.us".length).mode, "collection");
+  assert.ok(labels("db.us", { collections }).includes("users"));
+  assert.ok(labels("db.us", { collections }).includes("user_events"));
+
+  assert.equal(getMongoCompletionContext("use ", "use ".length).mode, "database");
+  assert.equal(getMongoCompletionContext("show ", "show ".length).mode, "showSubcommand");
+  assert.equal(getMongoCompletionContext("sh", "sh".length).mode, "root");
+  assert.equal(getMongoCompletionContext("", 0).mode, "root");
+
+  assert.equal(getMongoCompletionContext("db.users.find({ name: 'x' });\ndb.", "db.users.find({ name: 'x' });\ndb.".length).mode, "collection");
+  assert.ok(labels("db.users.find({ name: 'x' });\ndb.", { collections }).includes("users"));
+
+  // statement on a new line after a finished statement
+  assert.equal(getMongoCompletionContext("db.users.findOne({})\ndb.", "db.users.findOne({})\ndb.".length).mode, "collection");
+  assert.ok(labels("db.users.findOne({})\ndb.", { collections }).includes("users"));
+
+  assert.equal(getMongoCompletionContext("db.users.findOne({})\nfi", "db.users.findOne({})\nfi".length).mode, "root");
+  assert.ok(labels("db.users.findOne({})\nfi").includes("find"));
+});
+
+test("preserves auto-trigger and completion for getCollection and getSiblingDB dot chains", () => {
+  const getCollectionDot = 'db.getCollection("users").';
+  assert.equal(getMongoCompletionContext(getCollectionDot, getCollectionDot.length).mode, "method");
+  assert.equal(shouldAutoOpenMongoCompletion(getCollectionDot, getCollectionDot.length), true);
+
+  const siblingDbDot = 'db.getSiblingDB("shop").';
+  assert.equal(getMongoCompletionContext(siblingDbDot, siblingDbDot.length).mode, "collection");
+  assert.equal(shouldAutoOpenMongoCompletion(siblingDbDot, siblingDbDot.length), true);
+
+  const siblingGetCollectionDot = 'db.getSiblingDB("shop").getCollection("a").';
+  assert.equal(getMongoCompletionContext(siblingGetCollectionDot, siblingGetCollectionDot.length).mode, "method");
+  assert.equal(shouldAutoOpenMongoCompletion(siblingGetCollectionDot, siblingGetCollectionDot.length), true);
 });

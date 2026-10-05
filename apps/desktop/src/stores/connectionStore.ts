@@ -683,6 +683,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const connectInFlight = new Map<string, Promise<void>>();
   const disconnectInFlight = new Map<string, Promise<void>>();
   const disconnectInFlightScoped = new Map<string, boolean>();
+  const passwordChangeReconnectRequired = new Map<string, "retiring" | "ready">();
   const cancelDisconnectInFlight = new Map<string, Promise<void>>();
   const activeLocalConnectionAttempts = new Map<string, number>();
   const cancelledLocalConnectionAttempts = new Map<string, Set<number>>();
@@ -1642,6 +1643,7 @@ export const useConnectionStore = defineStore("connection", () => {
       easysearch: "Easysearch",
       meilisearch: "Meilisearch",
       solr: "Apache Solr",
+      couchdb: "Apache CouchDB",
       qdrant: "Qdrant",
       milvus: "Milvus",
       weaviate: "Weaviate",
@@ -1724,6 +1726,7 @@ export const useConnectionStore = defineStore("connection", () => {
       docs_notes_path: config.docs_notes_path?.trim() ? config.docs_notes_path.trim() : undefined,
       transport_layers: Array.isArray(config.transport_layers) ? config.transport_layers : [],
       show_system_schemas: config.show_system_schemas === true,
+      show_database_links: config.show_database_links !== false,
       sidebar_auto_load_all_tables: config.sidebar_auto_load_all_tables === true,
       connect_timeout_secs: connectTimeoutInherit ? settingsStore.editorSettings.globalConnectTimeoutSecs : config.connect_timeout_secs || 10,
       connect_timeout_inherit: connectTimeoutInherit,
@@ -1809,6 +1812,7 @@ export const useConnectionStore = defineStore("connection", () => {
       return !!node.connectionId && !!node.schema && isDefaultSchema(node.connectionId, node.schema);
     }
     if (node.type !== "database" && node.type !== "redis-db" && node.type !== "mongo-db") return false;
+    if (!settingsStore.editorSettings.sidebarPinDefaultDatabase) return false;
     return !!node.connectionId && typeof node.database === "string" && isDefaultDatabase(node.connectionId, node.database);
   }
 
@@ -1819,6 +1823,14 @@ export const useConnectionStore = defineStore("connection", () => {
   function syncPinnedTreeState(nodes: TreeNode[]) {
     syncPinnedTreeNodeStateInPlace(nodes, pinnedTreeNodeIds.value, pinnedTreeNodeOrder.value, isFixedPriorityTreeNode);
   }
+
+  watch(
+    () => settingsStore.editorSettings.sidebarPinDefaultDatabase,
+    () => {
+      syncPinnedTreeState(treeNodes.value);
+    },
+    { flush: "post" },
+  );
 
   function isConnectionUtilityNode(node: TreeNode): boolean {
     // dameng-users / dameng-roles must be here too: they are synthesized admin
@@ -2172,6 +2184,7 @@ export const useConnectionStore = defineStore("connection", () => {
   function buildOracleDatabaseLinksNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
     const config = getConfig(connectionId);
     if (!supportsOracleDatabaseLinks(effectiveDatabaseTypeForConnection(config))) return undefined;
+    if (config?.show_database_links === false) return undefined;
     const existing = existingConnectionNode?.children?.find((child) => child.type === "oracle-db-links");
     return { ...existing, id: `${connectionId}:__oracle_db_links`, label: "tree.databaseLinks", type: "oracle-db-links", connectionId, database: config?.database || "", isExpanded: existing?.isExpanded ?? false, children: existing?.children ?? [] };
   }
@@ -4457,7 +4470,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadMongoDatabases(connectionId);
     } else if (config.db_type === "dynamodb") {
       await loadDynamoDbTables(connectionId);
-    } else if (config.db_type === "elasticsearch" || config.db_type === "easysearch" || config.db_type === "meilisearch" || config.db_type === "solr") {
+    } else if (config.db_type === "elasticsearch" || config.db_type === "easysearch" || config.db_type === "meilisearch" || config.db_type === "solr" || config.db_type === "couchdb") {
       // Reload: list indices/cores.
       await loadElasticsearchIndices(connectionId);
     } else if (config.db_type === "milvus") {
@@ -4536,15 +4549,16 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function persistRememberedConnectionPassword(config: ConnectionConfig, rememberPassword: boolean, expectedConfigFingerprint: string): Promise<void> {
-    if (!rememberPassword) return;
+  async function persistRememberedConnectionPassword(config: ConnectionConfig, rememberPassword: boolean, expectedConfigFingerprint: string, localAttempt: number): Promise<void> {
+    if (!rememberPassword || !isCurrentLocalConnectionAttempt(config.id, localAttempt)) return;
     const index = connections.value.findIndex((connection) => connection.id === config.id);
     if (index < 0) return;
     if (connectionConfigFingerprint(connections.value[index]) !== expectedConfigFingerprint) return;
     const nextConnections = [...connections.value];
     nextConnections[index] = { ...nextConnections[index], password: config.password, save_password: true };
     await persistConnections(nextConnections);
-    if (connectionConfigFingerprint(connections.value[index]) !== expectedConfigFingerprint) {
+    const current = getConfig(config.id);
+    if (!isCurrentLocalConnectionAttempt(config.id, localAttempt) || !current || connectionConfigFingerprint(current) !== expectedConfigFingerprint) {
       await persistConnections();
       return;
     }
@@ -4569,12 +4583,19 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function connect(config: ConnectionConfig) {
     config = normalizeConnection(config);
+    const passwordChangeState = passwordChangeReconnectRequired.get(config.id);
+    if (passwordChangeState === "retiring") throw new Error(i18n.global.t("userAdmin.passwordChangedCleanupFailed"));
     const expectedConfigFingerprint = connectionConfigFingerprint(getConfig(config.id) ?? config);
     if (getBlockingDisconnectInFlight(config.id)) await waitForBlockingDisconnectInFlight(config.id);
+    if (passwordChangeReconnectRequired.get(config.id) !== passwordChangeState) throw new Error(i18n.global.t("userAdmin.passwordChangedReconnect"));
     const localAttempt = beginLocalConnectionAttempt(config.id);
     try {
       let rememberPassword = false;
-      if (connectionNeedsPasswordPrompt(config) && (await pluginConnectionPasswordPromptNeeded(config)) && !(await hasSessionCredential(config.id))) {
+      if (passwordChangeState === "ready") {
+        const prompted = await ensureConnectionPassword({ ...config, password: "", save_password: false }, true);
+        config = prompted.config;
+        rememberPassword = prompted.rememberPassword;
+      } else if (connectionNeedsPasswordPrompt(config) && (await pluginConnectionPasswordPromptNeeded(config)) && !(await hasSessionCredential(config.id))) {
         const prompted = await ensureConnectionPassword(config);
         config = prompted.config;
         rememberPassword = prompted.rememberPassword;
@@ -4591,11 +4612,13 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
       await syncMongoLegacyDriverFallback(id, config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
+      passwordChangeReconnectRequired.delete(config.id);
       activeConnectionId.value = id;
       connectedIds.value.add(id);
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(id, { ...config, id });
         await refreshConnectionIdentifierQuote(id, { ...config, id });
+        ensureLocalConnectionAttemptActive(config.id, localAttempt);
         // Compatibility modes warm asynchronously; the QueryEditor watcher and the
         // backend's own A-mode/EXISTS validation make a cold map safe.
         void refreshConnectionDatabaseModes(id, { ...config, id });
@@ -4627,18 +4650,18 @@ export const useConnectionStore = defineStore("connection", () => {
         });
       }
       try {
-        await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint);
+        await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint, localAttempt);
       } catch (error) {
-        setConnectionError(id, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
+        if (isCurrentLocalConnectionAttempt(config.id, localAttempt)) setConnectionError(id, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
       }
+      ensureLocalConnectionAttemptActive(config.id, localAttempt);
       return id;
     } catch (e) {
       if (isCancelledLocalConnectionAttempt(config.id, localAttempt)) {
-        clearConnectionError(config.id);
         throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       }
       if (isCancelledConnectionAttempt(e) || isSupersededConnectionAttempt(e)) {
-        clearConnectionError(config.id);
+        if (isCurrentLocalConnectionAttempt(config.id, localAttempt)) clearConnectionError(config.id);
       } else {
         recordConnectionError(config.id, e);
       }
@@ -4824,6 +4847,21 @@ export const useConnectionStore = defineStore("connection", () => {
     await api.forgetSessionCredential(connectionId);
   }
 
+  async function retirePasswordAfterChange(connectionId: string) {
+    passwordChangeReconnectRequired.set(connectionId, "retiring");
+    connections.value = connections.value.map((config) => (config.id === connectionId ? { ...config, password: "", save_password: false } : config));
+    const results = await Promise.allSettled([disconnect(connectionId), persistConnections()]);
+    try {
+      if (await api.sessionCredentialStatus(connectionId)) await api.forgetSessionCredential(connectionId);
+      if (results.some((result) => result.status === "rejected")) throw new Error();
+      passwordChangeReconnectRequired.set(connectionId, "ready");
+      setConnectionError(connectionId, i18n.global.t("userAdmin.passwordChangedReconnect"));
+    } catch {
+      setConnectionError(connectionId, i18n.global.t("userAdmin.passwordChangedCleanupFailed"));
+      throw new Error(i18n.global.t("userAdmin.passwordChangedCleanupFailed"));
+    }
+  }
+
   async function closeDatabaseConnection(connectionId: string, database: string) {
     if (hasSqlServerActivityTraceForConnection(connectionId, database)) await disposeSqlServerActivityTracesForConnection(connectionId, database);
     cancelObjectDdlLoadsForDatabase(connectionId, database);
@@ -4863,6 +4901,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function ensureConnected(connectionId: string, options: { activate?: boolean; verifyHealth?: boolean; forceReconnect?: boolean; allowPasswordPrompt?: boolean } = {}) {
+    if (passwordChangeReconnectRequired.has(connectionId)) throw new Error(i18n.global.t("userAdmin.passwordChangedReconnect"));
     if (!options.forceReconnect && connectedIds.value.has(connectionId)) {
       // Pure navigation can safely trust the existing connected state. Its
       // destination will perform the real API request, while blocking here on
@@ -4906,6 +4945,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     const expectedConfigFingerprint = connectionConfigFingerprint(config);
     if (getBlockingDisconnectInFlight(connectionId)) await waitForBlockingDisconnectInFlight(connectionId);
+    if (passwordChangeReconnectRequired.has(connectionId)) throw new Error(i18n.global.t("userAdmin.passwordChangedReconnect"));
     const existingConnect = connectInFlight.get(connectionId);
     if (existingConnect) {
       await existingConnect;
@@ -4940,32 +4980,33 @@ export const useConnectionStore = defineStore("connection", () => {
       if (config.db_type !== "plugin") {
         void refreshConnectedDatabaseInfo(connectionId, config);
         await refreshConnectionIdentifierQuote(connectionId, config);
+        ensureLocalConnectionAttemptActive(connectionId, localAttempt);
         void refreshConnectionDatabaseModes(connectionId, config);
       }
       markSuccessfulLocalConnectionAttempt(connectionId, localAttempt);
       markConnectionHealthChecked(connectionId);
       clearConnectionError(connectionId);
       try {
-        await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint);
+        await persistRememberedConnectionPassword(config, rememberPassword, expectedConfigFingerprint, localAttempt);
       } catch (error) {
-        setConnectionError(connectionId, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
+        if (isCurrentLocalConnectionAttempt(connectionId, localAttempt)) setConnectionError(connectionId, i18n.global.t("connection.rememberPasswordSaveFailed", { message: connectionErrorMessage(error) }));
       }
+      ensureLocalConnectionAttemptActive(connectionId, localAttempt);
     })();
     connectInFlight.set(connectionId, connectPromise);
     try {
       await connectPromise;
+      ensureLocalConnectionAttemptActive(connectionId, localAttempt);
       if (options.activate !== false) activeConnectionId.value = connectionId;
     } catch (e) {
       if (isCancelledLocalConnectionAttempt(connectionId, localAttempt)) {
-        clearConnectionError(connectionId);
         throw new Error(CONNECTION_ATTEMPT_CANCELLED_MESSAGE);
       }
       if (isCancelledConnectionAttempt(e)) {
-        clearConnectionError(connectionId);
+        if (isCurrentLocalConnectionAttempt(connectionId, localAttempt)) clearConnectionError(connectionId);
         throw e;
       }
       if (isSupersededConnectionAttempt(e) && connectedIds.value.has(connectionId)) {
-        clearConnectionError(connectionId);
         return;
       }
       // 后台搜索触发的重连失败只留一行提示，避免把完整驱动错误（如旧版 SQL Server 的 TLS 提示）
@@ -5019,18 +5060,22 @@ export const useConnectionStore = defineStore("connection", () => {
    * sidebar" guidance instead of triggering an interactive prompt from a
    * background re-init.
    */
-  async function repushPluginConnection(connectionId: string): Promise<void> {
+  async function repushPluginConnection(connectionId: string, options: { ignoreRecentHealthCheck?: boolean } = {}): Promise<boolean> {
     const config = getConfig(connectionId);
-    if (!config || config.db_type !== "plugin" || !connectedIds.value.has(connectionId)) return;
+    if (!config || config.db_type !== "plugin" || !connectedIds.value.has(connectionId)) return false;
     // A successful connect/health probe within the TTL means the sidebar open
     // (or a fresh restore connect) pushed the config moments ago and the
     // sidecar registry cannot plausibly be empty yet — skipping here keeps the
     // first open from paying a redundant disconnect+connect cycle on the
     // plugin's first `ready`. The 2s in-memory TTL dies with the frontend, so
-    // every realistic reload path still re-pushes.
-    if (hasRecentConnectionHealthCheck(connectionId)) return;
-    if (!(await canReconnectPluginConnectionWithoutPrompt(config))) return;
+    // every realistic reload path still re-pushes. The restore path overrides
+    // the skip: the SPA's boot restore can mark a connection healthy without
+    // ever delivering credentials to the sidecar, so trusting the TTL there
+    // strands the plugin with an empty registry (dbx-plugin-ssh#144).
+    if (!options.ignoreRecentHealthCheck && hasRecentConnectionHealthCheck(connectionId)) return false;
+    if (!(await canReconnectPluginConnectionWithoutPrompt(config))) return false;
     await ensureConnected(connectionId, { activate: false, forceReconnect: true, allowPasswordPrompt: false });
+    return true;
   }
 
   /**
@@ -5419,7 +5464,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     if (!connectedIds.value.has(connectionId)) return;
     const config = getConfig(connectionId);
-    if (!config || ["redis", "etcd", "zookeeper", "consul", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "solr", "milvus", "qdrant", "weaviate", "chromadb", "mq", "nacos", "salesforce"].includes(config.db_type)) return;
+    if (!config || ["redis", "etcd", "zookeeper", "consul", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "solr", "couchdb", "milvus", "qdrant", "weaviate", "chromadb", "mq", "nacos", "salesforce"].includes(config.db_type)) return;
     const node = findConnectionNode(connectionId);
     if (!node || node.type !== "connection" || hasConnectionMetadataChildren(node.children)) return;
     const scope = { kind: "connection-databases" as const, connectionId, driverProfile: metadataDriverProfile(config) };
@@ -5843,9 +5888,10 @@ export const useConnectionStore = defineStore("connection", () => {
       load = reclaimTreeNodeLoad(load, node);
       const isMeilisearch = getConfig(connectionId)?.db_type === "meilisearch";
       const isSolr = getConfig(connectionId)?.db_type === "solr";
+      const isCouchDb = getConfig(connectionId)?.db_type === "couchdb";
       const collections = isMeilisearch
         ? sortSidebarNames(await withMetadataLoadTimeout(connectionId, api.meilisearchListIndexes(connectionId), "Meilisearch indexes")).map((name) => ({ name, aliases: [] as string[] }))
-        : [...(await withMetadataLoadTimeout(connectionId, api.documentListCollections(connectionId, "default"), isSolr ? "Solr cores" : "Elasticsearch indices"))].sort((left, right) => compareSidebarNames(left.name, right.name));
+        : [...(await withMetadataLoadTimeout(connectionId, api.documentListCollections(connectionId, "default"), isSolr ? "Solr cores" : isCouchDb ? "CouchDB databases" : "Elasticsearch indices"))].sort((left, right) => compareSidebarNames(left.name, right.name));
       const indexNodes = collections.map((collection) => {
         const aliases = collection.aliases?.filter((alias) => alias.trim());
         return {
@@ -7359,6 +7405,7 @@ export const useConnectionStore = defineStore("connection", () => {
           connectionId,
           database,
           schema,
+          catalog: catalog || targetNode.catalog,
           tableName: table,
           meta: col,
         })),
@@ -7628,7 +7675,7 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "dynamodb") {
         await loadDynamoDbTables(node.connectionId);
-      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch" || config?.db_type === "solr") {
+      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch" || config?.db_type === "solr" || config?.db_type === "couchdb") {
         await loadElasticsearchIndices(node.connectionId);
       } else if (config?.db_type === "milvus") {
         await loadMilvusDatabases(node.connectionId);
@@ -8774,7 +8821,8 @@ export const useConnectionStore = defineStore("connection", () => {
       } catch {
         result = await api.mongoFindDocuments(connectionId, database, collection, 0, 100, "{}");
       }
-      const fields = inferMongoCompletionFields(result.documents ?? []);
+      const sampled = result.extended_documents?.length === result.documents.length ? result.extended_documents : result.documents;
+      const fields = inferMongoCompletionFields(sampled ?? []);
       mongoCompletionFieldsCache.value[cacheKey] = fields;
       evictOldestCacheEntries(mongoCompletionFieldsCache.value, COMPLETION_CACHE_MAX);
       return fields;
@@ -9179,6 +9227,16 @@ export const useConnectionStore = defineStore("connection", () => {
     return deduped;
   }
 
+  /// Engines whose CURRENT SCHEMA defaults to the login identity. An unqualified
+  /// reference resolves against the login schema there, so `listCompletionColumns`
+  /// falls back to the username instead of letting its schema-required early return
+  /// discard the lookup. A query tab hits that state when it never picked a schema
+  /// (`jdbcDialect.ts` records a new query tab or a reopened `.sql` file as the
+  /// cases). Dameng was the first engine fixed for this (#8301); DB2's CURRENT
+  /// SCHEMA is documented as the authorization ID of the session user, so it needs
+  /// the same fallback.
+  const LOGIN_SCHEMA_COMPLETION_TYPES = new Set(["dameng", "db2"]);
+
   async function listCompletionColumns(connectionId: string, database: string, table: string, schema?: string, context?: { clientSessionId?: string; version?: number; tableQuoted?: boolean; schemaQuoted?: boolean }, catalog?: string): Promise<SqlCompletionColumn[]> {
     const config = getConfig(connectionId);
     // Use the effective database type (e.g. a JDBC connection whose URL is
@@ -9192,7 +9250,8 @@ export const useConnectionStore = defineStore("connection", () => {
     const uppercaseUnquotedIdentifier = oracleIdentifier || effectiveDbType === "saphana";
     const completionTable = uppercaseUnquotedIdentifier && context?.tableQuoted === false ? table.toUpperCase() : table;
     const normalizedSchema = schema?.trim();
-    const rawCompletionSchema = effectiveDbType === "spanner" ? normalizedSchema : normalizedSchema || (effectiveDbType === "dameng" ? config?.username?.trim() || undefined : undefined);
+    const loginSchema = effectiveDbType && LOGIN_SCHEMA_COMPLETION_TYPES.has(effectiveDbType) ? config?.username?.trim() || undefined : undefined;
+    const rawCompletionSchema = effectiveDbType === "spanner" ? normalizedSchema : normalizedSchema || loginSchema;
     const completionSchema = uppercaseUnquotedIdentifier && rawCompletionSchema && context?.schemaQuoted === false ? rawCompletionSchema.toUpperCase() : rawCompletionSchema;
     const usesCurrentSchema = usesOracleCurrentSchemaCompletion(effectiveDbType, completionSchema);
     const hasCompletionSchema = completionSchema != null && (completionSchema !== "" || effectiveDbType === "spanner");
@@ -10222,6 +10281,7 @@ export const useConnectionStore = defineStore("connection", () => {
     databaseCompatibilityModes,
     isTreeNodePinned,
     orderByPinnedTreeNodes,
+    syncPinnedTreeState,
     toggleTreeNodePin,
     beginPinnedTreeNodeReorder,
     endPinnedTreeNodeReorder,
@@ -10271,6 +10331,7 @@ export const useConnectionStore = defineStore("connection", () => {
     handleConnectionLivenessMessage,
     metadataGenerationFor,
     disconnectAndForgetConnectionPassword,
+    retirePasswordAfterChange,
     hasSessionCredential,
     closeDatabaseConnection,
     ensureConnected,

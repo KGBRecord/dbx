@@ -26,6 +26,7 @@ import {
   GripVertical,
   HardDrive,
   Loader2,
+  LogOut,
   Moon,
   PackageSearch,
   Palette,
@@ -92,6 +93,7 @@ import {
   type DataGridFilterEditorView,
   type DataGridToolbarLayout,
   type MultiStatementDefaultView,
+  type DefaultExplainView,
   type ResultTabNamingMode,
   type OpenTabsRestoreMode,
   type AppCloseUnsavedTabsMode,
@@ -101,19 +103,24 @@ import {
   type TabGroupMode,
   type TabPlacement,
   type TabSortMode,
+  type WelcomePageMode,
   type UpdateDownloadSource,
   type CsvQuoteMode,
   type CsvNullMode,
   type CustomThemeColors,
   type CustomTheme,
+  DEFAULT_CUSTOM_THEMES,
   type McpConnectionPolicy,
   type McpGlobalPolicy,
   normalizeMcpGlobalPolicy,
   type ClickTableNavigationTarget,
   type EditorSettings,
+  type WebLogoPosition,
+  type SnippetTriggerKey,
   type SqlCompletionTriggerMode,
   type SqlTableCompletionSchemaQualification,
   type TableHoverLookupMode,
+  normalizeTabMaxWidth,
   SIDEBAR_INDENT_MIN,
   SIDEBAR_INDENT_MAX,
   SIDEBAR_FONT_SIZE_MIN,
@@ -328,7 +335,7 @@ import {
   type ToolbarVisibilityItem,
 } from "@/lib/settings/settingsSearch";
 import { LOCALE_OPTIONS } from "@/lib/app/localeOptions";
-import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields, writeWebDavBackupSelection } from "@/lib/webdav/webdavAutoUploadConfig";
+import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, readSyncMethod, writeWebDavAutoUploadFields, writeWebDavBackupSelection, writeSyncMethod, type SyncMethod } from "@/lib/webdav/webdavAutoUploadConfig";
 import { apiUrl, webPath } from "@/lib/common/webPath";
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, normalizeCustomFontFamilyInput, readableFontFamily, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSystemFontNames } from "@/lib/app/fontFamilyOptions";
@@ -501,6 +508,7 @@ const emit = defineEmits<{
   "open-mcp-settings": [];
   "open-update-center": [];
   "ai-config-deep-link-handled": [];
+  logout: [];
 }>();
 
 const hasAnyUpdate = computed(() => Boolean(props.appUpdateAvailable || (props.driverUpdateCount || 0) > 0 || props.jdbcUpdateAvailable || props.mcpUpdateAvailable || (props.pluginUpdateCount || 0) > 0));
@@ -649,7 +657,7 @@ const backgroundImageFileMissing = ref(false);
 // Set when the draft clears a configured image; the stored copy is only
 // deleted once the change is actually applied.
 let pendingBackgroundImageCleanup: string | null = null;
-const editCustomThemes = ref<CustomTheme[]>([...settingsStore.editorSettings.customThemes]);
+const editCustomThemes = ref<CustomTheme[]>([...(settingsStore.editorSettings.customThemes.length > 0 ? settingsStore.editorSettings.customThemes : DEFAULT_CUSTOM_THEMES)]);
 const editActiveCustomThemeId = ref(settingsStore.editorSettings.activeCustomThemeId);
 const editDataGridTypeColorSchemes = ref<DataGridTypeColorScheme[]>(cloneDataGridTypeColorSchemes(settingsStore.editorSettings.dataGridTypeColorSchemes));
 const editActiveDataGridTypeColorSchemeId = ref(settingsStore.editorSettings.activeDataGridTypeColorSchemeId);
@@ -682,6 +690,7 @@ const tableCompletionSchemaQualificationDescription = computed(() => {
 });
 const editInsertSpaceAfterCompletion = ref(settingsStore.editorSettings.insertSpaceAfterCompletion);
 const editSqlServerSpaceConfirmsCompletion = ref(settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion);
+const editFunctionCompletionIncludeParams = ref(settingsStore.editorSettings.functionCompletionIncludeParams);
 const showSqlServerSpaceConfirmsCompletion = computed(() => hasSqlServerConnection.value || settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion || editSqlServerSpaceConfirmsCompletion.value);
 const editSortCompletionColumnsAlphabetically = ref(settingsStore.editorSettings.sortCompletionColumnsAlphabetically);
 const editSelectFirstCompletionOnOpen = ref(settingsStore.editorSettings.selectFirstCompletionOnOpen);
@@ -708,12 +717,15 @@ const editContinueOnErrorOnBatch = ref(settingsStore.editorSettings.continueOnEr
 const editConfirmUnsavedSqlClose = ref(settingsStore.editorSettings.confirmUnsavedSqlClose);
 const editAppCloseUnsavedTabsMode = ref<AppCloseUnsavedTabsMode>(settingsStore.editorSettings.appCloseUnsavedTabsMode);
 const editSavedSqlOpenTargetMode = ref<SavedSqlOpenTargetMode>(settingsStore.editorSettings.savedSqlOpenTargetMode);
+const editWelcomePageMode = ref<WelcomePageMode>(settingsStore.editorSettings.welcomePageMode);
 const editAppLayout = ref(settingsStore.editorSettings.appLayout);
+const editWebLogoPosition = ref<WebLogoPosition>(settingsStore.editorSettings.webLogoPosition);
 const editTabLayout = ref(settingsStore.editorSettings.tabLayout);
 const editTabPlacement = ref<TabPlacement>(settingsStore.editorSettings.tabPlacement);
 const editColorizeConnectionTabs = ref(settingsStore.editorSettings.colorizeConnectionTabs);
 const editTabGroupMode = ref<TabGroupMode>(settingsStore.editorSettings.tabGroupMode);
 const editTabSortMode = ref<TabSortMode>(settingsStore.editorSettings.tabSortMode);
+const editTabMaxWidth = ref<number>(settingsStore.editorSettings.tabMaxWidth);
 const editShowTrayIcon = ref(settingsStore.desktopSettings.show_tray_icon);
 const editQuitOnClose = ref(settingsStore.desktopSettings.quit_on_close);
 const desktopCloseBehaviorResetPending = ref(false);
@@ -747,9 +759,13 @@ const dataGridFilterViewPreviewExpanded = ref(true);
 const editDataGridTextFilterPanelHeight = ref(settingsStore.editorSettings.dataGridTextFilterPanelHeight);
 const editDefaultAutoKeepResults = ref(settingsStore.editorSettings.defaultAutoKeepResults);
 const editMultiStatementDefaultView = ref<MultiStatementDefaultView>(settingsStore.editorSettings.multiStatementDefaultView);
+const editDefaultExplainView = ref<DefaultExplainView>(settingsStore.editorSettings.defaultExplainView);
 const editDataGridAutoTransposeSingleRow = ref(settingsStore.editorSettings.dataGridAutoTransposeSingleRow);
 const editDataGridCellDetailButtonVisible = ref(settingsStore.editorSettings.dataGridCellDetailButtonVisible);
+const editDataGridCellDetailDialogDefault = ref(settingsStore.editorSettings.dataGridCellDetailDialogDefault);
 const editDataGridCrosshairHighlight = ref(settingsStore.editorSettings.dataGridCrosshairHighlight);
+const editDataGridStripedRows = ref(settingsStore.editorSettings.dataGridStripedRows);
+const editDataGridZebraRowBg = ref(settingsStore.editorSettings.dataGridZebraRowBg);
 const editPageSize = ref(settingsStore.editorSettings.pageSize);
 const editTableOpenPageSize = ref(settingsStore.editorSettings.tableOpenPageSize);
 const editTableOpenSortMode = ref(settingsStore.editorSettings.tableOpenSortMode);
@@ -763,6 +779,7 @@ const editRegexMaxMatchCount = ref(settingsStore.editorSettings.regexMaxMatchCou
 const editAutoCalculateTotalRows = ref(settingsStore.editorSettings.autoCalculateTotalRows);
 const editFlatteningMultiLineText = ref(settingsStore.editorSettings.flatteningMultiLineText);
 const editDataGridShowWhitespace = ref(settingsStore.editorSettings.dataGridShowWhitespace);
+const editModelGenerationTemplates = ref(settingsStore.editorSettings.modelGenerationTemplates.map((template) => ({ ...template })));
 const editTableColumnTemplateRows = ref<TableColumnTemplateGridRow[]>(tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields));
 const editTableColumnTemplateDatabaseType = ref<DatabaseType>(TABLE_COLUMN_TEMPLATE_DATABASE_TYPES[0] ?? "mysql");
 const editSqlVariableSubstitutionEnabled = ref(settingsStore.editorSettings.sqlVariableSubstitutionEnabled);
@@ -842,8 +859,10 @@ const editRoutineSourceOpenMode = ref(settingsStore.editorSettings.routineSource
 const editSidebarTableSearchEnabled = ref(settingsStore.editorSettings.sidebarTableSearchEnabled);
 const editSidebarSearchOpenedDatabasesOnly = ref(settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly);
 const editAutoSelectActiveSidebarNode = ref(settingsStore.editorSettings.autoSelectActiveSidebarNode);
+const editSidebarPinDefaultDatabase = ref(settingsStore.editorSettings.sidebarPinDefaultDatabase);
 const editSidebarBrowseObjectsOnDatabaseActivation = ref(settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation);
 const editOpenTabsRestoreMode = ref<OpenTabsRestoreMode>(settingsStore.editorSettings.openTabsRestoreMode);
+const editAutoReloadRestoredDataTabsOnOpen = ref(settingsStore.editorSettings.autoReloadRestoredDataTabsOnOpen);
 const editDisconnectTabHandlingMode = ref<DisconnectTabHandlingMode>(settingsStore.editorSettings.disconnectTabHandlingMode);
 const editDeleteConnectionTabHandlingMode = ref<DeleteConnectionTabHandlingMode>(settingsStore.editorSettings.deleteConnectionTabHandlingMode);
 const editRememberConnectionDatabaseOnDelete = ref(settingsStore.editorSettings.rememberConnectionDatabaseOnDelete);
@@ -887,6 +906,8 @@ const editSidebarShowTooltips = ref(settingsStore.editorSettings.sidebarShowTool
 const editSidebarIndent = ref(settingsStore.editorSettings.sidebarIndent);
 const editSidebarFontSize = ref(settingsStore.editorSettings.sidebarFontSize);
 const editExportBatchSize = ref(settingsStore.editorSettings.exportBatchSize);
+const editPreferredExportPath = ref(settingsStore.editorSettings.preferredExportPath);
+const editAutoOpenExportFolder = ref(settingsStore.editorSettings.autoOpenExportFolder);
 const editCsvQuoteMode = ref<CsvQuoteMode>(settingsStore.editorSettings.csvQuoteMode);
 const editCsvNullMode = ref<CsvNullMode>(settingsStore.editorSettings.csvNullMode);
 const editGlobalDateTimeDisplayFormat = ref(settingsStore.editorSettings.globalDateTimeDisplayFormat);
@@ -959,6 +980,7 @@ function editableSnippet(snippet: SqlSnippet): SqlSnippet {
 }
 
 const editSnippets = ref<SqlSnippet[]>(settingsStore.editorSettings.snippets.map(editableSnippet));
+const editSnippetTriggerKey = ref<SnippetTriggerKey>(settingsStore.editorSettings.snippetTriggerKey);
 
 function editableSqlShortcut(action: SqlShortcutAction): SqlShortcutAction {
   const next: SqlShortcutAction = { ...action, enabled: action.enabled !== false };
@@ -1059,6 +1081,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     tableCompletionSchemaQualification: editTableCompletionSchemaQualification.value,
     insertSpaceAfterCompletion: editInsertSpaceAfterCompletion.value,
     sqlServerSpaceConfirmsCompletion: editSqlServerSpaceConfirmsCompletion.value,
+    functionCompletionIncludeParams: editFunctionCompletionIncludeParams.value,
     sortCompletionColumnsAlphabetically: editSortCompletionColumnsAlphabetically.value,
     selectFirstCompletionOnOpen: editSelectFirstCompletionOnOpen.value,
     completionTriggerMode: editCompletionTriggerMode.value,
@@ -1075,12 +1098,15 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     confirmUnsavedSqlClose: editConfirmUnsavedSqlClose.value,
     appCloseUnsavedTabsMode: editAppCloseUnsavedTabsMode.value,
     savedSqlOpenTargetMode: editSavedSqlOpenTargetMode.value,
+    welcomePageMode: editWelcomePageMode.value,
     appLayout: editAppLayout.value,
+    webLogoPosition: editWebLogoPosition.value,
     tabLayout: editTabLayout.value,
     tabPlacement: editTabPlacement.value,
     colorizeConnectionTabs: editColorizeConnectionTabs.value,
     tabGroupMode: editTabGroupMode.value,
     tabSortMode: editTabSortMode.value,
+    tabMaxWidth: editTabMaxWidth.value,
     showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
     showColumnTypesInHeader: editShowColumnTypesInHeader.value,
     showColumnHeaderTooltips: editShowColumnHeaderTooltips.value,
@@ -1100,11 +1126,16 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     dataGridTextFilterPanelHeight: editDataGridTextFilterPanelHeight.value,
     defaultAutoKeepResults: editDefaultAutoKeepResults.value,
     multiStatementDefaultView: editMultiStatementDefaultView.value,
+    defaultExplainView: editDefaultExplainView.value,
     dataGridAutoTransposeSingleRow: editDataGridAutoTransposeSingleRow.value,
     dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible.value,
+    dataGridCellDetailDialogDefault: editDataGridCellDetailDialogDefault.value,
     dataGridCrosshairHighlight: editDataGridCrosshairHighlight.value,
+    dataGridStripedRows: editDataGridStripedRows.value,
+    dataGridZebraRowBg: editDataGridZebraRowBg.value,
     flatteningMultiLineText: editFlatteningMultiLineText.value,
     dataGridShowWhitespace: editDataGridShowWhitespace.value,
+    modelGenerationTemplates: editModelGenerationTemplates.value,
     pageSize: editPageSize.value,
     tableOpenPageSize: editTableOpenPageSize.value,
     tableOpenSortMode: editTableOpenSortMode.value,
@@ -1125,8 +1156,10 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     sidebarTableSearchEnabled: editSidebarTableSearchEnabled.value,
     sidebarSearchOpenedDatabasesOnly: editSidebarSearchOpenedDatabasesOnly.value,
     autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode.value,
+    sidebarPinDefaultDatabase: editSidebarPinDefaultDatabase.value,
     sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation.value,
     openTabsRestoreMode: editOpenTabsRestoreMode.value,
+    autoReloadRestoredDataTabsOnOpen: editAutoReloadRestoredDataTabsOnOpen.value,
     disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
     deleteConnectionTabHandlingMode: editDeleteConnectionTabHandlingMode.value,
     rememberConnectionDatabaseOnDelete: editRememberConnectionDatabaseOnDelete.value,
@@ -1156,6 +1189,8 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     redisKeyTemplates: normalizeRedisKeyTemplates(editRedisKeyTemplates.value),
     redisDatabaseDisplayLimit: editRedisDatabaseDisplayLimit.value,
     exportBatchSize: editExportBatchSize.value,
+    preferredExportPath: editPreferredExportPath.value,
+    autoOpenExportFolder: editAutoOpenExportFolder.value,
     csvQuoteMode: editCsvQuoteMode.value,
     csvNullMode: editCsvNullMode.value,
     globalDateTimeDisplayFormat: editGlobalDateTimeDisplayFormat.value,
@@ -1167,6 +1202,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     updateDownloadSource: editUpdateDownloadSource.value,
     toolbarItems: { ...editToolbarItems.value },
     snippets: editSnippets.value,
+    snippetTriggerKey: editSnippetTriggerKey.value,
     sqlShortcuts: editSqlShortcuts.value,
     sqlVariableSubstitutionEnabled: editSqlVariableSubstitutionEnabled.value,
     sqlVariableSyntaxOverrides: editSqlVariableSyntaxOverrides.value,
@@ -1711,8 +1747,8 @@ function syncEditorSettingsDraftFromStore() {
   editTheme.value = settingsStore.editorSettings.theme;
   editBackgroundImage.value = cloneBackgroundImageDraft(settingsStore.editorSettings.backgroundImage);
   pendingBackgroundImageCleanup = null;
-  editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
-  editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
+  editCustomThemes.value = [...(settingsStore.editorSettings.customThemes.length > 0 ? settingsStore.editorSettings.customThemes : DEFAULT_CUSTOM_THEMES)];
+  editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId || editCustomThemes.value[0]?.id || "default";
   editExecuteMode.value = settingsStore.editorSettings.executeMode;
   editDefaultTransactionMode.value = settingsStore.editorSettings.defaultTransactionMode;
   editKeepExplicitTransactionInAutoCommit.value = settingsStore.editorSettings.keepExplicitTransactionInAutoCommit;
@@ -1726,6 +1762,7 @@ function syncEditorSettingsDraftFromStore() {
   editTableCompletionSchemaQualification.value = settingsStore.editorSettings.tableCompletionSchemaQualification;
   editInsertSpaceAfterCompletion.value = settingsStore.editorSettings.insertSpaceAfterCompletion;
   editSqlServerSpaceConfirmsCompletion.value = settingsStore.editorSettings.sqlServerSpaceConfirmsCompletion;
+  editFunctionCompletionIncludeParams.value = settingsStore.editorSettings.functionCompletionIncludeParams;
   editSortCompletionColumnsAlphabetically.value = settingsStore.editorSettings.sortCompletionColumnsAlphabetically;
   editSelectFirstCompletionOnOpen.value = settingsStore.editorSettings.selectFirstCompletionOnOpen;
   editCompletionTriggerMode.value = settingsStore.editorSettings.completionTriggerMode;
@@ -1743,12 +1780,15 @@ function syncEditorSettingsDraftFromStore() {
   editConfirmUnsavedSqlClose.value = settingsStore.editorSettings.confirmUnsavedSqlClose;
   editAppCloseUnsavedTabsMode.value = settingsStore.editorSettings.appCloseUnsavedTabsMode;
   editSavedSqlOpenTargetMode.value = settingsStore.editorSettings.savedSqlOpenTargetMode;
+  editWelcomePageMode.value = settingsStore.editorSettings.welcomePageMode;
   editAppLayout.value = settingsStore.editorSettings.appLayout;
+  editWebLogoPosition.value = settingsStore.editorSettings.webLogoPosition;
   editTabLayout.value = settingsStore.editorSettings.tabLayout;
   editTabPlacement.value = settingsStore.editorSettings.tabPlacement;
   editColorizeConnectionTabs.value = settingsStore.editorSettings.colorizeConnectionTabs;
   editTabGroupMode.value = settingsStore.editorSettings.tabGroupMode;
   editTabSortMode.value = settingsStore.editorSettings.tabSortMode;
+  editTabMaxWidth.value = settingsStore.editorSettings.tabMaxWidth;
   editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
   editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
   editShowColumnHeaderTooltips.value = settingsStore.editorSettings.showColumnHeaderTooltips;
@@ -1768,11 +1808,16 @@ function syncEditorSettingsDraftFromStore() {
   editDataGridTextFilterPanelHeight.value = settingsStore.editorSettings.dataGridTextFilterPanelHeight;
   editDefaultAutoKeepResults.value = settingsStore.editorSettings.defaultAutoKeepResults;
   editMultiStatementDefaultView.value = settingsStore.editorSettings.multiStatementDefaultView;
+  editDefaultExplainView.value = settingsStore.editorSettings.defaultExplainView;
   editDataGridAutoTransposeSingleRow.value = settingsStore.editorSettings.dataGridAutoTransposeSingleRow;
   editDataGridCellDetailButtonVisible.value = settingsStore.editorSettings.dataGridCellDetailButtonVisible;
+  editDataGridCellDetailDialogDefault.value = settingsStore.editorSettings.dataGridCellDetailDialogDefault;
   editDataGridCrosshairHighlight.value = settingsStore.editorSettings.dataGridCrosshairHighlight;
+  editDataGridStripedRows.value = settingsStore.editorSettings.dataGridStripedRows;
+  editDataGridZebraRowBg.value = settingsStore.editorSettings.dataGridZebraRowBg;
   editFlatteningMultiLineText.value = settingsStore.editorSettings.flatteningMultiLineText;
   editDataGridShowWhitespace.value = settingsStore.editorSettings.dataGridShowWhitespace;
+  editModelGenerationTemplates.value = settingsStore.editorSettings.modelGenerationTemplates.map((template) => ({ ...template }));
   editPageSize.value = settingsStore.editorSettings.pageSize;
   editTableOpenPageSize.value = settingsStore.editorSettings.tableOpenPageSize;
   editTableOpenSortMode.value = settingsStore.editorSettings.tableOpenSortMode;
@@ -1794,8 +1839,10 @@ function syncEditorSettingsDraftFromStore() {
   editSidebarTableSearchEnabled.value = settingsStore.editorSettings.sidebarTableSearchEnabled;
   editSidebarSearchOpenedDatabasesOnly.value = settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly;
   editAutoSelectActiveSidebarNode.value = settingsStore.editorSettings.autoSelectActiveSidebarNode;
+  editSidebarPinDefaultDatabase.value = settingsStore.editorSettings.sidebarPinDefaultDatabase;
   editSidebarBrowseObjectsOnDatabaseActivation.value = settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation;
   editOpenTabsRestoreMode.value = settingsStore.editorSettings.openTabsRestoreMode;
+  editAutoReloadRestoredDataTabsOnOpen.value = settingsStore.editorSettings.autoReloadRestoredDataTabsOnOpen;
   editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
   editDeleteConnectionTabHandlingMode.value = settingsStore.editorSettings.deleteConnectionTabHandlingMode;
   editRememberConnectionDatabaseOnDelete.value = settingsStore.editorSettings.rememberConnectionDatabaseOnDelete;
@@ -1824,6 +1871,8 @@ function syncEditorSettingsDraftFromStore() {
   editSidebarIndent.value = settingsStore.editorSettings.sidebarIndent;
   editSidebarFontSize.value = settingsStore.editorSettings.sidebarFontSize;
   editExportBatchSize.value = settingsStore.editorSettings.exportBatchSize;
+  editPreferredExportPath.value = settingsStore.editorSettings.preferredExportPath;
+  editAutoOpenExportFolder.value = settingsStore.editorSettings.autoOpenExportFolder;
   editCsvQuoteMode.value = settingsStore.editorSettings.csvQuoteMode;
   editCsvNullMode.value = settingsStore.editorSettings.csvNullMode;
   editGlobalDateTimeDisplayFormat.value = settingsStore.editorSettings.globalDateTimeDisplayFormat;
@@ -1835,6 +1884,7 @@ function syncEditorSettingsDraftFromStore() {
   editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
   editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
   editSnippets.value = settingsStore.editorSettings.snippets.map(editableSnippet);
+  editSnippetTriggerKey.value = settingsStore.editorSettings.snippetTriggerKey;
   editSqlShortcuts.value = mergeDefaultSqlShortcuts(settingsStore.editorSettings.sqlShortcuts.map(editableSqlShortcut));
   editSqlVariableSubstitutionEnabled.value = settingsStore.editorSettings.sqlVariableSubstitutionEnabled;
   editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides);
@@ -1872,6 +1922,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   tableCompletionSchemaQualification: editTableCompletionSchemaQualification,
   insertSpaceAfterCompletion: editInsertSpaceAfterCompletion,
   sqlServerSpaceConfirmsCompletion: editSqlServerSpaceConfirmsCompletion,
+  functionCompletionIncludeParams: editFunctionCompletionIncludeParams,
   sortCompletionColumnsAlphabetically: editSortCompletionColumnsAlphabetically,
   selectFirstCompletionOnOpen: editSelectFirstCompletionOnOpen,
   wordWrap: editWordWrap,
@@ -1886,12 +1937,15 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   confirmUnsavedSqlClose: editConfirmUnsavedSqlClose,
   appCloseUnsavedTabsMode: editAppCloseUnsavedTabsMode,
   savedSqlOpenTargetMode: editSavedSqlOpenTargetMode,
+  welcomePageMode: editWelcomePageMode,
   appLayout: editAppLayout,
+  webLogoPosition: editWebLogoPosition,
   tabLayout: editTabLayout,
   tabPlacement: editTabPlacement,
   colorizeConnectionTabs: editColorizeConnectionTabs,
   tabGroupMode: editTabGroupMode,
   tabSortMode: editTabSortMode,
+  tabMaxWidth: editTabMaxWidth,
   showColumnCommentsInHeader: editShowColumnCommentsInHeader,
   showColumnTypesInHeader: editShowColumnTypesInHeader,
   showColumnHeaderTooltips: editShowColumnHeaderTooltips,
@@ -1911,9 +1965,13 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   dataGridTextFilterPanelHeight: editDataGridTextFilterPanelHeight,
   defaultAutoKeepResults: editDefaultAutoKeepResults,
   multiStatementDefaultView: editMultiStatementDefaultView,
+  defaultExplainView: editDefaultExplainView,
   dataGridAutoTransposeSingleRow: editDataGridAutoTransposeSingleRow,
   dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible,
+  dataGridCellDetailDialogDefault: editDataGridCellDetailDialogDefault,
   dataGridCrosshairHighlight: editDataGridCrosshairHighlight,
+  dataGridStripedRows: editDataGridStripedRows,
+  dataGridZebraRowBg: editDataGridZebraRowBg,
   pageSize: editPageSize,
   tableOpenPageSize: editTableOpenPageSize,
   tableOpenSortMode: editTableOpenSortMode,
@@ -1935,8 +1993,10 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   sidebarTableSearchEnabled: editSidebarTableSearchEnabled,
   sidebarSearchOpenedDatabasesOnly: editSidebarSearchOpenedDatabasesOnly,
   autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode,
+  sidebarPinDefaultDatabase: editSidebarPinDefaultDatabase,
   sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation,
   openTabsRestoreMode: editOpenTabsRestoreMode,
+  autoReloadRestoredDataTabsOnOpen: editAutoReloadRestoredDataTabsOnOpen,
   disconnectTabHandlingMode: editDisconnectTabHandlingMode,
   deleteConnectionTabHandlingMode: editDeleteConnectionTabHandlingMode,
   rememberConnectionDatabaseOnDelete: editRememberConnectionDatabaseOnDelete,
@@ -1966,6 +2026,8 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   redisKeyTemplates: editRedisKeyTemplates,
   redisDatabaseDisplayLimit: editRedisDatabaseDisplayLimit,
   exportBatchSize: editExportBatchSize,
+  preferredExportPath: editPreferredExportPath,
+  autoOpenExportFolder: editAutoOpenExportFolder,
   csvQuoteMode: editCsvQuoteMode,
   csvNullMode: editCsvNullMode,
   exportRowLimitEnabled: editExportRowLimitEnabled,
@@ -1977,6 +2039,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   updateDownloadSource: editUpdateDownloadSource,
   toolbarItems: editToolbarItems,
   snippets: editSnippets,
+  snippetTriggerKey: editSnippetTriggerKey,
   sqlShortcuts: editSqlShortcuts,
   sqlVariableSubstitutionEnabled: editSqlVariableSubstitutionEnabled,
   sqlVariableSyntaxOverrides: editSqlVariableSyntaxOverrides,
@@ -1986,6 +2049,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   defaultTransactionMode: editDefaultTransactionMode,
   keepExplicitTransactionInAutoCommit: editKeepExplicitTransactionInAutoCommit,
   tableColumnTemplateFields: editTableColumnTemplateRows,
+  modelGenerationTemplates: editModelGenerationTemplates,
 };
 
 function applyEditorSettingsKeysToRefs(draft: EditorSettingsDraft, keys: readonly EditorSettingsDraftKey[]) {
@@ -1993,6 +2057,7 @@ function applyEditorSettingsKeysToRefs(draft: EditorSettingsDraft, keys: readonl
     customThemes: (value) => [...(value as CustomTheme[])],
     dataGridTypeColorSchemes: (value) => cloneDataGridTypeColorSchemes(value as DataGridTypeColorScheme[]),
     tableColumnTemplateFields: (value) => tableColumnTemplateRowsFromSettings(value as string[]),
+    modelGenerationTemplates: (value) => (value as EditorSettings["modelGenerationTemplates"]).map((template) => ({ ...template })),
     shortcuts: (value) => normalizeShortcutSettings(value as Parameters<typeof normalizeShortcutSettings>[0]),
     sqlFormatter: (value) => normalizeSqlFormatterSettings(value as SqlFormatterSettings),
     sidebarHiddenTablePrefixes: (value) => (value as string[]).join("\n"),
@@ -2099,7 +2164,10 @@ const formatterEditorShortcutIds: ShortcutActionId[] = [
   "selectAll",
   "uppercaseSelection",
   "lowercaseSelection",
+  "toggleCaseSelection",
   "toggleFold",
+  "foldAll",
+  "unfoldAll",
 ];
 const formatterEditorShortcutDefinitions = computed(() => formatterEditorShortcutIds.map((id) => SHORTCUT_DEFINITIONS.find((definition) => definition.id === id)).filter((definition): definition is (typeof SHORTCUT_DEFINITIONS)[number] => !!definition));
 const filteredShortcutDefinitions = computed(() => {
@@ -2291,6 +2359,7 @@ async function persistSettings() {
     // result back into the input so an out-of-range draft doesn't keep
     // reporting unsaved changes after a successful apply.
     editRedisDatabaseDisplayLimit.value = settingsStore.editorSettings.redisDatabaseDisplayLimit;
+    editPreferredExportPath.value = settingsStore.editorSettings.preferredExportPath;
     // 同理：落盘口径可能改写键位（跨平台默认键、保留键回退），草稿要跟着回到
     // 落盘值，避免面板卡在“未保存”无法应用（#9881）。
     editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
@@ -2389,6 +2458,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editTableCompletionSchemaQualification.value = DEFAULT_EDITOR_SETTINGS.tableCompletionSchemaQualification;
     editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
     editSqlServerSpaceConfirmsCompletion.value = DEFAULT_EDITOR_SETTINGS.sqlServerSpaceConfirmsCompletion;
+    editFunctionCompletionIncludeParams.value = DEFAULT_EDITOR_SETTINGS.functionCompletionIncludeParams;
     editSortCompletionColumnsAlphabetically.value = DEFAULT_EDITOR_SETTINGS.sortCompletionColumnsAlphabetically;
     editSelectFirstCompletionOnOpen.value = DEFAULT_EDITOR_SETTINGS.selectFirstCompletionOnOpen;
     editCompletionTriggerMode.value = DEFAULT_EDITOR_SETTINGS.completionTriggerMode;
@@ -2422,12 +2492,15 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
     editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
     editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
+    editWelcomePageMode.value = DEFAULT_EDITOR_SETTINGS.welcomePageMode;
     editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
+    editWebLogoPosition.value = DEFAULT_EDITOR_SETTINGS.webLogoPosition;
     editTabLayout.value = DEFAULT_EDITOR_SETTINGS.tabLayout;
     editTabPlacement.value = DEFAULT_EDITOR_SETTINGS.tabPlacement;
     editColorizeConnectionTabs.value = DEFAULT_EDITOR_SETTINGS.colorizeConnectionTabs;
     editTabGroupMode.value = DEFAULT_EDITOR_SETTINGS.tabGroupMode;
     editTabSortMode.value = DEFAULT_EDITOR_SETTINGS.tabSortMode;
+    editTabMaxWidth.value = DEFAULT_EDITOR_SETTINGS.tabMaxWidth;
     editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
     editQuitOnClose.value = DEFAULT_DESKTOP_SETTINGS.quit_on_close;
     desktopCloseBehaviorResetPending.value = true;
@@ -2442,8 +2515,10 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editSidebarTableSearchEnabled.value = DEFAULT_EDITOR_SETTINGS.sidebarTableSearchEnabled;
     editSidebarSearchOpenedDatabasesOnly.value = DEFAULT_EDITOR_SETTINGS.sidebarSearchOpenedDatabasesOnly;
     editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
+    editSidebarPinDefaultDatabase.value = DEFAULT_EDITOR_SETTINGS.sidebarPinDefaultDatabase;
     editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
     editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
+    editAutoReloadRestoredDataTabsOnOpen.value = DEFAULT_EDITOR_SETTINGS.autoReloadRestoredDataTabsOnOpen;
     editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
     editDeleteConnectionTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.deleteConnectionTabHandlingMode;
     editRememberConnectionDatabaseOnDelete.value = DEFAULT_EDITOR_SETTINGS.rememberConnectionDatabaseOnDelete;
@@ -2485,11 +2560,16 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDataGridTextFilterPanelHeight.value = DEFAULT_EDITOR_SETTINGS.dataGridTextFilterPanelHeight;
     editDefaultAutoKeepResults.value = DEFAULT_EDITOR_SETTINGS.defaultAutoKeepResults;
     editMultiStatementDefaultView.value = DEFAULT_EDITOR_SETTINGS.multiStatementDefaultView;
+    editDefaultExplainView.value = DEFAULT_EDITOR_SETTINGS.defaultExplainView;
     editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
     editDataGridCellDetailButtonVisible.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
+    editDataGridCellDetailDialogDefault.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailDialogDefault;
     editDataGridCrosshairHighlight.value = DEFAULT_EDITOR_SETTINGS.dataGridCrosshairHighlight;
+    editDataGridStripedRows.value = DEFAULT_EDITOR_SETTINGS.dataGridStripedRows;
+    editDataGridZebraRowBg.value = DEFAULT_EDITOR_SETTINGS.dataGridZebraRowBg;
     editFlatteningMultiLineText.value = DEFAULT_EDITOR_SETTINGS.flatteningMultiLineText;
     editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
+    editModelGenerationTemplates.value = DEFAULT_EDITOR_SETTINGS.modelGenerationTemplates.map((template) => ({ ...template }));
     editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
     editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
     editTableOpenSortMode.value = DEFAULT_EDITOR_SETTINGS.tableOpenSortMode;
@@ -2506,6 +2586,8 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editRedisKeyTemplates.value = normalizeRedisKeyTemplates(DEFAULT_EDITOR_SETTINGS.redisKeyTemplates).join("\n");
     editRedisDatabaseDisplayLimit.value = DEFAULT_EDITOR_SETTINGS.redisDatabaseDisplayLimit;
     editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+    editPreferredExportPath.value = DEFAULT_EDITOR_SETTINGS.preferredExportPath;
+    editAutoOpenExportFolder.value = DEFAULT_EDITOR_SETTINGS.autoOpenExportFolder;
     editCsvQuoteMode.value = DEFAULT_EDITOR_SETTINGS.csvQuoteMode;
     editCsvNullMode.value = DEFAULT_EDITOR_SETTINGS.csvNullMode;
     editGlobalDateTimeDisplayFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeDisplayFormat;
@@ -2518,6 +2600,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   } else if (tab === "snippets") {
     editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+    editSnippetTriggerKey.value = DEFAULT_EDITOR_SETTINGS.snippetTriggerKey;
   } else if (tab === "updates") {
     editAutoUpdateApp.value = DEFAULT_EDITOR_SETTINGS.autoUpdateApp;
     editAutoUpdateDrivers.value = DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers;
@@ -2555,6 +2638,7 @@ function resetAllDefaults() {
   editTableCompletionSchemaQualification.value = DEFAULT_EDITOR_SETTINGS.tableCompletionSchemaQualification;
   editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
   editSqlServerSpaceConfirmsCompletion.value = DEFAULT_EDITOR_SETTINGS.sqlServerSpaceConfirmsCompletion;
+  editFunctionCompletionIncludeParams.value = DEFAULT_EDITOR_SETTINGS.functionCompletionIncludeParams;
   editSortCompletionColumnsAlphabetically.value = DEFAULT_EDITOR_SETTINGS.sortCompletionColumnsAlphabetically;
   editSelectFirstCompletionOnOpen.value = DEFAULT_EDITOR_SETTINGS.selectFirstCompletionOnOpen;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
@@ -2572,7 +2656,9 @@ function resetAllDefaults() {
   editSavedSqlOpenTargetMode.value = DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode;
   editSqlVariableSubstitutionEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled;
   editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(DEFAULT_EDITOR_SETTINGS.sqlVariableSyntaxOverrides);
+  editWelcomePageMode.value = DEFAULT_EDITOR_SETTINGS.welcomePageMode;
   editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
+  editWebLogoPosition.value = DEFAULT_EDITOR_SETTINGS.webLogoPosition;
   editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
   editQuitOnClose.value = DEFAULT_DESKTOP_SETTINGS.quit_on_close;
   desktopCloseBehaviorResetPending.value = true;
@@ -2598,11 +2684,16 @@ function resetAllDefaults() {
   editDataGridTextFilterPanelHeight.value = DEFAULT_EDITOR_SETTINGS.dataGridTextFilterPanelHeight;
   editDefaultAutoKeepResults.value = DEFAULT_EDITOR_SETTINGS.defaultAutoKeepResults;
   editMultiStatementDefaultView.value = DEFAULT_EDITOR_SETTINGS.multiStatementDefaultView;
+  editDefaultExplainView.value = DEFAULT_EDITOR_SETTINGS.defaultExplainView;
   editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
   editDataGridCellDetailButtonVisible.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
+  editDataGridCellDetailDialogDefault.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailDialogDefault;
   editDataGridCrosshairHighlight.value = DEFAULT_EDITOR_SETTINGS.dataGridCrosshairHighlight;
+  editDataGridStripedRows.value = DEFAULT_EDITOR_SETTINGS.dataGridStripedRows;
+  editDataGridZebraRowBg.value = DEFAULT_EDITOR_SETTINGS.dataGridZebraRowBg;
   editFlatteningMultiLineText.value = DEFAULT_EDITOR_SETTINGS.flatteningMultiLineText;
   editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
+  editModelGenerationTemplates.value = DEFAULT_EDITOR_SETTINGS.modelGenerationTemplates.map((template) => ({ ...template }));
   editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
   editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
   editTableOpenSortMode.value = DEFAULT_EDITOR_SETTINGS.tableOpenSortMode;
@@ -2624,8 +2715,10 @@ function resetAllDefaults() {
   editSidebarTableSearchEnabled.value = DEFAULT_EDITOR_SETTINGS.sidebarTableSearchEnabled;
   editSidebarSearchOpenedDatabasesOnly.value = DEFAULT_EDITOR_SETTINGS.sidebarSearchOpenedDatabasesOnly;
   editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
+  editSidebarPinDefaultDatabase.value = DEFAULT_EDITOR_SETTINGS.sidebarPinDefaultDatabase;
   editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
   editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
+  editAutoReloadRestoredDataTabsOnOpen.value = DEFAULT_EDITOR_SETTINGS.autoReloadRestoredDataTabsOnOpen;
   editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
   editDeleteConnectionTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.deleteConnectionTabHandlingMode;
   editRememberConnectionDatabaseOnDelete.value = DEFAULT_EDITOR_SETTINGS.rememberConnectionDatabaseOnDelete;
@@ -2653,6 +2746,8 @@ function resetAllDefaults() {
   editRedisKeyTemplates.value = normalizeRedisKeyTemplates(DEFAULT_EDITOR_SETTINGS.redisKeyTemplates).join("\n");
   editRedisDatabaseDisplayLimit.value = DEFAULT_EDITOR_SETTINGS.redisDatabaseDisplayLimit;
   editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+  editPreferredExportPath.value = DEFAULT_EDITOR_SETTINGS.preferredExportPath;
+  editAutoOpenExportFolder.value = DEFAULT_EDITOR_SETTINGS.autoOpenExportFolder;
   editCsvQuoteMode.value = DEFAULT_EDITOR_SETTINGS.csvQuoteMode;
   editCsvNullMode.value = DEFAULT_EDITOR_SETTINGS.csvNullMode;
   editGlobalDateTimeDisplayFormat.value = DEFAULT_EDITOR_SETTINGS.globalDateTimeDisplayFormat;
@@ -2664,6 +2759,7 @@ function resetAllDefaults() {
   editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
   editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+  editSnippetTriggerKey.value = DEFAULT_EDITOR_SETTINGS.snippetTriggerKey;
   editSqlShortcuts.value = DEFAULT_SQL_SHORTCUTS.map(editableSqlShortcut);
 }
 
@@ -2805,6 +2901,12 @@ function onCompletionTriggerModeChange(v: any) {
   }
 }
 
+function onSnippetTriggerKeyChange(v: any) {
+  if (v === "tab" || v === "space" || v === "both") {
+    editSnippetTriggerKey.value = v;
+  }
+}
+
 function onTableCompletionSchemaQualificationChange(v: any) {
   if (v === "never" || v === "collision" || v === "always") {
     editTableCompletionSchemaQualification.value = v;
@@ -2877,7 +2979,11 @@ function resetAiTypography() {
 
 const themeSelectValue = computed(() => {
   if (editTheme.value === "custom") {
-    return `custom:${editActiveCustomThemeId.value}`;
+    if (editCustomThemes.value.length > 0) {
+      const activeMatch = editCustomThemes.value.find((t) => t.id === editActiveCustomThemeId.value);
+      return activeMatch ? `custom:${activeMatch.id}` : `custom:${editCustomThemes.value[0].id}`;
+    }
+    return "custom";
   }
   return editTheme.value;
 });
@@ -2889,12 +2995,21 @@ const themeSelectOptions = computed(() => [
     dark: theme.dark,
     isCustom: false,
   })),
-  ...editCustomThemes.value.map((theme) => ({
-    value: `custom:${theme.id}`,
-    label: theme.name,
-    dark: true,
-    isCustom: true,
-  })),
+  ...(editCustomThemes.value.length === 0
+    ? [
+        {
+          value: "custom",
+          label: t("settings.customTheme") || "Custom Theme",
+          dark: true,
+          isCustom: true,
+        },
+      ]
+    : editCustomThemes.value.map((theme) => ({
+        value: `custom:${theme.id}`,
+        label: theme.name,
+        dark: true,
+        isCustom: true,
+      }))),
 ]);
 
 function onThemeChange(v: any) {
@@ -2902,14 +3017,20 @@ function onThemeChange(v: any) {
   if (v.startsWith("custom:")) {
     editTheme.value = "custom";
     editActiveCustomThemeId.value = v.slice(7);
+  } else if (v === "custom") {
+    editTheme.value = "custom";
+    if (editCustomThemes.value.length === 0) {
+      editCustomThemes.value = JSON.parse(JSON.stringify(DEFAULT_CUSTOM_THEMES));
+    }
+    editActiveCustomThemeId.value = editCustomThemes.value[0]?.id ?? "default";
   } else {
     editTheme.value = v as typeof DEFAULT_EDITOR_SETTINGS.theme;
   }
 }
 
 function handleThemeSave(updatedThemes: CustomTheme[], activeId: string) {
-  editCustomThemes.value = updatedThemes;
-  editActiveCustomThemeId.value = activeId;
+  editCustomThemes.value = updatedThemes.length > 0 ? updatedThemes : JSON.parse(JSON.stringify(DEFAULT_CUSTOM_THEMES));
+  editActiveCustomThemeId.value = activeId || editCustomThemes.value[0]?.id || "default";
   editTheme.value = "custom";
   showThemeCustomizer.value = false;
 }
@@ -3085,6 +3206,10 @@ function setTabSortMode(value: TabSortMode) {
   editTabSortMode.value = value;
 }
 
+function setTabMaxWidth(value: number) {
+  editTabMaxWidth.value = normalizeTabMaxWidth(value);
+}
+
 function setSidebarActivation(value: "single" | "double") {
   editSidebarActivation.value = value;
 }
@@ -3103,6 +3228,18 @@ async function commitCustomSkillRoot() {
   if ((settingsStore.desktopSettings.custom_ai_skill_root ?? "") === trimmed) return;
   await settingsStore.updateDesktopSettings({ custom_ai_skill_root: trimmed || null });
 }
+async function pickPreferredExportPath() {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: t("settings.preferredExportPathChoose"),
+    defaultPath: editPreferredExportPath.value.trim() || undefined,
+  });
+  if (typeof selected !== "string" || !selected.trim()) return;
+  editPreferredExportPath.value = selected.trim();
+}
+
 async function pickCustomSkillRoot() {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({ directory: true, multiple: false, title: t("settings.aiSkillRoot") });
@@ -4314,7 +4451,7 @@ const localBackupError = ref(false);
 const localBackupPath = ref("");
 const localBackupDirectoryStorageKey = "dbx-local-backup-directory";
 const localBackupDirectory = ref(localStorage.getItem(localBackupDirectoryStorageKey) || "");
-const syncMethodTab = ref<"webdav" | "snippet" | "local">("webdav");
+const syncMethodTab = ref<SyncMethod>(readSyncMethod());
 const syncSelectionOpen = ref(false);
 const syncSelectionMode = ref<"upload" | "restore">("upload");
 const syncSelectionCatalog = ref<SyncSnapshotCatalog | null>(null);
@@ -4338,6 +4475,8 @@ const snippetError = ref(false);
 const legacySnippetId = ref("");
 const pendingLegacyCleanupId = ref("");
 const snippetSyncSettingsLoading = ref(true);
+
+watch(syncMethodTab, (value) => writeSyncMethod(value), { immediate: true });
 
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value);
 const localBackupCanIncludeSecrets = computed(() => !!localBackupSecretsPassphrase.value.trim());
@@ -4833,7 +4972,9 @@ const changingPassword = ref(false);
 
 async function scrollToInitialSettingsSection() {
   await nextTick();
-  if (props.initialSection === "tableColumnTemplates") {
+  if (props.initialSection === "welcome-page-settings") {
+    await revealSettingsSearchTarget({ id: "appearance-welcome-page", category: "appearance", title: t("settings.welcomePage"), description: t("settings.welcomePageDescription"), categoryLabel: t("settings.appearanceTab"), targetId: "welcome-page-settings" });
+  } else if (props.initialSection === "tableColumnTemplates") {
     tableColumnTemplateSectionRef.value?.scrollIntoView({
       block: "center",
       behavior: "smooth",
@@ -6777,6 +6918,16 @@ onUnmounted(() => {
 
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="editor-function-completion-include-params">{{ t("settings.functionCompletionIncludeParams") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.functionCompletionIncludeParamsDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="editor-function-completion-include-params" v-model="editFunctionCompletionIncludeParams" class="mt-0.5" />
+                </div>
+
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="editor-sort-completion-columns-alphabetically">{{ t("settings.sortCompletionColumnsAlphabetically") }}</Label>
                     <p class="text-xs text-muted-foreground">
                       {{ t("settings.sortCompletionColumnsAlphabeticallyDescription") }}
@@ -7382,6 +7533,45 @@ onUnmounted(() => {
 
               <Separator />
 
+              <div data-settings-search-id="welcome-page-settings" :class="['settings-appearance-group', settingsSearchTargetClass('welcome-page-settings')]">
+                <div class="flex items-center gap-1">
+                  <Label>{{ t("settings.welcomePage") }}</Label>
+                  <HelpTooltip :label="t('settings.welcomePage')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-72">
+                    <p>{{ t("settings.welcomePageDescription") }}</p>
+                  </HelpTooltip>
+                </div>
+                <div class="settings-appearance-choice-grid">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    class="settings-choice-card h-auto min-w-0 justify-start overflow-hidden whitespace-normal border p-3"
+                    :class="editWelcomePageMode === 'intro' ? 'dbx-choice-selected' : ''"
+                    :aria-pressed="editWelcomePageMode === 'intro'"
+                    @click="editWelcomePageMode = 'intro'"
+                  >
+                    <div class="w-full min-w-0 text-left">
+                      <div class="text-sm font-medium">{{ t("settings.welcomePageIntro") }}</div>
+                      <div class="break-words whitespace-normal text-xs text-muted-foreground">{{ t("settings.welcomePageIntroDescription") }}</div>
+                    </div>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    class="settings-choice-card h-auto min-w-0 justify-start overflow-hidden whitespace-normal border p-3"
+                    :class="editWelcomePageMode === 'workspace' ? 'dbx-choice-selected' : ''"
+                    :aria-pressed="editWelcomePageMode === 'workspace'"
+                    @click="editWelcomePageMode = 'workspace'"
+                  >
+                    <div class="w-full min-w-0 text-left">
+                      <div class="text-sm font-medium">{{ t("settings.welcomePageWorkspace") }}</div>
+                      <div class="break-words whitespace-normal text-xs text-muted-foreground">{{ t("settings.welcomePageWorkspaceDescription") }}</div>
+                    </div>
+                  </Button>
+                </div>
+              </div>
+
+              <Separator />
+
               <div class="settings-appearance-group">
                 <Label>{{ t("settings.appLayout") }}</Label>
                 <div class="settings-appearance-choice-grid">
@@ -7463,7 +7653,7 @@ onUnmounted(() => {
               </div>
 
               <div class="settings-appearance-group">
-                <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   <div class="space-y-2">
                     <Label>{{ t("settings.tabPlacement") }}</Label>
                     <Select :model-value="editTabPlacement" @update:model-value="setTabPlacement($event as TabPlacement)">
@@ -7485,6 +7675,7 @@ onUnmounted(() => {
                         <SelectItem value="database-type">{{ t("settings.tabGroupDatabaseType") }}</SelectItem>
                         <SelectItem value="database">{{ t("settings.tabGroupDatabase") }}</SelectItem>
                         <SelectItem value="connection">{{ t("settings.tabGroupConnection") }}</SelectItem>
+                        <SelectItem value="sidebar">{{ t("settings.tabGroupSidebar") }}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -7499,10 +7690,24 @@ onUnmounted(() => {
                       </SelectContent>
                     </Select>
                   </div>
+                  <div class="space-y-2">
+                    <Label>{{ t("settings.tabMaxWidth") }}</Label>
+                    <Select :model-value="String(editTabMaxWidth)" @update:model-value="setTabMaxWidth(Number($event))">
+                      <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="0">{{ t("settings.tabMaxWidthUnlimited") }}</SelectItem>
+                        <SelectItem value="160">{{ t("settings.tabMaxWidthCompact") }}</SelectItem>
+                        <SelectItem value="200">{{ t("settings.tabMaxWidthMedium") }}</SelectItem>
+                        <SelectItem value="240">{{ t("settings.tabMaxWidthStandard") }}</SelectItem>
+                        <SelectItem value="320">{{ t("settings.tabMaxWidthWide") }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
                 <div class="space-y-1 text-xs text-muted-foreground">
                   <p>{{ t("settings.tabPlacementDescription") }}</p>
                   <p>{{ t("settings.tabOrganizationDescription") }}</p>
+                  <p>{{ t("settings.tabMaxWidthDescription") }}</p>
                 </div>
               </div>
 
@@ -7615,6 +7820,24 @@ onUnmounted(() => {
                   <HelpTooltip :label="t('settings.toolbarTitle')" content-class="max-w-64">
                     <p>{{ t("settings.toolbarHiddenHint") }}</p>
                   </HelpTooltip>
+                </div>
+                <div v-if="isWeb" data-settings-search-id="appearance-web-logo-position" :class="['settings-item flex items-center justify-between gap-4 rounded-md border border-border/60 p-3', settingsSearchTargetClass('appearance-web-logo-position')]">
+                  <div class="space-y-1">
+                    <Label for="web-logo-position">{{ t("settings.webLogoPosition") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.webLogoPositionDescription") }}
+                    </p>
+                  </div>
+                  <Select :model-value="editWebLogoPosition" @update:model-value="editWebLogoPosition = $event as WebLogoPosition">
+                    <SelectTrigger id="web-logo-position" class="h-8 w-44 shrink-0">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="left">{{ t("settings.webLogoPositionLeft") }}</SelectItem>
+                      <SelectItem value="right">{{ t("settings.webLogoPositionRight") }}</SelectItem>
+                      <SelectItem value="hidden">{{ t("settings.webLogoPositionHidden") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border border-border/60 p-3">
                   <div class="space-y-1">
@@ -7856,6 +8079,15 @@ onUnmounted(() => {
                 </div>
                 <Switch id="auto-select-active-sidebar-node" v-model="editAutoSelectActiveSidebarNode" />
               </div>
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="sidebar-pin-default-database">{{ t("settings.sidebarPinDefaultDatabase") }}</Label>
+                  <HelpTooltip :label="t('settings.sidebarPinDefaultDatabase')">
+                    {{ t("settings.sidebarPinDefaultDatabaseDescription") }}
+                  </HelpTooltip>
+                </div>
+                <Switch id="sidebar-pin-default-database" v-model="editSidebarPinDefaultDatabase" />
+              </div>
               <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="open-tabs-restore-mode">{{ t("settings.openTabsRestoreMode") }}</Label>
@@ -7876,6 +8108,15 @@ onUnmounted(() => {
                 <p class="text-xs text-muted-foreground">
                   {{ t("settings.openTabsRestoreModeHint") }}
                 </p>
+              </div>
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="auto-reload-restored-data-tabs">{{ t("settings.autoReloadRestoredDataTabsOnOpen") }}</Label>
+                  <HelpTooltip :label="t('settings.autoReloadRestoredDataTabsOnOpen')">
+                    {{ t("settings.autoReloadRestoredDataTabsOnOpenDescription") }}
+                  </HelpTooltip>
+                </div>
+                <Switch id="auto-reload-restored-data-tabs" v-model="editAutoReloadRestoredDataTabsOnOpen" />
               </div>
               <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
@@ -8417,6 +8658,24 @@ onUnmounted(() => {
                     </SelectContent>
                   </Select>
                 </div>
+                <div data-settings-search-id="default-explain-view" :class="['settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('default-explain-view')]">
+                  <div class="min-w-0 space-y-1">
+                    <Label for="default-explain-view">{{ t("settings.defaultExplainView") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.defaultExplainViewDescription") }}</p>
+                  </div>
+                  <Select v-model="editDefaultExplainView">
+                    <SelectTrigger id="default-explain-view" class="h-8 w-36 shrink-0">
+                      <SelectValue :placeholder="t('settings.defaultExplainView')" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="canvas">{{ t("explain.canvas") }}</SelectItem>
+                      <SelectItem value="tree">{{ t("explain.tree") }}</SelectItem>
+                      <SelectItem value="summary">{{ t("explain.summary") }}</SelectItem>
+                      <SelectItem value="table">{{ t("explain.standardTable") }}</SelectItem>
+                      <SelectItem value="raw">{{ t("explain.raw") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="query-result-max-rows-enabled">
@@ -8614,6 +8873,17 @@ onUnmounted(() => {
                 </div>
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="data-grid-cell-detail-dialog-default">
+                      {{ t("settings.dataGridCellDetailDialogDefault") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.dataGridCellDetailDialogDefaultDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="data-grid-cell-detail-dialog-default" v-model="editDataGridCellDetailDialogDefault" />
+                </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="data-grid-crosshair-highlight">
                       {{ t("settings.dataGridCrosshairHighlight") }}
                     </Label>
@@ -8622,6 +8892,32 @@ onUnmounted(() => {
                     </p>
                   </div>
                   <Switch id="data-grid-crosshair-highlight" v-model="editDataGridCrosshairHighlight" />
+                </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="data-grid-striped-rows">
+                      {{ t("settings.dataGridStripedRows") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.dataGridStripedRowsDescription") }}
+                    </p>
+                  </div>
+                  <div class="flex items-center gap-3">
+                    <div v-if="editDataGridStripedRows" class="flex items-center gap-1.5">
+                      <Label for="data-grid-zebra-row-bg" class="text-xs text-muted-foreground">{{ t("settings.dataGridZebraRowBg") }}</Label>
+                      <input
+                        id="data-grid-zebra-row-bg"
+                        type="color"
+                        class="h-6 w-8 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0.5"
+                        :value="editDataGridZebraRowBg || (isDark ? '#28282b' : '#f0f0f0')"
+                        @input="editDataGridZebraRowBg = ($event.target as HTMLInputElement).value"
+                      />
+                      <Button v-if="editDataGridZebraRowBg" type="button" variant="ghost" size="sm" class="h-6 px-1 text-[11px] text-muted-foreground hover:text-foreground" @click="editDataGridZebraRowBg = ''">
+                        {{ t("settings.reset") }}
+                      </Button>
+                    </div>
+                    <Switch id="data-grid-striped-rows" v-model="editDataGridStripedRows" />
+                  </div>
                 </div>
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
@@ -8838,6 +9134,28 @@ onUnmounted(() => {
                       <SelectItem value="empty">{{ t("settings.csvNullModeEmpty") }}</SelectItem>
                     </SelectContent>
                   </Select>
+                </div>
+                <div data-settings-search-id="data-export-preferred-path" :class="['space-y-2', settingsSearchTargetClass('data-export-preferred-path')]">
+                  <Label for="export-preferred-path">{{ t("settings.preferredExportPath") }}</Label>
+                  <div class="flex items-center gap-2">
+                    <Input id="export-preferred-path" v-model="editPreferredExportPath" :placeholder="t('settings.preferredExportPathPlaceholder')" class="h-9 flex-1 font-mono text-xs" />
+                    <Button v-if="!isWeb" type="button" variant="outline" size="sm" class="h-9 shrink-0 px-2.5" :title="t('settings.preferredExportPathChoose')" :aria-label="t('settings.preferredExportPathChoose')" @click="pickPreferredExportPath">
+                      <FolderOpen class="h-4 w-4" />
+                    </Button>
+                    <Button v-if="editPreferredExportPath" type="button" variant="ghost" size="sm" class="h-9 shrink-0 px-2" :title="t('settings.preferredExportPathClear')" :aria-label="t('settings.preferredExportPathClear')" @click="editPreferredExportPath = ''">
+                      <X class="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <p class="text-xs text-muted-foreground">{{ t("settings.preferredExportPathDescription") }}</p>
+                </div>
+                <div v-if="!isWeb" data-settings-search-id="data-export-auto-open-folder" :class="['flex items-start justify-between gap-3', settingsSearchTargetClass('data-export-auto-open-folder')]">
+                  <div class="space-y-0.5">
+                    <Label for="export-auto-open-folder">{{ t("settings.autoOpenExportFolder") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.autoOpenExportFolderDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="export-auto-open-folder" v-model="editAutoOpenExportFolder" class="mt-0.5" />
                 </div>
                 <div class="space-y-2">
                   <Label>{{ t("settings.exportBatchSize") }}</Label>
@@ -9275,6 +9593,26 @@ onUnmounted(() => {
                   {{ t("settings.snippetsAdd") }}
                 </Button>
               </div>
+
+              <div data-settings-search-id="snippet-trigger-key" :class="['settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('snippet-trigger-key')]">
+                <div class="min-w-0 space-y-1">
+                  <Label>{{ t("settings.snippetTriggerKey") }}</Label>
+                  <p class="text-xs leading-tight text-muted-foreground">
+                    {{ t("settings.snippetTriggerKeyDescription") }}
+                  </p>
+                </div>
+                <Select :model-value="editSnippetTriggerKey" @update:model-value="onSnippetTriggerKeyChange">
+                  <SelectTrigger class="h-8 w-44 shrink-0">
+                    <SelectValue :placeholder="t('settings.snippetTriggerKey')" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="tab">{{ t("settings.snippetTriggerKeyTab") }}</SelectItem>
+                    <SelectItem value="space">{{ t("settings.snippetTriggerKeySpace") }}</SelectItem>
+                    <SelectItem value="both">{{ t("settings.snippetTriggerKeyBoth") }}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
               <div class="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
                 <p>{{ t("settings.snippetsPlaceholderHint") }}</p>
                 <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded bg-background/70 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-foreground">
@@ -11273,6 +11611,19 @@ LIMIT 100;</pre
                 <p v-if="passwordMessage" class="text-xs" :class="passwordError ? 'text-destructive' : 'text-green-500'">
                   {{ passwordMessage }}
                 </p>
+              </div>
+
+              <div class="border-t border-border/60 pt-5 space-y-3">
+                <Label class="text-base">{{ t("auth.logout") }}</Label>
+                <p class="text-sm text-muted-foreground">
+                  {{ t("auth.logoutDescription") }}
+                </p>
+                <div>
+                  <Button variant="outline" class="gap-2 text-destructive hover:text-destructive" @click="emit('logout')">
+                    <LogOut class="h-4 w-4" />
+                    {{ t("auth.logout") }}
+                  </Button>
+                </div>
               </div>
             </section>
 

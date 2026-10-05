@@ -14,8 +14,18 @@
 //! `dbx_sql_data` cannot depend on `dbx_formats` (the workspace enforces a one-way
 //! boundary between those two leaf crates), so this shim lives one level up in
 //! `dbx-core`, which already depends on `dbx-formats` and re-exports
-//! `data_grid_extractors`. It calls the same `push_formula_guard` the file exporters
-//! use, so the clipboard and file paths share one predicate and cannot drift.
+//! `data_grid_extractors`. It shares the [`needs_formula_guard`] predicate with the
+//! file exporters, so "does this text need a guard" is answered in exactly one place.
+//!
+//! It deliberately does **not** reuse [`dbx_formats::csv_export::push_formula_guard`],
+//! whose extra branch doubles a literal leading apostrophe (`'+8613…` → `''+8613…`).
+//! That doubling exists so DBX's own CSV importer, which strips one apostrophe, can
+//! read the value back. The clipboard has no such reader: the spreadsheet is the
+//! consumer, and Excel keeps a leading apostrophe as literal data on both paste and
+//! CSV open (measured on Excel 16.0 — pasting `''+8613800000000` stores both
+//! apostrophes, pasting `'+8613800000000` stores one). Doubling here would therefore
+//! add a visible apostrophe rather than preserve the value. The two paths legitimately
+//! differ because only one of them has a matching un-guard step.
 //!
 //! Only the extractors whose output lands in a spreadsheet are guarded. SQL, JSON,
 //! XML, HTML, Markdown and the raw extractor must stay byte-exact: prefixing a SQL
@@ -31,24 +41,47 @@ use serde_json::Value;
 /// evaluates any pasted field that starts with a trigger character. `PipeSeparated`
 /// and `Dsv` are the same shape. The one-row and CSV writers are RFC4180 records, so
 /// Excel treats their fields the same way.
+///
+/// Written as an exhaustive match with no `_` arm on purpose. The extractor dispatch
+/// in `dbx-sql-data` is exhaustive too, so a new variant already fails to build there;
+/// this is the cross-crate half of that contract. Without it, a variant added for a
+/// new spreadsheet-bound format would be handled by the dispatch yet silently skip the
+/// guard here, because nothing in `dbx-core` would mention it.
 fn is_spreadsheet_extractor(extractor: DataGridExtractorId) -> bool {
-    matches!(
-        extractor,
+    match extractor {
         DataGridExtractorId::Tsv
-            | DataGridExtractorId::TsvWithHeaders
-            | DataGridExtractorId::Csv
-            | DataGridExtractorId::CsvWithHeaders
-            | DataGridExtractorId::PipeSeparated
-            | DataGridExtractorId::Dsv
-            | DataGridExtractorId::OneRow
-    )
+        | DataGridExtractorId::TsvWithHeaders
+        | DataGridExtractorId::Csv
+        | DataGridExtractorId::CsvWithHeaders
+        | DataGridExtractorId::PipeSeparated
+        | DataGridExtractorId::Dsv
+        | DataGridExtractorId::OneRow => true,
+
+        // Not spreadsheet cells: a leading apostrophe would corrupt the document or
+        // the statement, and the raw extractor must stay byte-exact.
+        DataGridExtractorId::Raw
+        | DataGridExtractorId::Json
+        | DataGridExtractorId::JsonLines
+        | DataGridExtractorId::SqlInList
+        | DataGridExtractorId::SqlInserts
+        | DataGridExtractorId::SqlUpdates
+        | DataGridExtractorId::SqlSelect
+        | DataGridExtractorId::WhereClause
+        | DataGridExtractorId::Markdown
+        | DataGridExtractorId::Html
+        | DataGridExtractorId::Xml
+        | DataGridExtractorId::Pretty => false,
+    }
 }
 
 /// Returns the request with spreadsheet-triggering text cells prefixed by `'`.
 ///
 /// This is a no-op for every non-spreadsheet extractor, and for numbers, booleans and
 /// NULL (which never start with a trigger character and must keep their JSON types so
-/// the extractors' numeric formatting is unchanged).
+/// the extractors' numeric formatting is unchanged). Negative decimal text cells
+/// (drivers deliver DECIMAL/NUMERIC/BIGINT as strings) are also left alone: the shared
+/// [`needs_formula_guard`] predicate exempts whole-string numeric literals, so a
+/// copied `-1` stays `-1` while `-2+1+cmd|…` stays neutralized.
 pub fn neutralize_spreadsheet_formulas(mut request: DataGridExtractRequest) -> DataGridExtractRequest {
     if !is_spreadsheet_extractor(request.extractor) {
         return request;
@@ -145,6 +178,9 @@ mod tests {
             DataGridExtractorId::Xml,
             DataGridExtractorId::Html,
             DataGridExtractorId::Markdown,
+            // `Pretty` is a fixed-width ASCII table for terminal display; a leading
+            // apostrophe would shift its columns out of alignment.
+            DataGridExtractorId::Pretty,
             DataGridExtractorId::Raw,
         ] {
             let out = neutralize(extractor, vec![vec![json!("=1+1")]]);
@@ -154,11 +190,25 @@ mod tests {
 
     #[test]
     fn text_without_a_trigger_character_is_untouched() {
-        // A phone number written with a leading apostrophe is the common case the
-        // exporter already doubles; here only the trigger set is neutralized.
+        // Only the trigger set is neutralized; a value that merely contains an
+        // apostrophe (but does not start with one) is already plain text to Excel.
         for value in ["plain", "a=b", "1'2", "'plain", "x@y.com", "", "NULL", "  plain"] {
             let out = neutralize(DataGridExtractorId::Tsv, vec![vec![json!(value)]]);
             assert_eq!(out[0], json!(value), "{value:?} must not be guarded");
+        }
+    }
+
+    #[test]
+    fn clipboard_does_not_double_a_literal_leading_apostrophe() {
+        // The file exporters double a literal leading apostrophe (`'+8613…` becomes
+        // `''+8613…`) because DBX's own CSV importer strips one apostrophe back off.
+        // The clipboard has no importer, and Excel keeps a leading apostrophe as
+        // literal data on both paste and CSV open (Excel 16.0: pasting `''+8613…`
+        // stores both, pasting `'+8613…` stores one). Doubling here would add a
+        // visible apostrophe, so these values must come out exactly as stored.
+        for value in ["'+8613800000000", "''-edge", "'=SUM(A1)", "'@x"] {
+            let out = neutralize(DataGridExtractorId::Tsv, vec![vec![json!(value)]]);
+            assert_eq!(out[0], json!(value), "{value:?} must reach the sheet unchanged, not doubled");
         }
     }
 
@@ -175,6 +225,38 @@ mod tests {
         assert_eq!(out[2], json!(true));
         assert_eq!(out[3], Value::Null);
         assert_eq!(out[4], json!([1, -2]));
+    }
+
+    #[test]
+    fn negative_decimal_text_cells_are_copied_verbatim() {
+        // 回归：驱动把 DECIMAL/NUMERIC/BIGINT 以字符串下发（PG numeric、MySQL
+        // DECIMAL 都是 Value::String），负值曾因 `-` 触发符被复制成 `'-1`。
+        // 整串数字字面量豁免；超 Excel 15 位精度、`+` 号形态与注入载荷仍守卫。
+        for extractor in [DataGridExtractorId::Tsv, DataGridExtractorId::Csv, DataGridExtractorId::PipeSeparated] {
+            let out = neutralize(
+                extractor,
+                vec![vec![
+                    json!("-1"),
+                    json!("-123.45"),
+                    json!("-9223372036854775808"),
+                    json!("+8613800000000"),
+                    json!("-2+1+cmd|'x'"),
+                ]],
+            );
+            assert_eq!(out[0], json!("-1"), "extractor {extractor:?}");
+            assert_eq!(out[1], json!("-123.45"), "extractor {extractor:?}");
+            assert_eq!(out[2], json!("'-9223372036854775808"), "extractor {extractor:?}");
+            assert_eq!(out[3], json!("'+8613800000000"), "extractor {extractor:?}");
+            assert_eq!(out[4], json!("'-2+1+cmd|'x'"), "extractor {extractor:?}");
+        }
+    }
+
+    #[test]
+    fn grid_tsv_copy_of_a_negative_decimal_stays_a_plain_number() {
+        // 端到端：多格复制（默认 smart → TSV）里负 decimal 文本不再带 `'`。
+        let guarded = neutralize_spreadsheet_formulas(request(DataGridExtractorId::Tsv, vec![vec![json!("-1.23")]]));
+        let result = dbx_sql::data_grid_extractors::extract_data_grid_selection(guarded).expect("TSV extraction");
+        assert_eq!(result.text, "-1.23");
     }
 
     #[test]

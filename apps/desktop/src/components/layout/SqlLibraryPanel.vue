@@ -2,7 +2,36 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowDownWideNarrow, ArrowRightLeft, ChevronsDownUp, Database, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Layers, Library, Loader2, LocateFixed, Pencil, Play, Search, Trash2, Upload, X } from "@lucide/vue";
+import {
+  ArrowDownAZ,
+  ArrowDownWideNarrow,
+  ArrowRightLeft,
+  ArrowUpAZ,
+  ArrowUpDown,
+  Calendar,
+  ChevronsDownUp,
+  Clipboard,
+  Copy,
+  Clock,
+  Database,
+  Download,
+  FilePlus,
+  FileText,
+  FolderCog,
+  FolderClosed,
+  FolderOpen,
+  FolderPlus,
+  Layers,
+  Library,
+  Loader2,
+  LocateFixed,
+  Pencil,
+  Play,
+  Search,
+  Trash2,
+  Upload,
+  X,
+} from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { SearchableSelect } from "@/components/ui/searchable-select";
@@ -14,9 +43,10 @@ import SqlLibrarySearchSnippet from "@/components/layout/SqlLibrarySearchSnippet
 import type { SavedSqlLineMatch } from "@/lib/savedSql/savedSqlSearch";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import * as api from "@/lib/backend/api";
 import { externalSqlFileOpenErrorMessage } from "@/lib/sql/sqlFileOpen";
-import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { useSavedSqlStore, type SavedSqlFileSortMode, type SavedSqlFolderSortMode } from "@/stores/savedSqlStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -26,7 +56,7 @@ import { savedSqlFolderBranchFileCount } from "@/lib/savedSql/savedSqlFolderCoun
 import { collectSavedSqlDirectoryImportFiles } from "@/lib/savedSql/savedSqlDirectoryImport";
 import { savedSqlBatchErrorMessage, savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { savedSqlDatabaseScopeKey } from "@/lib/savedSql/savedSqlDatabaseTree";
-import { ensureSqlExtension, stripSqlExtension } from "@/lib/savedSql/savedSqlFileName";
+import { ensureSqlExtension, extractCandidateDatabaseFromName, nextAvailableSqlName } from "@/lib/savedSql/savedSqlFileName";
 import { savedSqlImportTarget } from "@/lib/savedSql/savedSqlImportTarget";
 import { savedSqlExecutionTargetFromTab, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { uniqueSavedSqlExportFileName, exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
@@ -92,23 +122,11 @@ function sanitizeFileSystemSegment(name: string) {
 }
 
 function uniqueImportedName(name: string, takenNames: Set<string>) {
-  const normalized = ensureSqlExtension(name);
-  const normalizedTakenNames = new Set([...takenNames].map((takenName) => ensureSqlExtension(takenName).toLocaleLowerCase()));
-  if (!normalizedTakenNames.has(normalized.toLocaleLowerCase())) {
-    takenNames.add(normalized);
-    return normalized;
-  }
-
-  const base = stripSqlExtension(normalized);
-  let counter = 2;
-  while (true) {
-    const candidate = `${base} (${counter}).sql`;
-    if (!normalizedTakenNames.has(candidate.toLocaleLowerCase())) {
-      takenNames.add(candidate);
-      return candidate;
-    }
-    counter++;
-  }
+  const resolved = nextAvailableSqlName(name, takenNames);
+  // Batch importers reuse one set across files, so the picked name has to stay
+  // taken for the rest of their loop.
+  takenNames.add(resolved);
+  return resolved;
 }
 
 function savedSqlImportNameScopeKey(target: Pick<SavedSqlFile, "connectionId" | "catalog" | "database">, folderId?: string) {
@@ -240,11 +258,20 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
 
     const folderCache = new Map<string, SavedSqlFolder>();
     const takenNamesByScope = new Map<string, Set<string>>();
-    const folderConnectionId = targetFolder?.connectionId ?? "";
+    const folderConnectionId = targetFolder?.connectionId || connectionStore.activeConnectionId || "";
+    const folderFiles = targetFolder ? savedSqlStore.filesInFolder(targetFolder.id) : [];
+    const folderFallbackDb = folderFiles.find((f) => f.database)?.database;
+    const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+    const activeTabDb = activeTab?.connectionId === folderConnectionId && activeTab.database ? activeTab.database : undefined;
+    const config = folderConnectionId ? connectionStore.getConfig(folderConnectionId) : undefined;
+    const defaultDb = config ? targetDefaultDatabase(config) || config.database : "";
+    const fallbackDb = folderFallbackDb || activeTabDb || defaultDb || "";
 
     for (const file of importFiles) {
       const sourceTarget = resolveExternalSqlFileTarget(file.path, (connectionId) => !!connectionStore.getConfig(connectionId), unassociatedExternalSqlFileTarget());
-      const importTarget = savedSqlImportTarget(sourceTarget, targetFolder);
+      const candidateDb = extractCandidateDatabaseFromName(file.name) || (file.folderNames.length > 0 ? extractCandidateDatabaseFromName(file.folderNames[file.folderNames.length - 1]) : undefined);
+      const effectiveFallbackDb = candidateDb || fallbackDb;
+      const importTarget = savedSqlImportTarget(sourceTarget, targetFolder, effectiveFallbackDb);
       const folderId = await resolveImportedFolder(folderConnectionId, targetFolder?.id, file.folderNames, folderCache);
       const nameScopeKey = savedSqlImportNameScopeKey(importTarget, folderId);
       let takenNames = takenNamesByScope.get(nameScopeKey);
@@ -361,6 +388,11 @@ function folderFileCount(folderId: string) {
   return savedSqlFolderBranchFileCount(folderId, savedSqlStore.allFolders, filesInFolder);
 }
 
+function allFilesInFolderBranch(folderId: string): SavedSqlFile[] {
+  const branchFolderIds = [folderId, ...descendantFolders(folderId).map((f) => f.id)];
+  return savedSqlStore.allFiles.filter((file) => file.folderId && branchFolderIds.includes(file.folderId));
+}
+
 type SqlLibraryRow = { type: "folder"; folder: SavedSqlFolder; depth: number; folderIndex: number } | { type: "file"; file: SavedSqlFile; depth: number };
 
 const visibleFolderRows = computed<SqlLibraryRow[]>(() => {
@@ -466,8 +498,19 @@ async function openNewFolderInput(parentFolderId?: string) {
 async function openNewQueryInFolder(folder?: SavedSqlFolder) {
   const connectionId = folder?.connectionId || connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
   if (!connectionId) return;
+  if (folder?.id) {
+    collapsedFolders.value = new Set([...collapsedFolders.value].filter((id) => id !== folder.id));
+  }
 
-  const target = { connectionId, database: "" };
+  const folderFiles = folder ? savedSqlStore.filesInFolder(folder.id) : [];
+  const folderFallbackDb = folderFiles.find((f) => f.database)?.database;
+  const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+  const activeTabDb = activeTab?.connectionId === connectionId && activeTab.database ? activeTab.database : undefined;
+  const config = connectionStore.getConfig(connectionId);
+  const defaultDb = config ? targetDefaultDatabase(config) || config.database : "";
+  const database = folderFallbackDb || activeTabDb || defaultDb || "";
+
+  const target = { connectionId, database };
   const filesInTargetFolder = folder ? savedSqlStore.filesInFolder(folder.id) : savedSqlStore.filesWithoutFolder();
   const takenNames = new Set(filesInTargetFolder.filter((file) => savedSqlDatabaseScopeKey(file) === savedSqlDatabaseScopeKey(target)).map((file) => file.name));
   const name = uniqueImportedName("new_query.sql", takenNames);
@@ -476,11 +519,14 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
       connectionId,
       folderId: folder?.id,
       name,
-      database: "",
+      database,
       sql: "",
     });
     const tabId = queryStore.openSavedSql(file);
     connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
+    // New files should behave like newly-created folders: the default name is
+    // immediately editable, with the extension excluded from the selection.
+    startRenameFile(file, { restoreFocusAfterEditorMount: true });
   } catch (error) {
     toast(t("savedSql.saveFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
   }
@@ -764,6 +810,26 @@ function fileTitleStyle(file: SavedSqlFile): CSSProperties | undefined {
 const renamingTarget = ref<{ type: "folder" | "file"; id: string } | null>(null);
 const renameValue = ref("");
 const renameInputRef = ref<HTMLInputElement | null>(null);
+let renameBlurTimer: number | undefined;
+
+function cancelPendingRenameBlur() {
+  if (renameBlurTimer === undefined) return;
+  window.clearTimeout(renameBlurTimer);
+  renameBlurTimer = undefined;
+}
+
+function handleRenameInputFocus() {
+  cancelPendingRenameBlur();
+}
+
+function handleRenameInputBlur() {
+  cancelPendingRenameBlur();
+  renameBlurTimer = window.setTimeout(() => {
+    renameBlurTimer = undefined;
+    void confirmRename();
+  }, 0);
+}
+
 function setRenameInputRef(el: unknown) {
   renameInputRef.value = (el as HTMLInputElement) ?? null;
 }
@@ -793,18 +859,31 @@ function startRenameFolder(folder: SavedSqlFolder) {
   });
 }
 
-function startRenameFile(file: SavedSqlFile) {
+function startRenameFile(file: SavedSqlFile, options: { restoreFocusAfterEditorMount?: boolean } = {}) {
   prepareRenameInput();
   setActiveItem(file.id, "file");
   renamingTarget.value = { type: "file", id: file.id };
   renameValue.value = file.name.replace(/\.sql$/i, "");
   nextTick(() => {
     focusSidebarRenameInput(() => renameInputRef.value ?? undefined);
+    if (options.restoreFocusAfterEditorMount) {
+      // QueryEditor requests focus on its own nextTick + animation frame when
+      // a new tab mounts. Restore the rename focus one frame later so that
+      // editor autofocus cannot immediately steal it back.
+      const restoreFocus = () => {
+        const input = renameInputRef.value;
+        input?.focus();
+        input?.select();
+      };
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(restoreFocus);
+      else setTimeout(restoreFocus, 0);
+    }
   });
 }
 
 async function confirmRename() {
   if (!renamingTarget.value) return;
+  cancelPendingRenameBlur();
   const { type, id } = renamingTarget.value;
   const name = renameValue.value.trim();
   renamingTarget.value = null;
@@ -822,6 +901,7 @@ async function confirmRename() {
 }
 
 function cancelRename() {
+  cancelPendingRenameBlur();
   renamingTarget.value = null;
   renameValue.value = "";
 }
@@ -974,6 +1054,68 @@ function handleFolderClick(folder: SavedSqlFolder, event: MouseEvent) {
 
 const contextTarget = ref<SavedSqlFolder | SavedSqlFile | "panel" | null>(null);
 
+function pasteTargetForLibraryContext(target: SavedSqlFolder | SavedSqlFile | "panel") {
+  if (target === "panel") {
+    const connectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
+    if (!connectionId) return null;
+    const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+    const config = connectionStore.getConfig(connectionId);
+    return {
+      connectionId,
+      database: activeTab?.connectionId === connectionId && activeTab.database ? activeTab.database : config ? targetDefaultDatabase(config) || config.database || "" : "",
+    };
+  }
+
+  if ("sql" in target) {
+    return {
+      connectionId: target.connectionId,
+      catalog: target.catalog,
+      database: target.database || "",
+      schema: target.schema,
+      folderId: target.folderId,
+    };
+  }
+
+  const folderFiles = savedSqlStore.filesInFolder(target.id);
+  const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
+  const config = connectionStore.getConfig(target.connectionId);
+  return {
+    connectionId: target.connectionId,
+    database: folderFiles.find((file) => file.database)?.database || (activeTab?.connectionId === target.connectionId && activeTab.database ? activeTab.database : undefined) || (config ? targetDefaultDatabase(config) || config.database || "" : ""),
+    folderId: target.id,
+  };
+}
+
+async function copyLibraryFiles(fileIds: readonly string[]) {
+  const uniqueIds = [...new Set(fileIds)].filter((id) => !!savedSqlStore.getFile(id));
+  if (uniqueIds.length === 0) return;
+  connectionStore.treeClipboard = { kind: "saved-sql-copy", fileIds: uniqueIds };
+  try {
+    await copyToClipboard(
+      uniqueIds
+        .map((id) => savedSqlStore.getFile(id)?.name)
+        .filter(Boolean)
+        .join("\n"),
+    );
+  } catch {
+    // The internal clipboard remains available when the system clipboard is denied.
+  }
+  toast(t("savedSql.copied", { count: uniqueIds.length }), 2000);
+}
+
+async function pasteLibraryFiles(target: SavedSqlFolder | SavedSqlFile | "panel") {
+  const clipboard = connectionStore.treeClipboard;
+  const destination = pasteTargetForLibraryContext(target);
+  if (clipboard?.kind !== "saved-sql-copy" || clipboard.fileIds.length === 0 || !destination) return;
+  try {
+    const files = await savedSqlStore.copyFilesToDatabase(clipboard.fileIds, destination);
+    if (files.length > 0) toast(t("savedSql.pasted", { count: files.length }), 2000);
+    else toast(t("savedSql.nothingToPaste"), 3000);
+  } catch (error) {
+    toast(t("savedSql.pasteFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+  }
+}
+
 function isContextFile(fileId: string): boolean {
   return contextTarget.value !== null && contextTarget.value !== "panel" && "sql" in contextTarget.value && contextTarget.value.id === fileId;
 }
@@ -1011,14 +1153,47 @@ function folderMoveMenuItems(fileIds: string[]): CtxMenuItem[] {
   ];
 }
 
+async function handleSortFolderFiles(folderId: string | undefined, mode: SavedSqlFileSortMode) {
+  try {
+    await savedSqlStore.sortFolderFiles(folderId, mode);
+    toast(t("sqlLibrary.sortSuccess"));
+  } catch (error) {
+    toast(t("sqlLibrary.moveFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+  }
+}
+
+async function handleSortFolderChildren(parentFolderId: string | undefined, mode: SavedSqlFolderSortMode) {
+  try {
+    await savedSqlStore.sortFolderChildren(parentFolderId, mode);
+    toast(t("sqlLibrary.sortSuccess"));
+  } catch (error) {
+    toast(t("sqlLibrary.moveFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+  }
+}
+
+async function handleSortAllFolderFiles(mode: SavedSqlFileSortMode) {
+  try {
+    await savedSqlStore.sortAllFolderFiles(mode);
+    toast(t("sqlLibrary.sortSuccess"));
+  } catch (error) {
+    toast(t("sqlLibrary.moveFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+  }
+}
+
 const contextMenuItems = computed<CtxMenuItem[]>(() => {
   const target = contextTarget.value;
   if (!target) return [];
 
   // If there's selection, show batch delete option
   if (hasSelection.value) {
-    const selectedFiles = Array.from(selectedFileIds.value);
+    const selectedFiles = [...new Set([...Array.from(selectedFileIds.value), ...Array.from(selectedFolderIds.value).flatMap((folderId) => allFilesInFolderBranch(folderId).map((f) => f.id))])];
     return [
+      {
+        label: t("savedSql.copyFile"),
+        action: () => copyLibraryFiles(selectedFiles),
+        icon: Copy,
+        visible: selectedFiles.length > 0,
+      },
       {
         label: t("sqlLibrary.changeTarget", { count: selectedFiles.length }),
         action: () => openChangeTarget(selectedFiles),
@@ -1044,11 +1219,56 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
   }
 
   if (target === "panel") {
+    const unfiledFiles = savedSqlStore.filesWithoutFolder();
+    const rootFolders = childFolders();
+    const hasSortOptions = unfiledFiles.length > 1 || rootFolders.length > 1 || savedSqlStore.allFiles.length > 1;
     return [
       { label: t("savedSql.newFolder"), action: openNewFolderInput, icon: FolderPlus },
       { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(), icon: FilePlus },
+      {
+        label: t("savedSql.pasteFile"),
+        action: () => pasteLibraryFiles("panel"),
+        icon: Clipboard,
+        disabled: connectionStore.treeClipboard?.kind !== "saved-sql-copy",
+      },
       { label: t("sqlLibrary.importDirectory"), action: () => importDirectoryIntoLibrary(), icon: Download },
       { label: t("sqlLibrary.exportLibrary"), action: () => exportFolderContents(), icon: Upload },
+      ...(hasSortOptions
+        ? [
+            { label: "", separator: true },
+            {
+              label: t("sqlLibrary.sortUnfiledFiles"),
+              icon: ArrowDownAZ,
+              visible: unfiledFiles.length > 1,
+              children: [
+                { label: t("sqlLibrary.sortNameAsc"), action: () => handleSortFolderFiles(undefined, "name-asc"), icon: ArrowDownAZ },
+                { label: t("sqlLibrary.sortNameDesc"), action: () => handleSortFolderFiles(undefined, "name-desc"), icon: ArrowUpAZ },
+                { label: t("sqlLibrary.sortDateDesc"), action: () => handleSortFolderFiles(undefined, "updated-desc"), icon: Clock },
+                { label: t("sqlLibrary.sortDateAsc"), action: () => handleSortFolderFiles(undefined, "updated-asc"), icon: Calendar },
+              ],
+            },
+            {
+              label: t("sqlLibrary.sortRootFolders"),
+              icon: FolderClosed,
+              visible: rootFolders.length > 1,
+              children: [
+                { label: t("sqlLibrary.sortNameAsc"), action: () => handleSortFolderChildren(undefined, "name-asc"), icon: ArrowDownAZ },
+                { label: t("sqlLibrary.sortNameDesc"), action: () => handleSortFolderChildren(undefined, "name-desc"), icon: ArrowUpAZ },
+              ],
+            },
+            {
+              label: t("sqlLibrary.sortAllFiles"),
+              icon: ArrowUpDown,
+              visible: savedSqlStore.allFiles.length > 1,
+              children: [
+                { label: t("sqlLibrary.sortNameAsc"), action: () => handleSortAllFolderFiles("name-asc"), icon: ArrowDownAZ },
+                { label: t("sqlLibrary.sortNameDesc"), action: () => handleSortAllFolderFiles("name-desc"), icon: ArrowUpAZ },
+                { label: t("sqlLibrary.sortDateDesc"), action: () => handleSortAllFolderFiles("updated-desc"), icon: Clock },
+                { label: t("sqlLibrary.sortDateAsc"), action: () => handleSortAllFolderFiles("updated-asc"), icon: Calendar },
+              ],
+            },
+          ]
+        : []),
       { label: "", separator: true },
       { label: t("sqlLibrary.openStorageDirectory"), action: openSqlStorageDirectory, icon: LocateFixed },
       { label: t("sqlLibrary.chooseSyncDirectory"), action: chooseSyncDirectory, icon: FolderCog },
@@ -1070,6 +1290,13 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
         disabled: !hasCurrentSavedSqlExecutionTarget.value,
       },
       { label: t("sqlLibrary.changeTarget", { count: 1 }), action: () => openChangeTarget([target.id]), icon: ArrowRightLeft },
+      { label: t("savedSql.copyFile"), action: () => copyLibraryFiles([target.id]), icon: Copy },
+      {
+        label: t("savedSql.pasteFile"),
+        action: () => pasteLibraryFiles(target),
+        icon: Clipboard,
+        disabled: connectionStore.treeClipboard?.kind !== "saved-sql-copy",
+      },
       { label: t("sqlLibrary.exportFile"), action: () => exportSingleFile(target), icon: Upload },
       { label: t("sqlLibrary.moveToFolder"), icon: FolderClosed, children: folderMoveMenuItems([target.id]) },
       { label: "", separator: true },
@@ -1083,11 +1310,47 @@ const contextMenuItems = computed<CtxMenuItem[]>(() => {
       },
     ];
   }
+  const folderFiles = allFilesInFolderBranch(target.id);
+  const directFiles = savedSqlStore.filesInFolder(target.id);
+  const directFolders = childFolders(target.id);
   return [
     { label: t("savedSql.newSubfolder"), action: () => openNewFolderInput(target.id), icon: FolderPlus },
     { label: t("savedSql.newQuery"), action: () => openNewQueryInFolder(target), icon: FilePlus },
+    {
+      label: t("savedSql.pasteFile"),
+      action: () => pasteLibraryFiles(target),
+      icon: Clipboard,
+      disabled: connectionStore.treeClipboard?.kind !== "saved-sql-copy",
+    },
+    {
+      label: t("sqlLibrary.changeTarget", { count: folderFiles.length }),
+      action: () => openChangeTarget(folderFiles.map((f) => f.id)),
+      icon: ArrowRightLeft,
+      disabled: folderFiles.length === 0,
+    },
     { label: t("sqlLibrary.importIntoFolder"), action: () => importDirectoryIntoLibrary(target), icon: Download },
     { label: t("sqlLibrary.exportFolder"), action: () => exportFolderContents(target), icon: Upload },
+    { label: "", separator: true },
+    {
+      label: t("sqlLibrary.sortFiles"),
+      icon: ArrowDownAZ,
+      disabled: directFiles.length <= 1,
+      children: [
+        { label: t("sqlLibrary.sortNameAsc"), action: () => handleSortFolderFiles(target.id, "name-asc"), icon: ArrowDownAZ },
+        { label: t("sqlLibrary.sortNameDesc"), action: () => handleSortFolderFiles(target.id, "name-desc"), icon: ArrowUpAZ },
+        { label: t("sqlLibrary.sortDateDesc"), action: () => handleSortFolderFiles(target.id, "updated-desc"), icon: Clock },
+        { label: t("sqlLibrary.sortDateAsc"), action: () => handleSortFolderFiles(target.id, "updated-asc"), icon: Calendar },
+      ],
+    },
+    {
+      label: t("sqlLibrary.sortSubfolders"),
+      icon: FolderClosed,
+      visible: directFolders.length > 1,
+      children: [
+        { label: t("sqlLibrary.sortNameAsc"), action: () => handleSortFolderChildren(target.id, "name-asc"), icon: ArrowDownAZ },
+        { label: t("sqlLibrary.sortNameDesc"), action: () => handleSortFolderChildren(target.id, "name-desc"), icon: ArrowUpAZ },
+      ],
+    },
     { label: "", separator: true },
     { label: t("savedSql.renameFolder"), action: () => startRenameFolder(target), icon: Pencil },
     { label: "", separator: true },
@@ -1263,6 +1526,7 @@ onBeforeUnmount(() => {
   document.removeEventListener("mousemove", onDocumentMouseMove, true);
   document.removeEventListener("mouseup", onDocumentMouseUp, true);
   window.clearTimeout(clearSuppressTimer);
+  cancelPendingRenameBlur();
   resetDragState();
 });
 
@@ -1423,11 +1687,13 @@ function showDropInside(targetId: string) {
                     <input
                       :ref="setRenameInputRef"
                       v-model="renameValue"
+                      data-preserve-editor-focus
                       data-no-drag="true"
                       class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
                       @keydown.enter.prevent="confirmRename"
                       @keydown.escape.prevent="cancelRename"
-                      @blur="confirmRename"
+                      @focus="handleRenameInputFocus"
+                      @blur="handleRenameInputBlur"
                       @mousedown.stop
                       @click.stop
                     />
@@ -1468,11 +1734,13 @@ function showDropInside(targetId: string) {
                       <input
                         :ref="setRenameInputRef"
                         v-model="renameValue"
+                        data-preserve-editor-focus
                         data-no-drag="true"
                         class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
                         @keydown.enter.prevent="confirmRename"
                         @keydown.escape.prevent="cancelRename"
-                        @blur="confirmRename"
+                        @focus="handleRenameInputFocus"
+                        @blur="handleRenameInputBlur"
                         @mousedown.stop
                         @click.stop
                       />
@@ -1510,11 +1778,13 @@ function showDropInside(targetId: string) {
                     <input
                       :ref="setRenameInputRef"
                       v-model="renameValue"
+                      data-preserve-editor-focus
                       data-no-drag="true"
                       class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
                       @keydown.enter.prevent="confirmRename"
                       @keydown.escape.prevent="cancelRename"
-                      @blur="confirmRename"
+                      @focus="handleRenameInputFocus"
+                      @blur="handleRenameInputBlur"
                       @mousedown.stop
                       @click.stop
                     />
@@ -1560,11 +1830,13 @@ function showDropInside(targetId: string) {
                       <input
                         :ref="setRenameInputRef"
                         v-model="renameValue"
+                        data-preserve-editor-focus
                         data-no-drag="true"
                         class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
                         @keydown.enter.prevent="confirmRename"
                         @keydown.escape.prevent="cancelRename"
-                        @blur="confirmRename"
+                        @focus="handleRenameInputFocus"
+                        @blur="handleRenameInputBlur"
                         @mousedown.stop
                         @click.stop
                       />
@@ -1608,11 +1880,13 @@ function showDropInside(targetId: string) {
                       <input
                         :ref="setRenameInputRef"
                         v-model="renameValue"
+                        data-preserve-editor-focus
                         data-no-drag="true"
                         class="min-w-0 flex-1 rounded border border-primary/50 bg-transparent px-1 text-[13px] outline-none"
                         @keydown.enter.prevent="confirmRename"
                         @keydown.escape.prevent="cancelRename"
-                        @blur="confirmRename"
+                        @focus="handleRenameInputFocus"
+                        @blur="handleRenameInputBlur"
                         @mousedown.stop
                         @click.stop
                       />

@@ -16,7 +16,7 @@ import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import { GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps, QueryEditorSurfaceHandle, StatementRange } from "./querySurfaces";
-import type { QueryTab } from "@/types/database";
+import type { QueryTab, TableInfoTab } from "@/types/database";
 import type { AiConversationBinding } from "@/lib/ai/aiConversationBinding";
 
 defineOptions({ inheritAttrs: false });
@@ -43,7 +43,6 @@ const emit = defineEmits<
   ContentAreaSurfaceEmits & {
     "focus-group": [groupId: string];
     "activate-tab": [tabId: string];
-    "locate-tab": [tab: QueryTab];
     "toggle-zen-mode": [];
     "start-resize": [event: PointerEvent];
     "toggle-collapse": [];
@@ -74,6 +73,7 @@ defineExpose({
   focusSearch: (target: Element | null = null) => activeSurfaceRef.value?.focusSearch(target) ?? false,
   focusWhere: () => activeSurfaceRef.value?.focusWhere() ?? false,
   openGoToColumn: () => activeSurfaceRef.value?.openGoToColumn() ?? false,
+  openTableStructureEditor: (initialTab?: TableInfoTab) => activeSurfaceRef.value?.openTableStructureEditor?.(initialTab) ?? false,
   refreshData: () => activeSurfaceRef.value?.refreshData() ?? false,
   toggleResultsPane: () => activeSurfaceRef.value?.toggleResultsPane() ?? false,
   refreshQueryEditorCompletionCache: () => activeSurfaceRef.value?.refreshQueryEditorCompletionCache() ?? false,
@@ -216,6 +216,8 @@ const groupExecutableSql = computed(() => {
         @explain="activeTab && toolbar.explain(activeTab.id)"
         @format-sql="activeTab && toolbar.formatSql(activeTab.id)"
         @compress-sql="activeTab && toolbar.compressSql(activeTab.id)"
+        @fold-all="activeSurfaceRef?.foldAll?.()"
+        @unfold-all="activeSurfaceRef?.unfoldAll?.()"
         @toggle-sql-keyword-case="toolbar.toggleSqlKeywordCase()"
         @save-sql="(tabId: string) => toolbar.saveSql(tabId)"
         @open-sql="toolbar.openSqlFile()"

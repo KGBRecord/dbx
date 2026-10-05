@@ -19,6 +19,10 @@ export function isSolrDatabaseType(dbType?: DatabaseType): boolean {
   return dbType === "solr";
 }
 
+export function isCouchDbDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "couchdb";
+}
+
 export interface SqlSnippet {
   id: string;
   label: string;
@@ -105,6 +109,8 @@ export interface ConnectionConfig {
   visible_database_patterns?: string[];
   visible_schemas?: Record<string, string[]>;
   show_system_schemas?: boolean;
+  /** Whether to show Oracle / OceanBase-Oracle database links node in the sidebar tree. Defaults to true. */
+  show_database_links?: boolean;
   /** Load every page when the sidebar's Tables group is opened for this connection. */
   sidebar_auto_load_all_tables?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
@@ -256,6 +262,15 @@ export interface SshTunnelConfig {
   /** Allow `nc` through an SSH exec channel when direct-tcpip is prohibited. */
   allow_exec_channel_proxy?: boolean;
   /**
+   * OpenSSH-style `ProxyCommand` used to reach this host instead of a direct
+   * TCP connection, e.g. `nc %h %p` or
+   * `cloudflared access ssh --hostname %h`. `%h`/`%p`/`%r`/`%%` expand from
+   * the effective host, port and user. The executable must be one of the
+   * helpers the backend allowlists (`nc`, `ncat`, `netcat`, `cloudflared`,
+   * `socat`, `connect`, `corkscrew`, `ssh`). Empty means a direct connection.
+   */
+  proxy_command?: string;
+  /**
    * When set, this layer references a shared tunnel profile; the profile's
    * configuration replaces this layer's fields at connect time (only `id`
    * and `enabled` are kept).
@@ -269,6 +284,7 @@ export interface SshConfigHostEntry {
   port?: number;
   user?: string;
   identity_file?: string;
+  proxy_command?: string | null;
 }
 
 export interface ProxyTunnelConfig {
@@ -1012,12 +1028,28 @@ export interface ObjectStatistics {
 
 export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "JOB" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
+export type RoutineParameterMetadataMode = "IN" | "OUT" | "INOUT" | "RETURN" | "UNKNOWN";
+
+export interface RoutineParameterMetadata {
+  name?: string | null;
+  mode: RoutineParameterMetadataMode;
+  jdbc_type?: number | null;
+  type_name?: string | null;
+  precision?: number | null;
+  length?: number | null;
+  scale?: number | null;
+  nullable?: boolean | null;
+  ordinal?: number | null;
+}
+
 export interface ObjectSource {
   name: string;
   object_type: ObjectSourceKind;
   schema?: string | null;
   source: string;
   editable?: boolean;
+  /** Optional structured metadata exposed by generic JDBC sidecars. */
+  routine_parameters?: RoutineParameterMetadata[];
 }
 
 export interface MysqlEventInfo {
@@ -1896,6 +1928,35 @@ export interface TabUiState {
   page?: Record<string, TabPageUiState>;
 }
 
+export interface DatabaseSearchResultItem {
+  id: string;
+  schema?: string;
+  tableName: string;
+  tableType?: string;
+  matchedColumns: string[];
+  preview: string;
+  whereInput: string;
+}
+
+export interface DatabaseSearchTableTask {
+  schema?: string;
+  table: TableInfo;
+}
+
+export interface DatabaseSearchTabState {
+  keyword: string;
+  perTableLimit: number;
+  progressDone: number;
+  progressTotal: number;
+  results: DatabaseSearchResultItem[];
+  tableErrors: Array<{ tableName: string; message: string }>;
+  generalError: string;
+  tableTasks: DatabaseSearchTableTask[];
+  nextTableIndex: number;
+  activeKeyword: string;
+  activePerTableLimit: number;
+}
+
 export interface QueryTab {
   id: string;
   /** Stable creation time used when tabs are displayed in creation order. */
@@ -2018,6 +2079,11 @@ export interface QueryTab {
     line: number;
     column?: number;
   };
+  /** Ephemeral request to reveal/scroll to a specific column in the data grid. */
+  gridRevealColumnRequest?: {
+    id: number;
+    columnName: string;
+  };
   executionId?: string;
   /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
   executingResultRunId?: string | null;
@@ -2066,7 +2132,8 @@ export interface QueryTab {
     | "solr-admin"
     | "dolt-version-control"
     | "plugin-workbench"
-    | "plugin-filesystem";
+    | "plugin-filesystem"
+    | "database-search";
   pluginWorkbench?: {
     /** Host command that created this tab; distinct commands can share a workbench. */
     commandId?: string;
@@ -2099,6 +2166,7 @@ export interface QueryTab {
   structureInitialTabRequestId?: number;
   structureInitialTarget?: TableStructureEditorTarget;
   structureDraft?: TableStructureEditorDraft;
+  databaseSearchState?: DatabaseSearchTabState;
   objectBrowser?: {
     catalog?: string;
     schema?: string;
@@ -2174,6 +2242,8 @@ export interface QueryTab {
     database?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
+    /** User-declared row identifier columns, used only when no automatic stable identifier exists. */
+    virtualPrimaryKeys?: string[];
     /** Physical primary keys used for table-open default sorting; excludes unique and synthetic row identifiers. */
     physicalPrimaryKeys?: string[];
   };
